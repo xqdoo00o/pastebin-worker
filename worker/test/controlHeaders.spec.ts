@@ -59,11 +59,17 @@ test("cache control", async () => {
   expect(resp.headers.has("Last-Modified")).toStrictEqual(true)
   expect(new Date(resp.headers.get("Last-Modified")!).getTime()).toStrictEqual(t1.getTime())
 
-  if ("CACHE_PASTE_AGE" in env) {
-    expect(resp.headers.get("Cache-Control")).toStrictEqual(`public, max-age=${env.CACHE_PASTE_AGE}`)
-  } else {
-    expect(resp.headers.get("Cache-Control")).toBeUndefined()
-  }
+  expect(resp.headers.get("Cache-Control")).toStrictEqual("public, no-cache, must-revalidate")
+
+  const metadataResp = await workerFetch(ctx, addRole(url, "m"))
+  expect(metadataResp.headers.get("Cache-Control")).toStrictEqual("public, no-cache, must-revalidate")
+
+  const displayResp = await workerFetch(ctx, addRole(url, "d"))
+  expect(displayResp.headers.get("Cache-Control")).toStrictEqual("public, no-cache, must-revalidate")
+
+  const readLimited = await upload(ctx, { c: "limited", reads: "2" })
+  expect((await workerFetch(ctx, readLimited.url)).headers.get("Cache-Control")).toStrictEqual("no-store")
+  expect((await workerFetch(ctx, addRole(readLimited.url, "m"))).headers.get("Cache-Control")).toStrictEqual("no-store")
 
   const indexResp = await workerFetch(ctx, BASE_URL)
   if ("CACHE_STATIC_PAGE_AGE" in env) {
@@ -71,7 +77,6 @@ test("cache control", async () => {
   } else {
     expect(indexResp.headers.get("Cache-Control")).toBeUndefined()
   }
-
   const t2 = new Date(2035, 0, 1)
   const staleResp = await workerFetch(
     ctx,
@@ -82,6 +87,37 @@ test("cache control", async () => {
     }),
   )
   expect(staleResp.status).toStrictEqual(304)
+  expect(staleResp.headers.get("Cache-Control")).toStrictEqual("public, no-cache, must-revalidate")
+})
+
+test("updated file-list metadata is revalidated before reuse", async () => {
+  const ctx = createExecutionContext()
+  const original = await upload(ctx, {
+    c: { content: new Blob(["old archive"]), filename: "2-items.zip" },
+    filenames: JSON.stringify([{ name: "old.txt", sizeBytes: 3 }]),
+  })
+
+  const before = await workerFetch(ctx, addRole(original.url, "m"))
+  expect((await before.json<MetaResponse>()).filenames).toStrictEqual([{ name: "old.txt", sizeBytes: 3 }])
+
+  await upload(
+    ctx,
+    {
+      c: { content: new Blob(["new archive"]), filename: "2-items.zip" },
+      filenames: JSON.stringify([
+        { name: "new.txt", sizeBytes: 3 },
+        { name: "folder/second.txt", sizeBytes: 6 },
+      ]),
+    },
+    { method: "PUT", url: original.manageUrl },
+  )
+
+  const after = await workerFetch(ctx, addRole(original.url, "m"))
+  expect(after.headers.get("Cache-Control")).toStrictEqual("public, no-cache, must-revalidate")
+  expect((await after.json<MetaResponse>()).filenames).toStrictEqual([
+    { name: "new.txt", sizeBytes: 3 },
+    { name: "folder/second.txt", sizeBytes: 6 },
+  ])
 })
 
 test("content disposition without specifying filename", async () => {
@@ -142,7 +178,7 @@ test("other HTTP methods", async () => {
     }),
   )
   expect(resp.status).toStrictEqual(405)
-  expect(resp.headers.has("Allow")).toStrictEqual(true)
+  expect(resp.headers.get("Allow")).toStrictEqual("GET, HEAD, PUT, POST, DELETE, OPTIONS")
 })
 
 test("option method", async () => {
@@ -160,7 +196,8 @@ test("option method", async () => {
   )
   expect(resp.status).toStrictEqual(200)
   expect(resp.headers.has("Access-Control-Allow-Origin")).toStrictEqual(true)
-  expect(resp.headers.has("Access-Control-Allow-Methods")).toStrictEqual(true)
+  expect(resp.headers.get("Access-Control-Allow-Methods")).toStrictEqual("GET, HEAD, PUT, POST, DELETE, OPTIONS")
+  expect(resp.headers.get("Access-Control-Allow-Headers")).toStrictEqual("*")
   expect(resp.headers.has("Access-Control-Max-Age")).toStrictEqual(true)
 
   const resp1 = await workerFetch(
@@ -173,5 +210,5 @@ test("option method", async () => {
     }),
   )
   expect(resp1.status).toStrictEqual(200)
-  expect(resp1.headers.has("Allow")).toStrictEqual(true)
+  expect(resp1.headers.get("Allow")).toStrictEqual("GET, HEAD, PUT, POST, DELETE, OPTIONS")
 })

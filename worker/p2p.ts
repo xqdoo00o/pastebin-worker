@@ -1,7 +1,7 @@
 import { genRandStr, jsonResponse, WorkerError } from "./common.js"
 import { verifyAuth } from "./pages/auth.js"
 import { pasteNameAvailable } from "./storage/storage.js"
-import { PASTE_NAME_LEN } from "../shared/constants.js"
+import { PASTE_NAME_LEN, PRIVATE_PASTE_NAME_LEN } from "../shared/constants.js"
 import { parseExpiration, parseExpirationReadable } from "../shared/parsers.js"
 import { parseReadLimit } from "../shared/verify.js"
 import type { P2PCreateResponse } from "../shared/interfaces.js"
@@ -26,10 +26,10 @@ export async function getP2PRoomStatus(env: Env, name: string): Promise<P2PRoomS
 interface P2PCreateOptions {
   expire?: string
   maxTransfers?: string | number
+  isPrivate?: boolean
 }
 
-async function readP2PCreateOptions(request: Request): Promise<P2PCreateOptions> {
-  const url = new URL(request.url)
+async function readP2PCreateOptions(request: Request, url: URL): Promise<P2PCreateOptions> {
   const expire = url.searchParams.get("expire")
   const maxTransfers = url.searchParams.get("maxTransfers")
   if (expire !== null || maxTransfers !== null) {
@@ -44,11 +44,13 @@ async function readP2PCreateOptions(request: Request): Promise<P2PCreateOptions>
     if (typeof body !== "object" || body === null) return {}
     const bodyExpire = (body as { expire?: unknown }).expire
     const bodyMaxTransfers = (body as { maxTransfers?: unknown }).maxTransfers
+    const bodyIsPrivate = (body as { isPrivate?: unknown }).isPrivate
     return {
       ...(typeof bodyExpire === "string" ? { expire: bodyExpire } : {}),
       ...(typeof bodyMaxTransfers === "string" || typeof bodyMaxTransfers === "number"
         ? { maxTransfers: bodyMaxTransfers }
         : {}),
+      ...(bodyIsPrivate === true ? { isPrivate: true } : {}),
     }
   } catch {
     return {}
@@ -77,21 +79,20 @@ function getP2PMaxTransfers(options: P2PCreateOptions, env: Env): number {
   return parsed
 }
 
-export async function handleP2PCreate(request: Request, env: Env): Promise<Response | null> {
-  const url = new URL(request.url)
+async function handleP2PCreate(request: Request, env: Env, url = new URL(request.url)): Promise<Response | null> {
   if (url.pathname !== "/p2p/create") return null
   if (request.method !== "POST") {
     return new Response("method not allowed", { status: 405, headers: { Allow: "POST" } })
   }
 
-  const authResponse = verifyAuth(request, env)
+  const authResponse = await verifyAuth(request, env)
   if (authResponse !== null) return authResponse
-  const options = await readP2PCreateOptions(request)
+  const options = await readP2PCreateOptions(request, url)
   const expirationSeconds = getP2PExpirationSeconds(options, env)
   const maxTransfers = getP2PMaxTransfers(options, env)
 
   for (let attempt = 0; attempt < 30; attempt += 1) {
-    const name = genRandStr(PASTE_NAME_LEN)
+    const name = genRandStr(options.isPrivate ? PRIVATE_PASTE_NAME_LEN : PASTE_NAME_LEN)
     const [isPasteNameAvailable, status] = await Promise.all([
       pasteNameAvailable(env, name),
       getP2PRoomStatus(env, name),
@@ -128,15 +129,18 @@ export async function handleP2PCreate(request: Request, env: Env): Promise<Respo
   throw new WorkerError(503, "unable to allocate a P2P room")
 }
 
-export async function handleP2PUpdate(request: Request, env: Env): Promise<Response | null> {
-  const url = new URL(request.url)
+export async function handleP2PUpdate(
+  request: Request,
+  env: Env,
+  url = new URL(request.url),
+): Promise<Response | null> {
   const match = /^\/p2p\/update\/([^/]+)$/.exec(url.pathname)
   if (!match) return null
   if (request.method !== "POST") {
     return new Response("method not allowed", { status: 405, headers: { Allow: "POST" } })
   }
 
-  const authResponse = verifyAuth(request, env)
+  const authResponse = await verifyAuth(request, env)
   if (authResponse !== null) return authResponse
 
   let body: Record<string, unknown>
@@ -176,8 +180,7 @@ export async function handleP2PUpdate(request: Request, env: Env): Promise<Respo
   })
 }
 
-export async function handleP2PWebSocket(request: Request, env: Env): Promise<Response | null> {
-  const url = new URL(request.url)
+async function handleP2PWebSocket(request: Request, env: Env, url = new URL(request.url)): Promise<Response | null> {
   const match = /^\/p2p\/ws\/([^/]+)$/.exec(url.pathname)
   if (!match) return null
   if (request.headers.get("Upgrade") !== "websocket") {
@@ -190,4 +193,12 @@ export async function handleP2PWebSocket(request: Request, env: Env): Promise<Re
   }
 
   return await roomStub(env, match[1]).fetch(request)
+}
+
+export async function handleP2PRequest(request: Request, env: Env): Promise<Response | null> {
+  const url = new URL(request.url)
+  if (url.pathname === "/p2p/create") return handleP2PCreate(request, env, url)
+  if (url.pathname.startsWith("/p2p/update/")) return handleP2PUpdate(request, env, url)
+  if (url.pathname.startsWith("/p2p/ws/")) return handleP2PWebSocket(request, env, url)
+  return null
 }

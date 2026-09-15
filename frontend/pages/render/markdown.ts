@@ -3,8 +3,8 @@
 // <pre><code class="language-X">, then loads highlight.js core plus only the
 // languages actually present. Shares language chunks with the React display
 // page so the browser hits cache when navigating between the two.
-import "../../styles/highlight-theme-light.css"
-import "../../styles/highlight-theme-dark.css"
+import "../../styles/highlight-theme.css"
+import "../../styles/markdown.css"
 import { canonicalLangName, loaderForLang } from "../../utils/highlight-client.js"
 
 const LANG_RE = /language-([\w-]+)/i

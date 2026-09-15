@@ -2,14 +2,12 @@ import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from "r
 import type { SelectHandle } from "./ui/index.js"
 import { Autocomplete, AutocompleteItem, Input, Select, SelectItem } from "./ui/index.js"
 
-import { autoCompleteOverrides, inputOverrides, selectOverrides, tst } from "../utils/overrides.js"
 import { highlightHTML, useAvailableLanguages, useHljsForLang } from "../utils/highlight.js"
 import { XIcon } from "./icons.js"
 import { DEFAULT_EDIT_FILENAME } from "../../shared/constants.js"
 import { countTextLines, LineNumbers } from "./LineNumbers.js"
 
-import "../styles/highlight-theme-light.css"
-import "../styles/highlight-theme-dark.css"
+import "../styles/highlight-theme.css"
 
 interface CodeInputProps extends React.HTMLProps<HTMLDivElement> {
   content: string
@@ -148,10 +146,9 @@ export function CodeEditor({
 
   return (
     <div className={className} {...rest}>
-      <div className={"mb-2 gap-2 flex flex-row" + " "}>
+      <div className="mb-2 flex gap-2">
         <Input
           className="flex-1"
-          classNames={inputOverrides}
           type={"text"}
           label={"File name"}
           placeholder={DEFAULT_EDIT_FILENAME}
@@ -162,7 +159,6 @@ export function CodeEditor({
         />
         <Autocomplete
           className={"max-w-[8em]"}
-          classNames={autoCompleteOverrides}
           label={"Language"}
           size={"sm"}
           isClearable
@@ -184,7 +180,6 @@ export function CodeEditor({
           size={"sm"}
           label={"Indent With"}
           className={"w-[6em] text-foreground"}
-          classNames={selectOverrides}
           selectedKeys={[formatTabSetting(tabSetting, false)]}
           onSelectionChange={(s) => {
             const key = Array.from(s)[0]
@@ -197,9 +192,7 @@ export function CodeEditor({
           ))}
         </Select>
       </div>
-      <div
-        className={`text-sm w-full bg-default-100 ${tst} rounded-xl p-2 relative border border-default-200 hover:border-default-400 focus-within:border-default-400`}
-      >
+      <div className="relative w-full rounded-xl border border-default-200 bg-default-100 p-2 text-sm transition-colors hover:border-default-400 focus-within:border-default-400">
         <div
           className={`relative w-full`}
           style={{ tabSize: tabSetting.char === "tab" ? tabSetting.width : undefined }}
@@ -207,7 +200,7 @@ export function CodeEditor({
           <div className={"w-full font-mono top-0 left-0 absolute"}>
             <pre
               ref={refHighlighting}
-              className={`text-foreground ${tst} w-full overflow-x-hidden`}
+              className="code-editor-preview w-full overflow-x-hidden text-foreground"
               style={{ marginLeft: lineNumOffset, width: `calc(100% - ${lineNumOffset})`, height: `${heightPx}px` }}
               dangerouslySetInnerHTML={{ __html: highlightedHTML }}
             ></pre>
@@ -216,7 +209,7 @@ export function CodeEditor({
               lineCount={lineCount}
               className={
                 "line-number-rows font-mono absolute pointer-events-none text-default-500 top-0 left-1 overflow-hidden " +
-                `border-solid border-default-300 border-r-1 ${tst}`
+                "border-r-1 border-default-300"
               }
               style={{ height: `${heightPx}px` }}
             />

@@ -5,14 +5,10 @@ export function decode(buffer: ArrayBuffer | ArrayBufferView<ArrayBufferLike>): 
   return new TextDecoder().decode(buffer)
 }
 
-export function btoa_utf8(value: string): string {
-  return btoa(String.fromCharCode(...new TextEncoder().encode(value)))
-}
-
 export function atob_utf8(value: string): string {
   const value_latin1 = atob(value)
   return new TextDecoder("utf-8").decode(
-    Uint8Array.from({ length: value_latin1.length }, (element, index) => value_latin1.charCodeAt(index)),
+    Uint8Array.from({ length: value_latin1.length }, (_, index) => value_latin1.charCodeAt(index)),
   )
 }
 
@@ -24,8 +20,8 @@ export class WorkerError extends Error {
   }
 }
 
-export function jsonResponse(value: unknown, init?: ResponseInit): Response {
-  return new Response(JSON.stringify(value), {
+export function jsonResponse(value: unknown, init?: ResponseInit, space?: number): Response {
+  return new Response(JSON.stringify(value, null, space), {
     ...init,
     headers: {
       "Content-Type": "application/json;charset=UTF-8",

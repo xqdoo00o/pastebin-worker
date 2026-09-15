@@ -410,6 +410,21 @@ async function persistPaste(
   await putPasteIndex(env, pasteName, content, metadata, kvExpiration)
 }
 
+function pasteReadState(
+  metadata: PasteMetadata,
+  readStateVersion: string | undefined,
+  remainingReads: number | null,
+  cleanupAt?: number,
+): PasteReadStateSeed | undefined {
+  if (readStateVersion === undefined) return undefined
+  return {
+    version: readStateVersion,
+    remainingReads,
+    expiresAt: metadata.willExpireAtUnix * 1000,
+    ...(cleanupAt === undefined ? {} : { cleanupAt }),
+  }
+}
+
 export async function updatePaste(
   env: Env,
   pasteName: string,
@@ -429,15 +444,12 @@ export async function updatePaste(
     accessCounter: originalMetadata.accessCounter,
     readStateVersion,
   })
-  const readState =
-    readStateVersion === undefined
-      ? undefined
-      : {
-          version: readStateVersion,
-          remainingReads: options.remainingReads ?? null,
-          expiresAt: metadata.willExpireAtUnix * 1000,
-          cleanupAt: Math.max(originalMetadata.willExpireAtUnix, metadata.willExpireAtUnix) * 1000,
-        }
+  const readState = pasteReadState(
+    metadata,
+    readStateVersion,
+    options.remainingReads ?? null,
+    Math.max(originalMetadata.willExpireAtUnix, metadata.willExpireAtUnix) * 1000,
+  )
   await persistPaste(env, pasteName, content, metadata, options, readState)
 
   return metadata
@@ -457,14 +469,7 @@ export async function createPaste(
     accessCounter: 0,
     readStateVersion,
   })
-  const readState =
-    readStateVersion === undefined
-      ? undefined
-      : {
-          version: readStateVersion,
-          remainingReads: options.remainingReads!,
-          expiresAt: metadata.willExpireAtUnix * 1000,
-        }
+  const readState = pasteReadState(metadata, readStateVersion, options.remainingReads ?? null)
   await persistPaste(env, pasteName, content, metadata, options, readState)
 
   return metadata
@@ -472,13 +477,9 @@ export async function createPaste(
 
 export async function pasteNameAvailable(env: Env, pasteName: string): Promise<boolean> {
   const item = await env.PB.getWithMetadata<PasteMetadata>(pasteName)
-  if (item.value == null) {
-    return true
-  } else if (item.metadata === null) {
-    throw new WorkerError(500, `paste of name '${pasteName}' has no metadata`)
-  } else {
-    return item.metadata.willExpireAtUnix < new Date().getTime() / 1000
-  }
+  if (item.value === null) return true
+  if (item.metadata === null) throw new WorkerError(500, `paste of name '${pasteName}' has no metadata`)
+  return item.metadata.willExpireAtUnix < Date.now() / 1000
 }
 
 interface RandomPasteNameOptions {

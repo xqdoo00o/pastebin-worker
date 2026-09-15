@@ -3,8 +3,6 @@ dist
 **/*.rs.bk
 bin/
 pkg/
-argon2/pkg*/
-wasm-pack.log
 node_modules/
 .cargo-ok
 
@@ -15,3 +13,9 @@ coverage
 .pnp.*
 .yarn
 __pycache__
+
+/codecs/.tools/
+/codecs/*/.bench/
+/codecs/*/build*/
+/codecs/*/dist*/
+/codecs/*/third_party/

@@ -36,12 +36,12 @@ test("privacy url with option p", async () => {
 
   // check url
   const url = responseJson.url
-  expect(url.startsWith(BASE_URL))
+  expect(url.startsWith(BASE_URL)).toBe(true)
 
   // check name
   const name = url.slice(BASE_URL.length + 1)
   expect(name.length).toStrictEqual(PRIVATE_PASTE_NAME_LEN)
-  expect(RAND_NAME_REGEX.test(name))
+  expect(RAND_NAME_REGEX.test(name)).toBe(true)
 
   // check revisit
   const revisitSesponse = await workerFetch(ctx, url)
@@ -75,30 +75,6 @@ test("expire with option e", async () => {
   await testFailParse("abc")
   await testFailParse("1c")
   await testFailParse("-100m")
-})
-
-test("custom path with option n", async () => {
-  const blob1 = genRandomBlob(1024)
-  const ctx = createExecutionContext()
-
-  // check bad names
-  const badNames = ["a", "ab", "..."]
-  for (const name of badNames) {
-    await uploadExpectStatus(ctx, { c: blob1, n: name }, 400)
-  }
-
-  // check good name upload
-  const goodName = "goodName123+_-[]*$@,;"
-  const uploadResponseJson = await upload(ctx, {
-    c: blob1,
-    n: goodName,
-  })
-  expect(uploadResponseJson.url).toStrictEqual(`${BASE_URL}/~${goodName}`)
-
-  // check revisit
-  const revisitResponse = await workerFetch(ctx, uploadResponseJson.url)
-  expect(revisitResponse.status).toStrictEqual(200)
-  expect(await areBlobsEqual(await revisitResponse.blob(), blob1)).toStrictEqual(true)
 })
 
 test("custom passwd with option s", async () => {

@@ -3,6 +3,8 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers"
 
 export default defineConfig({
   test: {
+    // Leave enough process capacity for the Workers pool when all projects run together.
+    maxWorkers: 4,
     coverage: {
       provider: "istanbul", // v8 is not supported due for cf workers
       reporter: ["text", "json-summary", "html", "json"],

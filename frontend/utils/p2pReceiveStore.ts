@@ -1,4 +1,4 @@
-import { isP2PFileMeta, verificationBlockSize, type P2PFileMeta } from "./p2pCommon.js"
+import { isP2PFileMeta, isVerificationHash, verificationBlockSize, type P2PFileMeta } from "./p2p/protocol.js"
 import { isUuid } from "../../shared/verify.js"
 import {
   acquireOPFSFileLease,
@@ -8,6 +8,14 @@ import {
   type OPFSFileLease,
 } from "./opfs.js"
 import { acquireExclusiveWebLock, type WebLockLease } from "./webLock.js"
+import { WorkerRequestMap } from "./workerRequests.js"
+import {
+  browserStorage,
+  readStorageJson,
+  removeStorageItem,
+  storageKeysWithPrefix,
+  writeStorageJson,
+} from "./browserStorage.js"
 
 const checkpointSchemaVersion = 1
 const sessionPeerSchemaVersion = 1
@@ -32,8 +40,11 @@ export interface P2PResumeCheckpoint {
 interface P2PSessionPeer {
   version: typeof sessionPeerSchemaVersion
   peerId: string
+  recoveryRetryToken?: string
   updatedAt: number
 }
+
+export type P2PSessionPeerState = Pick<P2PSessionPeer, "peerId" | "recoveryRetryToken">
 
 interface WorkerResponse {
   id: number
@@ -68,7 +79,7 @@ function isCheckpoint(value: unknown, roomName: string, now = Date.now()): value
     checkpoint.receivedBytes > 0 &&
     checkpoint.receivedBytes < checkpoint.meta.size &&
     Array.isArray(checkpoint.completedHashes) &&
-    checkpoint.completedHashes.every((hash) => typeof hash === "string" && /^[a-f0-9]{40}$/i.test(hash)) &&
+    checkpoint.completedHashes.every(isVerificationHash) &&
     checkpoint.completedHashes.length * verificationBlockSize <= checkpoint.receivedBytes &&
     (!checkpoint.meta.verifyTransfer ||
       checkpoint.receivedBytes - checkpoint.completedHashes.length * verificationBlockSize < verificationBlockSize) &&
@@ -86,6 +97,7 @@ function isSessionPeer(value: unknown, now = Date.now()): value is P2PSessionPee
   return (
     peer.version === sessionPeerSchemaVersion &&
     isUuid(peer.peerId) &&
+    (peer.recoveryRetryToken === undefined || isUuid(peer.recoveryRetryToken)) &&
     typeof peer.updatedAt === "number" &&
     Number.isFinite(peer.updatedAt) &&
     peer.updatedAt > now - sessionPeerMaxAgeMs &&
@@ -93,136 +105,98 @@ function isSessionPeer(value: unknown, now = Date.now()): value is P2PSessionPee
   )
 }
 
-function readSessionPeerValue(raw: string, now = Date.now()): P2PSessionPeer | undefined {
-  // Migrate the UUID-only format written by versions before session peer expiry
-  // was introduced.
-  if (isUuid(raw)) return { version: sessionPeerSchemaVersion, peerId: raw, updatedAt: now }
-  try {
-    const value: unknown = JSON.parse(raw)
-    return isSessionPeer(value, now) ? value : undefined
-  } catch {
-    return undefined
-  }
+function readSessionPeerValue(storage: Storage | undefined, key: string, now = Date.now()): P2PSessionPeer | undefined {
+  return readStorageJson(storage, key, (value) => (isSessionPeer(value, now) ? value : undefined))
 }
 
-export function readP2PSessionPeerId(roomName: string): string | undefined {
-  if (typeof sessionStorage === "undefined") return undefined
-  try {
-    const key = sessionPeerKey(roomName)
-    const raw = sessionStorage.getItem(key)
-    if (raw === null) return undefined
-    const peer = readSessionPeerValue(raw)
-    if (peer) {
-      if (raw === peer.peerId) sessionStorage.setItem(key, JSON.stringify(peer))
-      return peer.peerId
-    }
-    sessionStorage.removeItem(key)
-  } catch {
-    // Session storage may be disabled.
-  }
+export function readP2PSessionPeer(roomName: string): P2PSessionPeerState | undefined {
+  const storage = browserStorage("session")
+  const key = sessionPeerKey(roomName)
+  const peer = readSessionPeerValue(storage, key)
+  if (peer) return { peerId: peer.peerId, recoveryRetryToken: peer.recoveryRetryToken }
+  removeStorageItem(storage, key)
   return undefined
 }
 
-export function writeP2PSessionPeerId(roomName: string, peerId: string): boolean {
-  if (typeof sessionStorage === "undefined" || !isUuid(peerId)) return false
-  try {
-    const peer: P2PSessionPeer = {
-      version: sessionPeerSchemaVersion,
-      peerId,
-      updatedAt: Date.now(),
-    }
-    sessionStorage.setItem(sessionPeerKey(roomName), JSON.stringify(peer))
-    return true
-  } catch {
+export function writeP2PSessionPeer(roomName: string, peerId: string): boolean {
+  if (!isUuid(peerId)) return false
+  const storage = browserStorage("session")
+  const key = sessionPeerKey(roomName)
+  const existing = readSessionPeerValue(storage, key)
+  const peer: P2PSessionPeer = {
+    version: sessionPeerSchemaVersion,
+    peerId,
+    ...(existing?.peerId === peerId && existing.recoveryRetryToken
+      ? { recoveryRetryToken: existing.recoveryRetryToken }
+      : {}),
+    updatedAt: Date.now(),
+  }
+  return writeStorageJson(storage, key, peer)
+}
+
+export function setP2PSessionRecoveryRetryToken(
+  roomName: string,
+  peerId: string,
+  recoveryRetryToken: string | undefined,
+): boolean {
+  if (!isUuid(peerId) || (recoveryRetryToken !== undefined && !isUuid(recoveryRetryToken))) {
     return false
   }
+  const storage = browserStorage("session")
+  const key = sessionPeerKey(roomName)
+  const existing = readSessionPeerValue(storage, key)
+  if (existing?.peerId !== peerId) return false
+  const peer: P2PSessionPeer = {
+    version: sessionPeerSchemaVersion,
+    peerId,
+    ...(recoveryRetryToken ? { recoveryRetryToken } : {}),
+    updatedAt: Date.now(),
+  }
+  return writeStorageJson(storage, key, peer)
 }
 
 export function cleanupStaleP2PSessionPeers(now = Date.now()): number {
-  if (typeof sessionStorage === "undefined") return 0
+  const storage = browserStorage("session")
   let removed = 0
-  try {
-    const keys: string[] = []
-    for (let index = 0; index < sessionStorage.length; index += 1) {
-      const key = sessionStorage.key(index)
-      if (key?.startsWith(sessionPeerKeyPrefix)) keys.push(key)
-    }
-    for (const key of keys) {
-      const roomName = key.slice(sessionPeerKeyPrefix.length)
-      const raw = sessionStorage.getItem(key)
-      const peer = raw === null ? undefined : readSessionPeerValue(raw, now)
-      if (roomName && peer) {
-        if (raw === peer.peerId) sessionStorage.setItem(key, JSON.stringify(peer))
-        continue
-      }
-      sessionStorage.removeItem(key)
-      removed += 1
-    }
-  } catch {
-    // Storage may be disabled.
+  for (const key of storageKeysWithPrefix(storage, sessionPeerKeyPrefix)) {
+    const roomName = key.slice(sessionPeerKeyPrefix.length)
+    const peer = readSessionPeerValue(storage, key, now)
+    if (roomName && peer) continue
+    if (removeStorageItem(storage, key)) removed += 1
   }
   return removed
 }
 
 export function cleanupStaleP2PResumeCheckpoints(now = Date.now()): number {
-  if (typeof localStorage === "undefined") return 0
+  const storage = browserStorage("local")
   let removed = 0
-  try {
-    const keys: string[] = []
-    for (let index = 0; index < localStorage.length; index += 1) {
-      const key = localStorage.key(index)
-      if (key?.startsWith(checkpointKeyPrefix)) keys.push(key)
-    }
-    for (const key of keys) {
-      const roomName = key.slice(checkpointKeyPrefix.length)
-      try {
-        const raw = localStorage.getItem(key)
-        const value: unknown = raw === null ? undefined : JSON.parse(raw)
-        if (roomName && isCheckpoint(value, roomName, now)) continue
-      } catch {
-        // Invalid and obsolete checkpoints are removed below.
-      }
-      localStorage.removeItem(key)
-      removed += 1
-    }
-  } catch {
-    // Storage may be disabled.
+  for (const key of storageKeysWithPrefix(storage, checkpointKeyPrefix)) {
+    const roomName = key.slice(checkpointKeyPrefix.length)
+    const checkpoint = readStorageJson(storage, key, (value) =>
+      roomName && isCheckpoint(value, roomName, now) ? value : undefined,
+    )
+    if (checkpoint) continue
+    if (removeStorageItem(storage, key)) removed += 1
   }
   return removed
 }
 
 export function readP2PResumeCheckpoint(roomName: string): P2PResumeCheckpoint | undefined {
-  if (typeof localStorage === "undefined") return undefined
-  try {
-    const raw = localStorage.getItem(checkpointKey(roomName))
-    if (!raw) return undefined
-    const value: unknown = JSON.parse(raw)
-    if (isCheckpoint(value, roomName)) return value
-    localStorage.removeItem(checkpointKey(roomName))
-  } catch {
-    // Storage may be disabled or contain an obsolete checkpoint.
-  }
+  const storage = browserStorage("local")
+  const key = checkpointKey(roomName)
+  const checkpoint = readStorageJson(storage, key, (value) => (isCheckpoint(value, roomName) ? value : undefined))
+  if (checkpoint) return checkpoint
+  removeStorageItem(storage, key)
   return undefined
 }
 
 export function writeP2PResumeCheckpoint(checkpoint: P2PResumeCheckpoint): boolean {
-  writeP2PSessionPeerId(checkpoint.roomName, checkpoint.peerId)
-  if (typeof localStorage === "undefined") return false
-  try {
-    localStorage.setItem(checkpointKey(checkpoint.roomName), JSON.stringify(checkpoint))
-    return true
-  } catch {
-    return false
-  }
+  writeP2PSessionPeer(checkpoint.roomName, checkpoint.peerId)
+  return writeStorageJson(browserStorage("local"), checkpointKey(checkpoint.roomName), checkpoint)
 }
 
 export function removeP2PResumeCheckpoint(roomName: string): void {
-  if (typeof localStorage === "undefined") return
-  try {
-    localStorage.removeItem(checkpointKey(roomName))
-  } catch {
-    // Storage may be disabled.
-  }
+  removeStorageItem(browserStorage("local"), checkpointKey(roomName))
 }
 
 export function p2pResumeMetaMatches(left: P2PFileMeta, right: P2PFileMeta): boolean {
@@ -238,8 +212,7 @@ export function p2pResumeMetaMatches(left: P2PFileMeta, right: P2PFileMeta): boo
 
 export class P2PPersistentReceiveStore {
   private readonly worker: Worker
-  private nextRequestId = 1
-  private readonly requests = new Map<number, { resolve: (value: unknown) => void; reject: (reason: Error) => void }>()
+  private readonly requests = new WorkerRequestMap<unknown>()
   private closed = false
   private closeError: Error | undefined
   private pendingWritePosition: number | undefined
@@ -255,11 +228,8 @@ export class P2PPersistentReceiveStore {
     })
     this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       const response = event.data
-      const request = this.requests.get(response.id)
-      if (!request) return
-      this.requests.delete(response.id)
-      if (response.ok) request.resolve(response.value)
-      else request.reject(new Error(response.error || "P2P storage worker failed."))
+      if (response.ok) this.requests.resolve(response.id, response.value)
+      else this.requests.reject(response.id, new Error(response.error || "P2P storage worker failed."))
     }
     this.worker.onerror = () => this.failWorker(new Error("P2P storage worker failed."))
     this.worker.onmessageerror = () => this.failWorker(new Error("P2P storage worker returned an invalid message."))
@@ -400,21 +370,7 @@ export class P2PPersistentReceiveStore {
     transfer: Transferable[] = [],
   ): Promise<unknown> {
     if (this.closed) return Promise.reject(this.closeError ?? new Error("P2P storage worker is closed."))
-    const id = this.nextRequestId++
-    return new Promise((resolve, reject) => {
-      this.requests.set(id, { resolve, reject })
-      try {
-        this.worker.postMessage({ id, type, ...payload }, transfer)
-      } catch (error) {
-        this.requests.delete(id)
-        reject(error instanceof Error ? error : new Error(String(error)))
-      }
-    })
-  }
-
-  private failPending(error: Error): void {
-    for (const request of this.requests.values()) request.reject(error)
-    this.requests.clear()
+    return this.requests.request((id) => this.worker.postMessage({ id, type, ...payload }, transfer))
   }
 
   private failWorker(error: Error): void {
@@ -423,14 +379,14 @@ export class P2PPersistentReceiveStore {
     this.closeError = error
     this.clearPendingWrite()
     this.worker.terminate()
-    this.failPending(error)
+    this.requests.rejectAll(error)
   }
 
   private terminate(): void {
     this.closed = true
     this.clearPendingWrite()
     this.worker.terminate()
-    this.failPending(new Error("P2P storage worker closed."))
+    this.requests.rejectAll(new Error("P2P storage worker closed."))
   }
 }
 

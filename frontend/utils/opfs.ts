@@ -1,15 +1,24 @@
 import { acquireExclusiveWebLock, type WebLockLease } from "./webLock.js"
 import { OPFS_LARGE_FILE_THRESHOLD_BYTES, OPFS_REQUIRED_SPACE_MULTIPLIER } from "../../shared/constants.js"
+import {
+  browserStorage,
+  readStorageItem,
+  removeStorageItem,
+  setStorageItem,
+  storageKeysWithPrefix,
+} from "./browserStorage.js"
 
 const tempFilePrefixes = {
   download: "paste-decrypt-",
   archive: "paste-archive-",
+  optical: "paste-optical-",
 } as const
+export type OPFSTemporaryFilePurpose = keyof typeof tempFilePrefixes
 const tempFileSuffix = ".tmp"
 const tempFileMaxAgeMs = 24 * 60 * 60 * 1000
 const downloadDeletionGraceMs = 60 * 60 * 1000
 const pendingDeletionKeyPrefix = "pastebin-worker:opfs-delete:"
-const managedTemporaryFilePattern = /^(?:paste-(?:decrypt|archive)-|p2p-).+\.tmp$/
+const managedTemporaryFilePattern = /^(?:paste-(?:decrypt|archive|optical)-|p2p-).+\.tmp$/
 
 export const OPFS_DOWNLOAD_THRESHOLD = OPFS_LARGE_FILE_THRESHOLD_BYTES
 
@@ -17,12 +26,22 @@ type OPFSStorageManager = StorageManager & { getDirectory?: () => Promise<FileSy
 
 export type OPFSFileLease = WebLockLease
 
+/** A file that may carry an application-managed backing-store lifecycle. */
+export interface ManagedFile {
+  file: File
+  cleanup?: () => Promise<void>
+  deferCleanup?: () => void
+}
+
+/** Successful result of closing an OPFS temporary file. */
+export interface CompletedOPFSTemporaryFile extends ManagedFile {
+  cleanup: () => Promise<void>
+  deferCleanup: () => void
+}
+
 export interface OPFSTemporaryFile {
   write(data: FileSystemWriteChunkType): Promise<void>
-  finish(
-    filename: string,
-    type: string,
-  ): Promise<{ file: File; cleanup: () => Promise<void>; deferCleanup: () => void }>
+  finish(filename: string, type: string): Promise<CompletedOPFSTemporaryFile>
   abort(): Promise<void>
 }
 
@@ -41,55 +60,41 @@ function isNotFoundError(error: unknown): boolean {
 }
 
 export function queueOPFSFileDeletion(filename: string): void {
-  if (!isManagedTemporaryFilename(filename) || typeof localStorage === "undefined") return
-  try {
-    localStorage.setItem(`${pendingDeletionKeyPrefix}${filename}`, "1")
-  } catch {
-    // Page teardown and disabled storage can make localStorage unavailable.
-  }
+  if (!isManagedTemporaryFilename(filename)) return
+  setStorageItem(browserStorage("local"), `${pendingDeletionKeyPrefix}${filename}`, "1")
 }
 
 export function deferOPFSFileDeletion(filename: string, notBefore = Date.now() + downloadDeletionGraceMs): void {
-  if (!isManagedTemporaryFilename(filename) || !Number.isFinite(notBefore) || typeof localStorage === "undefined") {
+  if (!isManagedTemporaryFilename(filename) || !Number.isFinite(notBefore)) {
     return
   }
-  try {
-    localStorage.setItem(`${pendingDeletionKeyPrefix}${filename}`, String(Math.max(2, Math.ceil(notBefore))))
-  } catch {
-    // Page teardown and disabled storage can make localStorage unavailable.
-  }
+  setStorageItem(
+    browserStorage("local"),
+    `${pendingDeletionKeyPrefix}${filename}`,
+    String(Math.max(2, Math.ceil(notBefore))),
+  )
 }
 
 export function clearQueuedOPFSFileDeletion(filename: string): void {
-  if (!isManagedTemporaryFilename(filename) || typeof localStorage === "undefined") return
-  try {
-    localStorage.removeItem(`${pendingDeletionKeyPrefix}${filename}`)
-  } catch {
-    // Cleanup is best-effort.
-  }
+  if (!isManagedTemporaryFilename(filename)) return
+  removeStorageItem(browserStorage("local"), `${pendingDeletionKeyPrefix}${filename}`)
 }
 
 function queuedOPFSFileDeletions(now = Date.now()): string[] {
-  if (typeof localStorage === "undefined") return []
+  const storage = browserStorage("local")
   const filenames: string[] = []
   const invalidKeys: string[] = []
-  try {
-    for (let index = 0; index < localStorage.length; index += 1) {
-      const key = localStorage.key(index)
-      if (!key?.startsWith(pendingDeletionKeyPrefix)) continue
-      const filename = key.slice(pendingDeletionKeyPrefix.length)
-      const rawNotBefore = localStorage.getItem(key)
-      const notBefore = rawNotBefore === "1" ? 0 : Number(rawNotBefore)
-      if (!isManagedTemporaryFilename(filename) || !Number.isFinite(notBefore) || notBefore < 0) {
-        invalidKeys.push(key)
-      } else if (notBefore <= now) {
-        filenames.push(filename)
-      }
+  for (const key of storageKeysWithPrefix(storage, pendingDeletionKeyPrefix)) {
+    const filename = key.slice(pendingDeletionKeyPrefix.length)
+    const rawNotBefore = readStorageItem(storage, key)
+    const notBefore = rawNotBefore === "1" ? 0 : Number(rawNotBefore)
+    if (!isManagedTemporaryFilename(filename) || !Number.isFinite(notBefore) || notBefore < 0) {
+      invalidKeys.push(key)
+    } else if (notBefore <= now) {
+      filenames.push(filename)
     }
-    for (const key of invalidKeys) localStorage.removeItem(key)
-  } catch {
-    return []
   }
+  for (const key of invalidKeys) removeStorageItem(storage, key)
   return filenames
 }
 
@@ -97,7 +102,7 @@ export function acquireOPFSFileLease(filename: string): Promise<OPFSFileLease | 
   return acquireExclusiveWebLock(opfsFileLockName(filename))
 }
 
-export async function removeOPFSFileIfUnlocked(root: FileSystemDirectoryHandle, filename: string): Promise<boolean> {
+async function removeOPFSFileIfUnlocked(root: FileSystemDirectoryHandle, filename: string): Promise<boolean> {
   const leaseRequest = acquireOPFSFileLease(filename)
   // Without a cross-tab lock primitive, automatic deletion is not safe.
   if (!leaseRequest) return false
@@ -171,7 +176,7 @@ export function cleanupOPFSTemporaryFilesOnce(root: FileSystemDirectoryHandle): 
 
 export async function createOPFSTemporaryFile(
   expectedSize: number,
-  purpose: keyof typeof tempFilePrefixes = "download",
+  purpose: OPFSTemporaryFilePurpose = "download",
 ): Promise<OPFSTemporaryFile> {
   const storage = navigator.storage as OPFSStorageManager | undefined
   if (typeof storage?.getDirectory !== "function") {

@@ -1,12 +1,12 @@
 name = "pb"
-compatibility_date = "2026-06-16"
+compatibility_date = "2026-08-04"
 
 workers_dev = false
 main = "worker/index.ts"
 
 [build]
 command = "pnpm ensure:argon2"
-watch_dir = ["argon2/src", "argon2/Cargo.toml"]
+watch_dir = ["codecs/argon2/src", "codecs/argon2/build.mjs"]
 
 [[rules]]
 type = "Text"
@@ -78,11 +78,17 @@ TOS_MAIL = "pb@shz.al"
 # Cache-Control max-age for static pages
 CACHE_STATIC_PAGE_AGE = 7200
 
-# Cache-Control max-age for paste pages
-CACHE_PASTE_AGE = 600
-
 # Default input tab on the home page: "edit" or "file"
 DEFAULT_TAB = "edit"
+
+# Default transfer method on the index page: "upload", "p2p", or "optical"
+DEFAULT_TRANSFER_METHOD = "upload"
+
+# Default ZIP archive compression for Upload/P2P: "deflate" or "zstd"
+DEFAULT_ARCHIVE_COMPRESSION = "deflate"
+
+# Default link type for Upload/P2P: "short" or "long"
+DEFAULT_LINK_TYPE = "short"
 
 # Default expiration
 DEFAULT_EXPIRATION = "7d"
@@ -92,6 +98,9 @@ MAX_EXPIRATION = "90d"
 
 # Default reads
 DEFAULT_READS = 0
+
+# Whether end-to-end encryption is enabled by default for Upload
+DEFAULT_E2E_ENCRYPTION = false
 
 # A map of usernames to password hashes: { username = "password hash" }
 # Run `pnpm password` to generate a password hash.
@@ -106,9 +115,6 @@ R2_MAX_ALLOWED = "256M"
 
 # The following mimetypes will be converted to text/plain
 DISALLOWED_MIME_FOR_PASTE = ["text/html", "audio/x-mpegurl"]
-
-# Whether P2P transfer is enabled by default on the index page
-DEFAULT_P2P_TRANSFER = false
 
 # Default P2P pairing link expiration
 DEFAULT_P2P_EXPIRATION = "6h"
@@ -134,4 +140,18 @@ DEFAULT_P2P_VERIFY = true
 # Include a stun: URL when you want browsers to try direct connectivity first.
 # Also set TURN_SHARED_SECRET, run:
 #    pnpm wrangler secret put TURN_SHARED_SECRET
-# TURN_URLS = []
+TURN_URLS = []
+
+# Default QR camera transfer settings.
+# TX FPS: 10, 15, 20, 24, 30, 50, or 60
+DEFAULT_QR_TX_FPS = 30
+
+# Bytes carried by each QR frame: 500, 1000, 1465, 1850, 2331, or 2953.
+# Use a size that fits the selected ECC level (L supports the largest frames).
+DEFAULT_QR_FRAME_BYTES = 2953
+
+# QR error correction level: "L", "M", "Q", or "H"
+DEFAULT_QR_ECC = "L"
+
+# QR codes shown at once: 1, 2 (1x2), 4 (2x2), 6 (2x3), or 9(3x3)
+DEFAULT_QR_LAYOUT = 4

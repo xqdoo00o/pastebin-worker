@@ -1,23 +1,12 @@
 import type { CardProps } from "./ui/index.js"
-import {
-  Button,
-  Card,
-  CardBody,
-  CardHeader,
-  CircularProgress,
-  Divider,
-  Input,
-  Tooltip,
-  mergeClasses,
-} from "./ui/index.js"
+import { Divider, PanelCard, StatusBanner, Tooltip } from "./ui/index.js"
 import type { P2PCreateResponse, P2PIceServer } from "../../shared/interfaces.js"
-import type { P2PSenderFileInfo, P2PSenderPeerInfo } from "../utils/p2pCommon.js"
-import { CopyWidget } from "./CopyWidget.js"
-import { QrCodeTooltip } from "./QrCodeTooltip.js"
+import type { P2PSenderFileInfo, P2PSenderPeerInfo } from "../utils/p2p/protocol.js"
 import { InfoTooltip } from "./InfoTooltip.js"
-import { tst } from "../utils/overrides.js"
 import { P2PProgressBar } from "./P2PProgressBar.js"
 import { RelayConnectionIcon } from "./icons.js"
+import { ShareUrlField } from "./ShareUrlField.js"
+import { TransferLoadingState } from "./TransferLoadingState.js"
 
 interface P2PTransferPanelProps extends CardProps {
   isLoading: boolean
@@ -71,7 +60,7 @@ function P2PPeerStatus({ peer }: { peer: P2PSenderPeerInfo }) {
           <span
             role="status"
             aria-label={peer.connectionPhase === "pairing" ? "Pairing WebRTC connection" : "Retrying WebRTC pairing"}
-            className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-primary-200 border-t-primary"
+            className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-primary-100 border-t-primary"
           />
         )}
       </div>
@@ -129,10 +118,11 @@ export function P2PTransferPanel({
   transferGroups.sort((left, right) => left.file.order - right.file.order)
 
   return (
-    <Card classNames={mergeClasses({ base: tst }, { base: className })} {...rest}>
-      <CardHeader className="flex items-center justify-between gap-3 pl-4 pb-2 text-2xl">
-        <span>P2P Transfer</span>
-        {hasTurn && (
+    <PanelCard
+      title="P2P Transfer"
+      className={className}
+      headerEnd={
+        hasTurn ? (
           <Tooltip
             placement="bottom"
             contentClassName="max-w-sm whitespace-normal rounded-lg bg-gray-800 px-3 py-2 text-sm text-white shadow-lg"
@@ -161,76 +151,54 @@ export function P2PTransferPanel({
               <span aria-hidden="true" className="size-2 rounded-full bg-success" />
             </span>
           </Tooltip>
-        )}
-      </CardHeader>
-      <Divider />
-      <CardBody>
-        {isLoading && !response ? (
-          <div className="w-full flex flex-col items-center justify-center gap-2 py-4">
-            <CircularProgress aria-label="Preparing P2P transfer..." />
-            <span className="text-sm text-foreground-500">Preparing P2P link...</span>
-            {onCancel && (
-              <Button size="sm" variant="ghost" onPress={onCancel} className="mt-1">
-                Cancel
-              </Button>
-            )}
-          </div>
-        ) : (
-          response && (
-            <>
-              <div className="mb-2 flex items-end gap-2">
-                <Input
-                  readOnly
-                  className="mb-0 min-w-0 flex-1"
-                  label="Pair URL"
-                  labelExtra={
-                    <InfoTooltip label="More information" compact>
-                      Share this URL to the receiver. Keep this page open and your screen unlocked. The file is not
-                      uploaded; closing this page or locking your phone will interrupt the transfer.
-                    </InfoTooltip>
-                  }
-                  value={displayUrl}
-                  endContent={<QrCodeTooltip value={displayUrl} className="hover:bg-default-200" />}
-                />
-                <CopyWidget
-                  label="Copy link"
-                  className={`${tst} h-[38px] bg-default-100`}
-                  getCopyContent={() => displayUrl}
-                />
-              </div>
-              <div className="rounded-lg bg-primary-50 px-3 py-2 text-sm text-primary">
-                {status || "Waiting for receiver..."}
-              </div>
-              {transferGroups.length > 0 && (
-                <div className="mt-2 flex flex-col gap-3">
-                  {transferGroups.map((group) => (
-                    <div key={group.file.revision} className="min-w-0">
-                      <Divider className="mb-2" />
-                      <div className="min-w-0 overflow-hidden text-sm font-semibold text-foreground-500">
-                        <span className="block truncate" title={group.file.name}>
-                          {group.file.name}
-                        </span>
-                      </div>
-                      {group.peers.length > 0 && (
-                        <div className="flex flex-col gap-2">
-                          {group.peers.map((peer) => (
-                            <div
-                              key={`${group.file.revision}:${peer.peerId}`}
-                              className="rounded-lg bg-default-50 py-2"
-                            >
-                              <P2PPeerStatus peer={peer} />
-                            </div>
-                          ))}
-                        </div>
-                      )}
+        ) : undefined
+      }
+      {...rest}
+    >
+      {isLoading && !response ? (
+        <TransferLoadingState progressLabel="Preparing P2P transfer..." onCancel={onCancel}>
+          <span className="text-sm text-default-500">Preparing P2P link...</span>
+        </TransferLoadingState>
+      ) : (
+        response && (
+          <>
+            <ShareUrlField
+              label="Pair URL"
+              labelExtra={
+                <InfoTooltip label="More information" compact>
+                  Share this link with the receiver. Keep this page open and your screen unlocked—closing or locking
+                  will interrupt the direct P2P transfer.
+                </InfoTooltip>
+              }
+              value={displayUrl}
+            />
+            <StatusBanner>{status || "Waiting for receiver..."}</StatusBanner>
+            {transferGroups.length > 0 && (
+              <div className="mt-2 flex flex-col gap-3">
+                {transferGroups.map((group) => (
+                  <div key={group.file.revision} className="min-w-0">
+                    <Divider className="mb-2" />
+                    <div className="min-w-0 overflow-hidden text-sm font-semibold text-foreground">
+                      <span className="block truncate" title={group.file.name}>
+                        {group.file.name}
+                      </span>
                     </div>
-                  ))}
-                </div>
-              )}
-            </>
-          )
-        )}
-      </CardBody>
-    </Card>
+                    {group.peers.length > 0 && (
+                      <div className="flex flex-col gap-2">
+                        {group.peers.map((peer) => (
+                          <div key={`${group.file.revision}:${peer.peerId}`} className="py-2">
+                            <P2PPeerStatus peer={peer} />
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )
+      )}
+    </PanelCard>
   )
 }

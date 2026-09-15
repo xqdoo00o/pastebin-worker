@@ -1,10 +1,12 @@
 import { useMemo, useState } from "react"
 import { formatSize } from "../utils/utils.js"
-import { ChevronDownIcon, FileIcon, FolderIcon } from "./icons.js"
-import { tst } from "../utils/overrides.js"
+import { ChevronDownIcon, FileIcon, FolderIcon, XIcon } from "./icons.js"
 import { itemCountLabel } from "../../shared/format.js"
+import { dedupeFilename } from "../../shared/fileType.js"
 
 export interface FileTreeEntry {
+  /** Stable identity used for actions. Defaults to the normalized path. */
+  id?: string
   name: string
   sizeBytes: number
 }
@@ -12,6 +14,7 @@ export interface FileTreeEntry {
 interface FileTreeNode {
   name: string
   path: string
+  removeId?: string
   type: "file" | "folder"
   sizeBytes: number
   children: FileTreeNode[]
@@ -20,6 +23,7 @@ interface FileTreeNode {
 interface MutableFileTreeNode {
   name: string
   path: string
+  removeId?: string
   type: "file" | "folder"
   sizeBytes: number
   children: Map<string, MutableFileTreeNode>
@@ -29,14 +33,21 @@ interface FileTreeProps {
   files: FileTreeEntry[]
   className?: string
   compact?: boolean
+  tone?: "muted" | "foreground"
+  /** When provided, each entry gets a remove button. Files use their stable id; folders use their normalized path. */
+  onRemove?: (idOrPath: string, type: "file" | "folder") => void
 }
 
-function normalizedFilePath(path: string): string {
+export function normalizedFilePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\/+/, "")
 }
 
 function childKey(type: FileTreeNode["type"], name: string): string {
   return `${type}:${name}`
+}
+
+function uniqueFileName(siblings: Map<string, MutableFileTreeNode>, name: string): string {
+  return dedupeFilename(name, (candidate) => siblings.has(childKey("file", candidate)))
 }
 
 function toReadonlyNode(node: MutableFileTreeNode): FileTreeNode {
@@ -86,9 +97,12 @@ function buildFileTree(files: FileTreeEntry[]): FileTreeNode[] {
       currentPath += `${part}${isLast && !isFolder ? "" : "/"}`
 
       if (isLast && !isFolder) {
-        siblings.set(childKey("file", part), {
-          name: part,
-          path: currentPath,
+        const displayName = uniqueFileName(siblings, part)
+        const displayPath = `${currentPath.slice(0, currentPath.length - part.length)}${displayName}`
+        siblings.set(childKey("file", displayName), {
+          name: displayName,
+          path: displayPath,
+          removeId: file.id ?? path,
           type: "file",
           sizeBytes: file.sizeBytes,
           children: new Map(),
@@ -109,9 +123,8 @@ function buildFileTree(files: FileTreeEntry[]): FileTreeNode[] {
     })
 }
 
-function FolderMeta({ node }: { node: FileTreeNode }) {
-  if (node.children.length === 0) return <span>0 item</span>
-  return <span>{itemCountLabel(node.children.length)}</span>
+function folderMeta(node: FileTreeNode): string {
+  return node.children.length === 0 ? "0 item" : itemCountLabel(node.children.length)
 }
 
 function FileTreeRows({
@@ -120,45 +133,62 @@ function FileTreeRows({
   expandedPaths,
   toggleExpanded,
   compact,
+  tone,
+  onRemove,
 }: {
   nodes: FileTreeNode[]
   depth: number
   expandedPaths: Set<string>
   toggleExpanded: (path: string) => void
   compact: boolean
+  tone: "muted" | "foreground"
+  onRemove?: (idOrPath: string, type: "file" | "folder") => void
 }) {
+  const detailColor = tone === "foreground" ? "text-foreground" : "text-default-500"
+
   return (
     <>
       {nodes.map((node) => {
         const isExpanded = expandedPaths.has(node.path)
         const indent = { paddingLeft: `${depth * (compact ? 0.5 : 0.8)}rem` }
+        const removeButton = onRemove && (
+          <button
+            type="button"
+            aria-label={`Remove ${node.name}`}
+            className="flex shrink-0 cursor-pointer items-center rounded p-0.5 text-default-400 transition-colors hover:bg-danger-100 hover:text-danger focus:outline-none focus-visible:ring-1 focus-visible:ring-default-400"
+            onClick={(e) => {
+              e.stopPropagation()
+              onRemove(node.type === "file" ? (node.removeId ?? node.path) : node.path, node.type)
+            }}
+          >
+            <XIcon className="size-4" />
+          </button>
+        )
 
         if (node.type === "folder") {
           return (
             <div key={`folder-${node.path}`}>
-              <button
-                type="button"
-                className={
-                  `flex w-full cursor-pointer items-center rounded px-1 py-1 text-left hover:bg-default-200 focus:outline-none focus-visible:ring-1 focus-visible:ring-default-400 ${tst} ` +
-                  (compact ? "justify-between gap-1.5" : "justify-between gap-3")
-                }
+              <div
+                className={`flex items-center justify-between rounded px-1 py-1 hover:bg-default-200 ${compact ? "gap-1.5" : "gap-3"}`}
                 style={indent}
-                aria-expanded={isExpanded}
-                onClick={() => toggleExpanded(node.path)}
               >
-                <span className="flex min-w-0 items-center">
-                  <span className="flex shrink-0 items-center gap-0">
-                    <ChevronDownIcon className={`size-4 shrink-0 ${isExpanded ? "" : "-rotate-90"}`} />
-                    <FolderIcon className="size-4 shrink-0 text-foreground-500" />
-                  </span>
-                  <span className="ml-1 truncate" title={node.path}>
+                <button
+                  type="button"
+                  className="-my-1 -ml-1 flex min-w-0 flex-1 cursor-pointer items-center rounded py-1 pl-1 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-default-400"
+                  aria-expanded={isExpanded}
+                  onClick={() => toggleExpanded(node.path)}
+                >
+                  <ChevronDownIcon className={`size-4 shrink-0 ${isExpanded ? "" : "-rotate-90"}`} />
+                  <FolderIcon className={`size-4 shrink-0 ${detailColor}`} />
+                  <span className="ml-1 truncate select-none" title={node.path}>
                     {node.name}
                   </span>
+                </button>
+                <span className="flex shrink-0 items-center gap-1.5">
+                  <span className={`text-xs ${detailColor}`}>{folderMeta(node)}</span>
+                  {removeButton}
                 </span>
-                <span className="shrink-0 text-xs text-foreground-500">
-                  <FolderMeta node={node} />
-                </span>
-              </button>
+              </div>
               {isExpanded && node.children.length > 0 && (
                 <FileTreeRows
                   nodes={node.children}
@@ -166,6 +196,8 @@ function FileTreeRows({
                   expandedPaths={expandedPaths}
                   toggleExpanded={toggleExpanded}
                   compact={compact}
+                  tone={tone}
+                  onRemove={onRemove}
                 />
               )}
             </div>
@@ -179,15 +211,16 @@ function FileTreeRows({
             style={indent}
           >
             <span className="flex min-w-0 items-center">
-              <span className="flex shrink-0 items-center gap-0">
-                <span className="size-4 shrink-0" />
-                <FileIcon className="size-4 shrink-0 text-foreground-500" />
-              </span>
+              <span className="size-4 shrink-0" />
+              <FileIcon className={`size-4 shrink-0 ${detailColor}`} />
               <span className="ml-1 truncate" title={node.path}>
                 {node.name}
               </span>
             </span>
-            <span className="shrink-0 text-xs text-foreground-500">{formatSize(node.sizeBytes)}</span>
+            <span className="flex shrink-0 items-center gap-1.5">
+              <span className={`shrink-0 text-xs ${detailColor}`}>{formatSize(node.sizeBytes)}</span>
+              {removeButton}
+            </span>
           </div>
         )
       })}
@@ -195,7 +228,7 @@ function FileTreeRows({
   )
 }
 
-export function FileTree({ files, className = "", compact = false }: FileTreeProps) {
+export function FileTree({ files, className = "", compact = false, tone = "muted", onRemove }: FileTreeProps) {
   const nodes = useMemo(() => buildFileTree(files), [files])
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set())
 
@@ -209,13 +242,15 @@ export function FileTree({ files, className = "", compact = false }: FileTreePro
   }
 
   return (
-    <div className={`text-sm text-foreground-600 ${className}`}>
+    <div className={`text-sm ${tone === "foreground" ? "text-foreground" : "text-default-600"} ${className}`}>
       <FileTreeRows
         nodes={nodes}
         depth={0}
         expandedPaths={expandedPaths}
         toggleExpanded={toggleExpanded}
         compact={compact}
+        tone={tone}
+        onRemove={onRemove}
       />
     </div>
   )

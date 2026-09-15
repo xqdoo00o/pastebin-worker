@@ -1,0 +1,58 @@
+diff --git a/deps/obl/oblas_lite.c b/deps/obl/oblas_lite.c
+index 657cb92..78364cd 100644
+--- a/deps/obl/oblas_lite.c
++++ b/deps/obl/oblas_lite.c
+@@ -574,6 +574,37 @@ void obl_axpyb32_wasm(u8 *a, u32 *b, u8 u, unsigned k)
+ }
+ #endif
+ 
++void obl_qr_rs_init(void)
++{
++    oblas_lite_init();
++}
++
++void obl_qr_rs_update(u8 *remainder, const u8 *generator, u8 factor,
++                      unsigned padded_degree)
++{
++#if defined(__wasm_simd128__)
++    const v128_t low_table =
++        wasm_v128_load(GF2_8_SHUF_LO + ((unsigned)factor * 16));
++    const v128_t high_table =
++        wasm_v128_load(GF2_8_SHUF_HI + ((unsigned)factor * 16));
++
++    /* Each output coefficient consumes the following input coefficient. The
++     * sentinel supplies the zero shifted into the final padded lane. */
++    remainder[padded_degree] = 0;
++    for (unsigned offset = 0; offset < padded_degree; offset += 16) {
++        v128_t shifted = wasm_v128_load(remainder + offset + 1);
++        v128_t product = obl_wasm_mul(wasm_v128_load(generator + offset),
++                                      low_table, high_table);
++        wasm_v128_store(remainder + offset, wasm_v128_xor(shifted, product));
++    }
++#else
++    const u8 *factor_row = &GF2_8_MUL[(unsigned)factor << 8];
++    for (unsigned i = 0; i + 1 < padded_degree; i++)
++        remainder[i] = remainder[i + 1] ^ factor_row[generator[i]];
++    remainder[padded_degree - 1] = factor_row[generator[padded_degree - 1]];
++#endif
++}
++
+ #ifdef _MSC_VER
+ #pragma warning(push)
+ #pragma warning(disable: 4113)
+diff --git a/deps/obl/oblas_lite.h b/deps/obl/oblas_lite.h
+index f86fa15..9af9245 100644
+--- a/deps/obl/oblas_lite.h
++++ b/deps/obl/oblas_lite.h
+@@ -27,6 +27,11 @@ void obl_axiy_wasm(uint8_t *a, uint8_t *b, uint8_t u, unsigned k);
+ void obl_axpyb32_wasm(uint8_t *a, uint32_t *b, uint8_t u, unsigned k);
+ #endif
+ 
++void obl_qr_rs_init(void);
++
++void obl_qr_rs_update(uint8_t *remainder, const uint8_t *generator,
++                      uint8_t factor, unsigned padded_degree);
++
+ typedef uint8_t u8;
+ typedef uint16_t u16;
+ typedef uint32_t u32;

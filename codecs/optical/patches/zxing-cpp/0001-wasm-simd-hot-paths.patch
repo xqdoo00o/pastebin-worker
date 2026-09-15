@@ -1,0 +1,234 @@
+diff --git a/core/src/HybridBinarizer.cpp b/core/src/HybridBinarizer.cpp
+index 4e20df7..263f0a8 100644
+--- a/core/src/HybridBinarizer.cpp
++++ b/core/src/HybridBinarizer.cpp
+@@ -14,6 +14,10 @@
+ #include <fstream>
+ #include <memory>
+ 
++#ifdef __wasm_simd128__
++#include <wasm_simd128.h>
++#endif
++
+ #define USE_NEW_ALGORITHM
+ 
+ namespace ZXing {
+@@ -47,18 +51,47 @@ bool HybridBinarizer::getPatternRow(int row, int rotation, PatternRow& res) cons
+ 
+ using T_t = uint8_t;
+ 
++#ifdef __wasm_simd128__
++static uint8_t HorizontalMinU8(v128_t value)
++{
++	value = wasm_u8x16_min(value, wasm_i8x16_shuffle(value, value, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7));
++	value = wasm_u8x16_min(value, wasm_i8x16_shuffle(value, value, 4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11));
++	value = wasm_u8x16_min(value, wasm_i8x16_shuffle(value, value, 2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13));
++	value = wasm_u8x16_min(value, wasm_i8x16_shuffle(value, value, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14));
++	return wasm_u8x16_extract_lane(value, 0);
++}
++
++static uint8_t HorizontalMaxU8(v128_t value)
++{
++	value = wasm_u8x16_max(value, wasm_i8x16_shuffle(value, value, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7));
++	value = wasm_u8x16_max(value, wasm_i8x16_shuffle(value, value, 4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11));
++	value = wasm_u8x16_max(value, wasm_i8x16_shuffle(value, value, 2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13));
++	value = wasm_u8x16_max(value, wasm_i8x16_shuffle(value, value, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14));
++	return wasm_u8x16_extract_lane(value, 0);
++}
++#endif
++
+ /**
+ * Applies a single threshold to a block of pixels.
+ */
+ static void ThresholdBlock(const uint8_t* __restrict luminances, int xoffset, int yoffset, T_t threshold, int rowStride,
+ 						   BitMatrix& matrix)
+ {
++#ifdef __wasm_simd128__
++	// LocalAverage uses HybridBinarizer; GlobalHistogram bypasses this block-threshold SIMD path.
++	const auto thresholdVec = wasm_u8x16_splat(threshold);
++#endif
+ 	for (int y = yoffset; y < yoffset + BLOCK_SIZE; ++y) {
+ 		auto* src = luminances + y * rowStride + xoffset;
+ 		auto* const dstBegin = matrix.row(y).begin() + xoffset;
+ 		// TODO: fix pixelStride > 1 case
++#ifdef __wasm_simd128__
++		auto pixels = wasm_v128_load64_zero(src);
++		wasm_v128_store64_lane(dstBegin, wasm_u8x16_le(pixels, thresholdVec), 0);
++#else
+ 		for (auto* dst = dstBegin; dst < dstBegin + BLOCK_SIZE; ++dst, ++src)
+ 			*dst = (*src <= threshold) * BitMatrix::SET_V;
++#endif
+ 	}
+ }
+ 
+@@ -187,19 +220,59 @@ static std::shared_ptr<BitMatrix> CalculateMatrix(const uint8_t* __restrict lumi
+ 
+ #else
+ 
++// These reusable buffers belong only to LocalAverage/HybridBinarizer; GlobalHistogram uses a separate path.
++struct ReusableBinarizerBuffers
++{
++	Matrix<T_t> thresholds;
++	Matrix<T_t> smoothed;
++	std::shared_ptr<BitMatrix> bits;
++};
++
++static ReusableBinarizerBuffers& ReusableBuffers(int subWidth, int subHeight)
++{
++	static thread_local ReusableBinarizerBuffers buffers;
++	if (buffers.thresholds.width() != subWidth || buffers.thresholds.height() != subHeight) {
++		buffers.thresholds = Matrix<T_t>(subWidth, subHeight);
++		buffers.smoothed = Matrix<T_t>(subWidth, subHeight);
++	}
++	return buffers;
++}
++
++static std::shared_ptr<BitMatrix> ReusableBitMatrix(ReusableBinarizerBuffers& buffers, int width, int height)
++{
++	// BinaryBitmap caches the returned shared_ptr for the duration of a read.
++	// Reuse only when that cache is gone; a reentrant caller gets a fresh matrix.
++	if (!buffers.bits || buffers.bits.use_count() != 1 || buffers.bits->width() != width ||
++		buffers.bits->height() != height)
++		buffers.bits = std::make_shared<BitMatrix>(width, height);
++	return buffers.bits;
++}
++
+ // Subdivide the image in blocks of BLOCK_SIZE and calculate one threshold value per block as
+ // (max - min > MIN_DYNAMIC_RANGE) ? (max + min) / 2 : 0
+-static Matrix<T_t> BlockThresholds(const ImageView iv)
++static void BlockThresholds(const ImageView iv, Matrix<T_t>& thresholds)
+ {
+-	int subWidth = (iv.width() + BLOCK_SIZE - 1) / BLOCK_SIZE; // ceil(width/BS)
+-	int subHeight = (iv.height() + BLOCK_SIZE - 1) / BLOCK_SIZE; // ceil(height/BS)
+-
+-	Matrix<T_t> thresholds(subWidth, subHeight);
++	int subWidth = thresholds.width();
++	int subHeight = thresholds.height();
+ 
+ 	for (int y = 0; y < subHeight; y++) {
+ 		int y0 = std::min(y * BLOCK_SIZE, iv.height() - BLOCK_SIZE);
+ 		for (int x = 0; x < subWidth; x++) {
+ 			int x0 = std::min(x * BLOCK_SIZE, iv.width() - BLOCK_SIZE);
++#ifdef __wasm_simd128__
++			// LocalAverage/HybridBinarizer only; GlobalHistogram never calculates per-block thresholds.
++			v128_t minVec = wasm_i8x16_splat(-1);
++			v128_t maxVec = wasm_i8x16_splat(0);
++			for (int yy = 0; yy < BLOCK_SIZE; yy += 2) {
++				auto rows = wasm_v128_load64_zero(iv.data(x0, y0 + yy));
++				rows = wasm_v128_load64_lane(iv.data(x0, y0 + yy + 1), rows, 1);
++				minVec = wasm_u8x16_min(minVec, rows);
++				maxVec = wasm_u8x16_max(maxVec, rows);
++			}
++
++			uint8_t min = HorizontalMinU8(minVec);
++			uint8_t max = HorizontalMaxU8(maxVec);
++#else
+ 			uint8_t min = 255;
+ 			uint8_t max = 0;
+ 			for (int yy = 0; yy < BLOCK_SIZE; yy++) {
+@@ -207,19 +280,16 @@ static Matrix<T_t> BlockThresholds(const ImageView iv)
+ 				for (int xx = 0; xx < BLOCK_SIZE; xx++)
+ 					UpdateMinMax(min, max, line[xx]);
+ 			}
++#endif
+ 
+ 			thresholds(x, y) = (max - min > MIN_DYNAMIC_RANGE) ? (int(max) + min) / 2 : 0;
+ 		}
+ 	}
+-
+-	return thresholds;
+ }
+ 
+ // Apply gaussian-like smoothing filter over all non-zero thresholds and fill any remaining gaps with nearest neighbor
+-static Matrix<T_t> SmoothThresholds(Matrix<T_t>&& in)
++static void SmoothThresholds(const Matrix<T_t>& in, Matrix<T_t>& out)
+ {
+-	Matrix<T_t> out(in.width(), in.height());
+-
+ 	constexpr int R = WINDOW_SIZE / BLOCK_SIZE / 2;
+ 	for (int y = 0; y < in.height(); y++) {
+ 		for (int x = 0; x < in.width(); x++) {
+@@ -252,14 +322,11 @@ static Matrix<T_t> SmoothThresholds(Matrix<T_t>&& in)
+ 		}
+ 	}
+ 	std::fill(last + 1, out.end(), *(std::max(last, out.begin())));
+-
+-	return out;
+ }
+ 
+-static std::shared_ptr<BitMatrix> ThresholdImage(const ImageView iv, const Matrix<T_t>& thresholds)
++static std::shared_ptr<BitMatrix> ThresholdImage(const ImageView iv, const Matrix<T_t>& thresholds,
++											 std::shared_ptr<BitMatrix> matrix)
+ {
+-	auto matrix = std::make_shared<BitMatrix>(iv.width(), iv.height());
+-
+ #ifdef PRINT_DEBUG
+ 	Matrix<uint8_t> out(iv.width(), iv.height());
+ #endif
+@@ -293,10 +360,14 @@ std::shared_ptr<const BitMatrix> HybridBinarizer::getBlackMatrix() const
+ {
+ 	if (width() >= WINDOW_SIZE && height() >= WINDOW_SIZE) {
+ #ifdef USE_NEW_ALGORITHM
+-		auto thrs = SmoothThresholds(BlockThresholds(_buffer));
+-		if (std::ranges::max(thrs) == 0)
++		int subWidth = (width() + BLOCK_SIZE - 1) / BLOCK_SIZE;
++		int subHeight = (height() + BLOCK_SIZE - 1) / BLOCK_SIZE;
++		auto& buffers = ReusableBuffers(subWidth, subHeight);
++		BlockThresholds(_buffer, buffers.thresholds);
++		SmoothThresholds(buffers.thresholds, buffers.smoothed);
++		if (std::ranges::max(buffers.smoothed) == 0)
+ 			return GlobalHistogramBinarizer::getBlackMatrix();
+-		return ThresholdImage(_buffer, thrs);
++		return ThresholdImage(_buffer, buffers.smoothed, ReusableBitMatrix(buffers, width(), height()));
+ #else
+ 		const uint8_t* luminances = _buffer.data();
+ 		int subWidth = (width() + BLOCK_SIZE - 1) / BLOCK_SIZE; // ceil(width/BS)
+diff --git a/core/src/Pattern.h b/core/src/Pattern.h
+index 3a61bd5..ce45326 100644
+--- a/core/src/Pattern.h
++++ b/core/src/Pattern.h
+@@ -21,6 +21,10 @@
+ #include <type_traits>
+ #include <vector>
+ 
++#ifdef __wasm_simd128__
++#include <wasm_simd128.h>
++#endif
++
+ namespace ZXing {
+ 
+ using PatternType = uint16_t;
+@@ -430,6 +434,25 @@ void GetPatternRow(Range<I> b_row, PatternRow& p_row)
+ 	// The following code has been observed to cause a speedup of up to 30% on large images on an AVX cpu
+ 	// and on an a Google Pixel 3 Android phone. Your mileage may vary.
+ 	if constexpr (std::contiguous_iterator<I> && sizeof(std::remove_cv_t<std::iter_value_t<I>>) == 1) {
++#ifdef __wasm_simd128__
++		const auto* const bitPtrBegin = std::to_address(bitPos);
++		const auto* const bitPtrEnd = std::to_address(bitPosEnd);
++		auto* bitPtr = bitPtrBegin;
++
++		// Compare adjacent bytes sixteen at a time. The bitmask contains one bit
++		// for every black/white transition and ctz locates the first one.
++		while (bitPtr < bitPtrEnd - 16) {
++			auto current = wasm_v128_load(bitPtr);
++			auto shifted = wasm_v128_load(bitPtr + 1);
++			uint32_t transitions = wasm_i8x16_bitmask(wasm_i8x16_ne(current, shifted));
++			int step = transitions ? std::countr_zero(transitions) + 1 : 16;
++			(*intPos) += step;
++			intPos += transitions != 0;
++			bitPtr += step;
++		}
++
++		bitPos += bitPtr - bitPtrBegin;
++#else
+ 		using simd_t = uint64_t;
+ 		const auto* const bitPtrBegin = std::to_address(bitPos);
+ 		const auto* const bitPtrEnd = std::to_address(bitPosEnd);
+@@ -454,6 +477,7 @@ void GetPatternRow(Range<I> b_row, PatternRow& p_row)
+ 		}
+ 
+ 		bitPos += bitPtr - bitPtrBegin;
++#endif
+ 	}
+ 
+ 	while (++bitPos != bitPosEnd) {

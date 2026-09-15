@@ -6,49 +6,42 @@ export class ParseError extends Error {
   }
 }
 
-export function parseSize(sizeStr: string): number | null {
-  sizeStr = sizeStr.trim()
-  const SIZE_REGEX = /^\d+(\.\d+)?\s*[KMG]?$/
-  if (!SIZE_REGEX.test(sizeStr)) {
-    return null
-  }
+interface ScaledValue<Unit extends string> {
+  amount: number
+  unit: Unit | ""
+  value: number
+}
 
-  let sizeBytes = parseFloat(sizeStr)
-  const lastChar = sizeStr[sizeStr.length - 1]
-  if (lastChar === "K") sizeBytes *= 1024
-  else if (lastChar === "M") sizeBytes *= 1024 * 1024
-  else if (lastChar === "G") sizeBytes *= 1024 * 1024 * 1024
-  return sizeBytes
+function parseScaledValue<Unit extends string>(
+  input: string,
+  pattern: RegExp,
+  multipliers: Readonly<Record<Unit, number>>,
+): ScaledValue<Unit> | null {
+  const match = pattern.exec(input.trim())
+  if (!match?.[1]) return null
+  const amount = Number(match[1])
+  const unit = (match[2] ?? "") as Unit | ""
+  return { amount, unit, value: amount * (unit === "" ? 1 : multipliers[unit]) }
+}
+
+const SIZE_PATTERN = /^(\d+(?:\.\d+)?)\s*([KMG]?)$/
+const SIZE_MULTIPLIERS = { K: 1024, M: 1024 ** 2, G: 1024 ** 3 } as const
+const EXPIRATION_PATTERN = /^(\d+(?:\.\d+)?)\s*([smhd]?)$/
+const EXPIRATION_MULTIPLIERS = { s: 1, m: 60, h: 3600, d: 3600 * 24 } as const
+
+export function parseSize(sizeStr: string): number | null {
+  return parseScaledValue(sizeStr, SIZE_PATTERN, SIZE_MULTIPLIERS)?.value ?? null
 }
 
 export function parseExpiration(expirationStr: string): number | null {
-  expirationStr = expirationStr.trim()
-  const EXPIRE_REGEX = /^\d+(\.\d+)?\s*[smhd]?$/
-  if (!EXPIRE_REGEX.test(expirationStr)) {
-    return null
-  }
-
-  let expirationSeconds = parseFloat(expirationStr)
-  const lastChar = expirationStr[expirationStr.length - 1]
-  if (lastChar === "m") expirationSeconds *= 60
-  else if (lastChar === "h") expirationSeconds *= 3600
-  else if (lastChar === "d") expirationSeconds *= 3600 * 24
-  return expirationSeconds
+  return parseScaledValue(expirationStr, EXPIRATION_PATTERN, EXPIRATION_MULTIPLIERS)?.value ?? null
 }
 
 export function parseExpirationReadable(expirationStr: string): string | null {
-  expirationStr = expirationStr.trim()
-  const EXPIRE_REGEX = /^\d+(\.\d+)?\s*[smhd]?$/
-  if (!EXPIRE_REGEX.test(expirationStr)) {
-    return null
-  }
-
-  const num = parseFloat(expirationStr)
-  const lastChar = expirationStr[expirationStr.length - 1]
-  if (lastChar === "m") return `${num} minute${num > 1 ? "s" : ""}`
-  else if (lastChar === "h") return `${num} hour${num > 1 ? "s" : ""}`
-  else if (lastChar === "d") return `${num} day${num > 1 ? "s" : ""}`
-  return `${num} second${num > 1 ? "s" : ""}`
+  const parsed = parseScaledValue(expirationStr, EXPIRATION_PATTERN, EXPIRATION_MULTIPLIERS)
+  if (!parsed) return null
+  const noun = parsed.unit === "m" ? "minute" : parsed.unit === "h" ? "hour" : parsed.unit === "d" ? "day" : "second"
+  return `${parsed.amount} ${noun}${parsed.amount > 1 ? "s" : ""}`
 }
 
 export interface ParsedPath {

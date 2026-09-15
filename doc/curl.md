@@ -1,265 +1,177 @@
-# CLI Usage with `curl`
+# CLI usage with `curl`
 
-A comprehensive guide to using this pastebin from the command line. For the
-full HTTP API reference, see [api.md]({{BASE_URL}}/doc/api).
+This guide covers the stored-paste HTTP API from a shell. For every endpoint
+and response field, see the [HTTP API reference]({{BASE_URL}}/doc/api).
 
 ## Conventions
 
-- `<name>` — the random name (e.g. `abcd`) or custom name (prefixed with `~`,
-  e.g. `~hitagi`) of a paste.
-- `<passwd>` — the password returned at upload time, used to update or delete
-  the paste.
-- `<expire>` — an expiration period: an integer or float, optionally suffixed
-  with `s` (seconds, default), `m` (minutes), `h` (hours), or `d` (days). For
-  example, `300`, `30m`, `25d`.
+- `<name>` is a generated paste name: 6 characters normally, or 24 characters
+  in private mode.
+- `<manage-url>` is the secret `manageUrl` returned by an upload. Do not share
+  it: anyone who has it can replace or delete the paste.
+- Expirations accept an integer or decimal plus an optional unit: `s` (the
+  default), `m`, `h`, or `d`. Examples: `300`, `30m`, `2h`, `25d`.
 
-## Uploading
+If the deployment requires HTTP Basic authentication, add
+`-u '<user>:<password>'` to upload and P2P-management requests.
 
-### Upload text content
+## Upload
+
+### Text, files, and stdin
 
 ```shell
-$ curl -Fc='hello, world' {{BASE_URL}}
+$ curl -F c='hello, world' {{BASE_URL}}
+$ curl -F c=@photo.jpg {{BASE_URL}}
+$ printf 'hello\n' | curl -F c=@- {{BASE_URL}}
+```
+
+A successful upload returns metadata and two URLs:
+
+```json
 {
-  "url": "{{BASE_URL}}/abcd",
-  "manageUrl": "{{BASE_URL}}/abcd:w2eHqyZGc@CQzWLN=BiJiQxZ",
-  "expirationSeconds": 1209600,
-  "expireAt": "2026-05-21T10:33:06.114Z"
+  "url": "{{BASE_URL}}/BxWH2a",
+  "manageUrl": "{{BASE_URL}}/BxWH2a:w2eHqyZGc@CQzWLN=BiJiQxZ",
+  "expirationSeconds": 259200,
+  "lastModifiedAt": "2026-08-25T10:33:06.000Z",
+  "createdAt": "2026-08-25T10:33:06.000Z",
+  "expireAt": "2026-08-28T10:33:06.000Z",
+  "sizeBytes": 12,
+  "location": "KV"
 }
 ```
 
-Save `url` for sharing and `manageUrl` for later updates or deletion.
+Share `url`; retain `manageUrl` privately for updates and deletion. When `c`
+is uploaded as a file, its filename is returned on downloads through
+`Content-Disposition`.
 
-### Upload a file
+### Upload options
 
 ```shell
-$ curl -Fc=@panty.jpg {{BASE_URL}}
+$ curl -F c='temporary' -F e=30m {{BASE_URL}}       # expiration
+$ curl -F c='secret'    -F p=1   {{BASE_URL}}       # 24-character random name
+$ curl -F c='read once' -F reads=1 {{BASE_URL}}     # burn after one content read
+$ curl -F c=@main.rs    -F lang=rust {{BASE_URL}}   # display-page highlighting
+$ curl -F c='content'   -F s='correct-horse' {{BASE_URL}} # management password
 ```
 
-The original filename will be sent back as the `Content-Disposition` header
-when the paste is fetched.
+- Omitting `e` uses the deployment default (`{{DEFAULT_EXPIRATION}}` here).
+  Requested expirations above the deployment maximum
+  (`{{MAX_EXPIRATION}}` here) are clamped to that maximum.
+- `reads` must be a non-negative integer. `0` means unlimited. A content read
+  through the raw, display, article, or redirect route consumes one read;
+  `HEAD` and `/m/<name>` do not.
+- A custom management password must contain 8–128 characters and no newline.
+  If `s` is omitted, the service generates one.
+- Paste names cannot be selected by the client; `p` only chooses between the
+  short and long random-name formats.
 
-### Upload from stdin
+The low-level API accepts at most 5 MiB of content in a normal `POST` or `PUT`.
+For larger content, use the web UI or the
+[`pb`]({{REPO}}/tree/goshujin/scripts) CLI; they automatically use 5 MiB R2
+multipart parts up to this deployment's `{{R2_MAX_ALLOWED}}` limit.
 
-```shell
-$ echo 'hello' | curl -Fc=@- {{BASE_URL}}
-$ cat panty.jpg | curl -Fc=@- {{BASE_URL}}
-```
+## Fetch
 
-### Set an expiration
-
-```shell
-$ curl -Fc='kawaii' -Fe=300 {{BASE_URL}}      # 300 seconds
-$ curl -Fc='kawaii' -Fe=2h  {{BASE_URL}}      # 2 hours
-$ curl -Fc=@big.bin -Fe=30d {{BASE_URL}}      # 30 days
-```
-
-If `e` is not specified, the default expiration of the deployment is used. The
-maximum expiration is also enforced by the deployment.
-
-### Use a custom name
+### Raw content
 
 ```shell
-$ curl -Fc='kawaii' -Fn=hitagi {{BASE_URL}}
-{
-  "url": "{{BASE_URL}}/~hitagi",
-  ...
-}
-```
-
-The custom name is at least 3 characters long and may consist of letters,
-digits, and `+_-[]*$=@,;/`. Note the leading `~` in the returned URL.
-
-Because `curl` uses `;` and `,` as field separators, names containing those
-characters need to be wrapped in extra quotes:
-
-```shell
-$ curl -Fc=@panty.jpg -Fn='"hi/hello;g,ood"' {{BASE_URL}}
-```
-
-### Set a custom password
-
-```shell
-$ curl -Fc='kawaii' -Fs=12345678 {{BASE_URL}}
-```
-
-If `s` is omitted, a random password is generated and returned in `manageUrl`.
-
-### Private mode (longer random name)
-
-```shell
-$ curl -Fc='secret' -Fp=1 {{BASE_URL}}
-```
-
-Without a custom name (`n`), `p` produces a 24-character random name, making
-the paste effectively unguessable.
-
-### Mark a paste as syntax-highlighted
-
-```shell
-$ curl -Fc=@main.rs -Flang=rust {{BASE_URL}}
-```
-
-The `lang` field is sent back as the `X-PB-Highlight-Language` header on
-fetching the paste, and is used by the display page (`/d/<name>`).
-
-## Fetching
-
-### Fetch raw content
-
-```shell
-$ curl {{BASE_URL}}/abcd
+$ curl {{BASE_URL}}/BxWH2a
 hello, world
+
+$ curl -OJ {{BASE_URL}}/BxWH2a               # use the stored filename
+$ curl '{{BASE_URL}}/BxWH2a?a' -OJ           # force attachment disposition
+$ curl {{BASE_URL}}/BxWH2a | jq .             # pipe to another tool
 ```
 
-### Save the response to a file
+You can override the response filename or MIME type without changing the
+stored paste:
 
 ```shell
-$ curl {{BASE_URL}}/~panty.jpg -o panty.jpg
-$ curl -OJ {{BASE_URL}}/~panty               # use server-supplied filename
+$ curl -OJ {{BASE_URL}}/BxWH2a/report.json
+$ curl -i {{BASE_URL}}/BxWH2a.json
+$ curl -i '{{BASE_URL}}/BxWH2a?mime=application/json'
 ```
 
-`-J` honors the `Content-Disposition` header set from the original filename.
+MIME priority is `?mime`, path extension/filename, stored filename, uploaded
+MIME hint, then `text/plain`. Potentially active types such as HTML, SVG, XML,
+and configured disallowed types are served as plain text.
 
-### Force download (attachment)
+### Metadata and conditional requests
 
 ```shell
-$ curl '{{BASE_URL}}/abcd?a' -OJ
+$ curl {{BASE_URL}}/m/BxWH2a | jq .
+$ curl -I {{BASE_URL}}/BxWH2a
+$ curl -i -H 'If-Modified-Since: Tue, 25 Aug 2026 10:33:06 GMT' \
+    {{BASE_URL}}/BxWH2a
 ```
 
-The `?a` query string sets `Content-Disposition: attachment`.
+`HEAD` returns the raw response headers without its body. Ordinary paste
+responses use `Cache-Control: public, no-cache, must-revalidate`; read-limited
+responses use `no-store`. A matching `If-Modified-Since` returns `304 Not
+Modified`.
 
-### Override mime type
+R2-backed pastes without a read limit also support one byte range:
 
 ```shell
-$ curl '{{BASE_URL}}/~panty.jpg?mime=image/png' \
-    -w '%{content_type}\n' -o /dev/null -sS
-image/png
+$ curl -H 'Range: bytes=0-1048575' {{BASE_URL}}/BxWH2a -o first-megabyte.bin
+$ curl -C - -O {{BASE_URL}}/BxWH2a              # resume when the server advertises ranges
 ```
 
-Or via path extension:
+Range requests return `206` when satisfied and `416` when unsatisfiable. They
+are ignored for KV-backed and read-limited pastes.
+
+## Display, Markdown, and redirects
 
 ```shell
-$ curl '{{BASE_URL}}/abcd.json' -i
+$ firefox {{BASE_URL}}/d/BxWH2a                  # display/highlight in browser
+$ firefox '{{BASE_URL}}/d/BxWH2a?lang=rust'      # override display language
+$ firefox {{BASE_URL}}/a/BxWH2a                  # render Markdown as HTML
+$ curl -L {{BASE_URL}}/u/BxWH2a                  # redirect to pasted URL
 ```
 
-### Pipe to another tool
+`/a` supports GitHub-flavored Markdown, syntax highlighting, and MathJax.
+`/u` only redirects when the paste is a valid URL no longer than 2,000 bytes.
+
+## Update and delete
+
+Capture the management URL from the upload response:
 
 ```shell
-$ curl {{BASE_URL}}/~panty.jpg | feh -
-$ curl {{BASE_URL}}/~config | jq .
-```
+$ response=$(curl -sS -F c=@notes.md {{BASE_URL}})
+$ paste_url=$(printf '%s' "$response" | jq -r .url)
+$ manage_url=$(printf '%s' "$response" | jq -r .manageUrl)
 
-### Conditional fetch with `If-Modified-Since`
-
-```shell
-$ curl -i -H 'If-Modified-Since: Wed, 01 May 2026 00:00:00 GMT' \
-    {{BASE_URL}}/~hitagi
-HTTP/2 304
-```
-
-## Inspecting metadata
-
-```shell
-$ curl {{BASE_URL}}/m/abcd
-{
-  "lastModifiedAt": "2026-05-05T10:33:06.114Z",
-  "createdAt": "2026-05-01T10:33:06.114Z",
-  "expireAt": "2026-05-08T10:33:06.114Z",
-  "sizeBytes": 4096,
-  "location": "KV",
-  "filename": "a.jpg"
-}
-```
-
-A `HEAD` request returns the same headers as `GET` without the body, useful
-for quickly checking size and `Content-Type`:
-
-```shell
-$ curl -I {{BASE_URL}}/abcd
-```
-
-## URL shortener
-
-Upload a short URL, then redirect through `/u/<name>`:
-
-```shell
-$ curl -Fc='https://example.com/very/long/path' -Fn=ex {{BASE_URL}}
-$ curl -L {{BASE_URL}}/u/~ex
-```
-
-## Markdown rendering
-
-Upload a markdown file and render it as HTML via `/a/<name>`:
-
-```shell
-$ curl -Fc=@README.md -Fn=readme {{BASE_URL}}
-$ firefox {{BASE_URL}}/a/~readme
-```
-
-GitHub-flavored Markdown is supported, along with syntax highlighting and
-LaTeX math via MathJax.
-
-## Updating an existing paste
-
-Use the `manageUrl` returned at upload time:
-
-```shell
-$ curl -X PUT -Fc='kawaii~' \
-    {{BASE_URL}}/~hitagi:22@-OJWcTOH2jprTJWYadmDv
-```
-
-`PUT` accepts the same fields as `POST` (`c`, `e`, `s`). Note that `e`
-recalculates the expiration starting from the update time.
-
-## Deleting a paste
-
-```shell
-$ curl -X DELETE {{BASE_URL}}/~hitagi:22@-OJWcTOH2jprTJWYadmDv
+$ curl -X PUT -F c=@revised-notes.md "$manage_url"
+$ curl -X DELETE "$manage_url"
 the paste will be deleted in seconds
 ```
 
-Deletion may take a few seconds to propagate globally.
+`PUT` replaces the content and accepts the upload metadata fields. Supplying
+`e` starts a new expiration period from the update time; supplying `s` rotates
+the management password. The returned `manageUrl` is therefore authoritative.
+Deletion can take a few seconds to propagate globally.
 
-## Tips
+## P2P and QR transfer
 
-- Pipe long output through `jq` to inspect upload responses:
-
-  ```shell
-  $ curl -sFc='hi' {{BASE_URL}} | jq -r .url
-  ```
-
-- Save the management URL into a variable to chain commands:
-
-  ```shell
-  $ resp=$(curl -sFc=@notes.md {{BASE_URL}})
-  $ url=$(jq  -r .url       <<<"$resp")
-  $ mgmt=$(jq -r .manageUrl  <<<"$resp")
-  ```
-
-- For files larger than the `R2_THRESHOLD` of the deployment, content is
-  stored in R2 instead of KV transparently — no client change is needed.
-
-- The maximum allowed upload size is set per deployment via `R2_MAX_ALLOWED`.
-  Exceeding it returns HTTP `413`.
-
-- A single HTTP request body is capped at **100 MB** by Cloudflare Workers
-  (HTTP `413 Payload Too Large` is returned before the request ever reaches
-  the worker), regardless of the deployment's `R2_MAX_ALLOWED`. To upload
-  larger files, use the web UI at `{{BASE_URL}}` or the
-  [`pb`](https://github.com/SharzyL/pastebin-worker/tree/goshujin/scripts)
-  CLI — both automatically switch to a multipart upload that streams 5 MiB
-  chunks through the `/mpu/*` endpoints.
+The browser UI at `{{BASE_URL}}` also supports direct WebRTC P2P transfer and
+offline screen-to-camera QR transfer. These modes do not create stored-paste
+URLs. Open `{{BASE_URL}}/qr-receiver` on the receiving device for QR camera,
+screen-capture, or exported-APNG reception. See the
+[API reference]({{BASE_URL}}/doc/api#p2p-api) if implementing a P2P client.
 
 ## Common errors
 
-| Status | Meaning                                                                                                                                                 |
-| -----: | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-|  `400` | Malformed request (bad field, illegal name, bad expire).                                                                                                |
-|  `403` | Wrong password when updating or deleting.                                                                                                               |
-|  `404` | Paste not found, or already expired.                                                                                                                    |
-|  `409` | Custom name is already in use.                                                                                                                          |
-|  `413` | Request body exceeds 100 MB (platform cap, intercepted by Cloudflare before reaching the worker), or content exceeds the deployment's `R2_MAX_ALLOWED`. |
-|  `500` | Unexpected server error — please report it.                                                                                                             |
+| Status | Meaning                                                                                            |
+| -----: | -------------------------------------------------------------------------------------------------- |
+|  `400` | Invalid path, multipart form, option, or P2P request.                                              |
+|  `401` | HTTP Basic authentication is required or failed.                                                   |
+|  `403` | The management password or P2P sender token is wrong.                                              |
+|  `404` | The paste or document does not exist.                                                              |
+|  `410` | A P2P room or multipart upload has expired.                                                        |
+|  `413` | A direct content part exceeds 5 MiB, or a completed multipart object exceeds `{{R2_MAX_ALLOWED}}`. |
+|  `416` | An R2 byte range is unsatisfiable.                                                                 |
+|  `500` | Unexpected server error.                                                                           |
+|  `503` | A random paste name or P2P room could not be allocated after retries.                              |
 
-For the full HTTP API including `HEAD`, `OPTIONS`, response headers, and edge
-cases, see [api.md]({{BASE_URL}}/doc/api).
+For multipart endpoint details, response headers, and P2P room creation, see
+the [full HTTP API reference]({{BASE_URL}}/doc/api).

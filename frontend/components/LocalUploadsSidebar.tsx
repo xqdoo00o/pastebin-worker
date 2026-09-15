@@ -1,12 +1,10 @@
 import { useEffect, useRef, useState } from "react"
-import type { CSSProperties } from "react"
 
 import type { LocalUploadRecord } from "../utils/localUploads.js"
 import { formatSize } from "../utils/utils.js"
 import { Button, Card, CardBody, Tooltip } from "./ui/index.js"
 import { ChevronDownIcon, ExternalLinkIcon, FileIcon, TrashIcon } from "./icons.js"
 import { CopyWidget } from "./CopyWidget.js"
-import { tst } from "../utils/overrides.js"
 import { FileTree } from "./FileTree.js"
 import { itemCountLabel } from "../../shared/format.js"
 
@@ -18,7 +16,6 @@ interface LocalUploadsSidebarProps {
   onDeleteUpload: (upload: LocalUploadRecord) => Promise<boolean>
   scrollToKey?: string
   className?: string
-  style?: CSSProperties
 }
 
 function getDisplayName(upload: LocalUploadRecord): string {
@@ -57,7 +54,6 @@ export function LocalUploadsSidebar({
   onDeleteUpload,
   scrollToKey,
   className = "",
-  style,
 }: LocalUploadsSidebarProps) {
   const listRef = useRef<HTMLDivElement | null>(null)
   const knownKeysRef = useRef<Set<string>>(new Set(uploads.map((upload) => upload.key)))
@@ -68,7 +64,7 @@ export function LocalUploadsSidebar({
   const [now, setNow] = useState(() => Date.now())
   const actionClass =
     `inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-xl bg-default-100 px-2 ` +
-    `text-xs text-foreground hover:bg-default-200 ${tst}`
+    "text-xs text-foreground transition-colors hover:bg-default-200"
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 60000)
@@ -118,19 +114,13 @@ export function LocalUploadsSidebar({
   }
 
   return (
-    <aside
-      className={`flex w-full flex-col xl:mt-6 xl:h-[calc(var(--local-uploads-height)-1.5rem)] xl:max-h-[calc(var(--local-uploads-height)-1.5rem)] xl:w-75 xl:overflow-hidden ${className}`}
-      style={style}
-    >
+    <aside className={`flex max-h-[56rem] w-full flex-col overflow-hidden xl:mt-6 xl:w-75 ${className}`}>
       {uploads.length === 0 ? (
         <div className="rounded-lg border border-dashed border-default-300 px-4 py-4 text-sm text-default-500">
           Uploads from this browser will appear here.
         </div>
       ) : (
-        <div
-          ref={listRef}
-          className="local-upload-list flex max-h-[calc(100vh-1rem)] flex-col overflow-y-auto px-1 xl:min-h-0 xl:max-h-none xl:flex-1 xl:overscroll-contain"
-        >
+        <div ref={listRef} className="flex min-h-0 flex-col overflow-y-auto px-1 overscroll-contain">
           {uploads.map((upload) => {
             const isExpanded = expandedKeys.has(upload.key)
             const hasFilenames = upload.filenames !== undefined && upload.filenames.length > 0
@@ -173,7 +163,7 @@ export function LocalUploadsSidebar({
                             <>
                               <button
                                 type="button"
-                                className={`mt-1 inline-flex cursor-pointer items-center gap-1 text-sm text-primary hover:underline focus:outline-none focus-visible:ring-1 focus-visible:ring-default-400 rounded ${tst}`}
+                                className="mt-1 inline-flex cursor-pointer items-center gap-1 rounded text-sm text-primary hover:underline focus:outline-none focus-visible:ring-1 focus-visible:ring-default-400"
                                 aria-expanded={isExpanded}
                                 onClick={() => {
                                   setExpandedKeys((current) => {
@@ -189,7 +179,7 @@ export function LocalUploadsSidebar({
                               </button>
                               {isExpanded && (
                                 <div className="mt-2 max-h-48 overflow-auto rounded-md bg-default-100">
-                                  <FileTree files={upload.filenames!} compact />
+                                  <FileTree files={upload.filenames!} compact tone="foreground" />
                                 </div>
                               )}
                             </>
@@ -204,7 +194,7 @@ export function LocalUploadsSidebar({
                             color="danger"
                             aria-label={`Delete ${displayName}`}
                             disabled={isDeleting}
-                            className="shrink-0 cursor-pointer text-default-500 hover:text-danger disabled:cursor-not-allowed"
+                            className="shrink-0 cursor-pointer text-default-500 hover:text-danger"
                             onPress={() => {
                               void deleteUpload(upload)
                             }}

@@ -9,13 +9,11 @@ import {
   ENCRYPTION_TAG_SIZE,
   parseEncryptionHeader,
 } from "./encryptionCore.js"
-import { createOPFSTemporaryFile, OPFS_DOWNLOAD_THRESHOLD } from "./opfs.js"
+import { createOPFSTemporaryFile, OPFS_DOWNLOAD_THRESHOLD, type ManagedFile } from "./opfs.js"
+import { parseNonNegativeSafeInteger } from "../../shared/numbers.js"
 
-export interface DownloadedResponseFile {
-  file: File
+export interface DownloadedResponseFile extends ManagedFile {
   content?: Uint8Array
-  cleanup?: () => Promise<void>
-  deferCleanup?: () => void
 }
 
 interface ResponseDownloadOptions {
@@ -28,9 +26,29 @@ interface ResponseDownloadOptions {
 }
 
 function parseSize(value: string | null | number | undefined): number | null {
-  if (value === null || value === undefined) return null
-  const parsed = typeof value === "number" ? value : Number(value)
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null
+  return parseNonNegativeSafeInteger(value)
+}
+
+interface ResponseBodyLifecycle {
+  temporaryFile?: Awaited<ReturnType<typeof createOPFSTemporaryFile>>
+  cleanup?: () => Promise<void>
+}
+
+async function consumeResponseReader<T>(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  consume: (lifecycle: ResponseBodyLifecycle) => Promise<T>,
+): Promise<T> {
+  const lifecycle: ResponseBodyLifecycle = {}
+  try {
+    return await consume(lifecycle)
+  } catch (error) {
+    await lifecycle.temporaryFile?.abort()
+    await lifecycle.cleanup?.()
+    await reader.cancel(error).catch(() => undefined)
+    throw error
+  } finally {
+    reader.releaseLock()
+  }
 }
 
 export async function downloadResponseToFile(
@@ -54,11 +72,9 @@ export async function downloadResponseToFile(
 
   if (!response.body) throw new Error("The download response does not have a readable body")
   const reader = response.body.getReader()
-  let temporaryFile: Awaited<ReturnType<typeof createOPFSTemporaryFile>> | undefined
-  let cleanup: (() => Promise<void>) | undefined
-  try {
+  return await consumeResponseReader(reader, async (lifecycle) => {
     options.signal?.throwIfAborted()
-    temporaryFile = await createOPFSTemporaryFile(expectedSize)
+    lifecycle.temporaryFile = await createOPFSTemporaryFile(expectedSize)
     let written = 0
     while (true) {
       options.signal?.throwIfAborted()
@@ -67,24 +83,17 @@ export async function downloadResponseToFile(
       if (written + next.value.byteLength > expectedSize) {
         throw new Error("Downloaded response is larger than Content-Length")
       }
-      await temporaryFile.write(next.value)
+      await lifecycle.temporaryFile.write(next.value)
       written += next.value.byteLength
     }
     if (written !== expectedSize) throw new Error("Downloaded response ended before Content-Length")
 
-    const completed = await temporaryFile.finish(options.filename, options.type)
-    cleanup = completed.cleanup
-    temporaryFile = undefined
+    const completed = await lifecycle.temporaryFile.finish(options.filename, options.type)
+    lifecycle.cleanup = completed.cleanup
+    lifecycle.temporaryFile = undefined
     const content = options.includeContent ? new Uint8Array(await completed.file.arrayBuffer()) : undefined
-    return { file: completed.file, content, cleanup, deferCleanup: completed.deferCleanup }
-  } catch (error) {
-    await temporaryFile?.abort()
-    await cleanup?.()
-    await reader.cancel(error).catch(() => undefined)
-    throw error
-  } finally {
-    reader.releaseLock()
-  }
+    return { file: completed.file, content, cleanup: lifecycle.cleanup, deferCleanup: completed.deferCleanup }
+  })
 }
 
 class ExactStreamReader {
@@ -145,9 +154,7 @@ export async function decryptResponseToFile(
   const key = await decodeKey(scheme, encodedKey)
   const reader = response.body.getReader()
   const exact = new ExactStreamReader(reader)
-  let temporaryFile: Awaited<ReturnType<typeof createOPFSTemporaryFile>> | undefined
-  let cleanup: (() => Promise<void>) | undefined
-  try {
+  return await consumeResponseReader(reader, async (lifecycle) => {
     options.signal?.throwIfAborted()
     const headerBytes = await exact.read(ENCRYPTION_HEADER_SIZE)
     const header = parseEncryptionHeader(headerBytes)
@@ -163,7 +170,7 @@ export async function decryptResponseToFile(
 
     const useOPFS = header.plaintextSize >= (options.opfsThreshold ?? OPFS_DOWNLOAD_THRESHOLD)
     const content = useOPFS ? undefined : new Uint8Array(header.plaintextSize)
-    if (useOPFS) temporaryFile = await createOPFSTemporaryFile(header.plaintextSize)
+    if (useOPFS) lifecycle.temporaryFile = await createOPFSTemporaryFile(header.plaintextSize)
     const session = createChunkedDecryptionSession(key, headerBytes)
     try {
       for (let index = 0; index < encryptionChunkCount(header.plaintextSize); index += 1) {
@@ -172,7 +179,7 @@ export async function decryptResponseToFile(
         const encrypted = await exact.read(end - start + ENCRYPTION_TAG_SIZE)
         const decrypted = await session.decrypt(index, encrypted.buffer)
         options.signal?.throwIfAborted()
-        if (temporaryFile) await temporaryFile.write(decrypted)
+        if (lifecycle.temporaryFile) await lifecycle.temporaryFile.write(decrypted)
         else content!.set(new Uint8Array(decrypted), start)
       }
     } finally {
@@ -180,27 +187,20 @@ export async function decryptResponseToFile(
     }
     await exact.ensureEnd()
 
-    if (temporaryFile) {
-      const completed = await temporaryFile.finish(options.filename, options.type)
-      cleanup = completed.cleanup
-      temporaryFile = undefined
+    if (lifecycle.temporaryFile) {
+      const completed = await lifecycle.temporaryFile.finish(options.filename, options.type)
+      lifecycle.cleanup = completed.cleanup
+      lifecycle.temporaryFile = undefined
       const includedContent = options.includeContent ? new Uint8Array(await completed.file.arrayBuffer()) : undefined
       return {
         file: completed.file,
         content: includedContent,
-        cleanup,
+        cleanup: lifecycle.cleanup,
         deferCleanup: completed.deferCleanup,
       }
     }
 
     const file = new File([content!], options.filename, { type: options.type })
     return options.includeContent === false ? { file } : { file, content }
-  } catch (error) {
-    await temporaryFile?.abort()
-    await cleanup?.()
-    await reader.cancel(error).catch(() => undefined)
-    throw error
-  } finally {
-    reader.releaseLock()
-  }
+  })
 }

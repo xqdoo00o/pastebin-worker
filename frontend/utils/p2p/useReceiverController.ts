@@ -7,6 +7,7 @@ import type {
   P2PReceiverSession,
   P2PTransferHistoryItem,
 } from "./protocol.js"
+import { asError } from "../errors.js"
 
 export interface P2PReceivedFileContext {
   isCurrent: () => boolean
@@ -120,7 +121,7 @@ export function useP2PReceiverController(name: string, config: PublicEnv, option
 
       const receiverModule = await import("../p2pReceiver.js").catch((error: unknown) => {
         if (isCurrentSession()) {
-          optionsRef.current.onStartError?.(error instanceof Error ? error : new Error(String(error)))
+          optionsRef.current.onStartError?.(asError(error))
         }
         return null
       })
@@ -174,7 +175,7 @@ export function useP2PReceiverController(name: string, config: PublicEnv, option
               setStatus,
             }),
           ).catch((error: unknown) => {
-            if (isCurrent()) optionsRef.current.onError(error instanceof Error ? error : new Error(String(error)))
+            if (isCurrent()) optionsRef.current.onError(asError(error))
           })
         },
         onAbandoned: () => {

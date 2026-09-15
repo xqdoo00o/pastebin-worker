@@ -1,7 +1,13 @@
 import { expect, test, it, describe, beforeEach, afterEach } from "vitest"
 import { areBlobsEqual, BASE_URL, genRandomBlob, upload, uploadExpectStatus, workerFetch } from "./testUtils.js"
-import { encodeBasicAuth, decodeBasicAuth, verifyPasswordHash } from "../pages/auth.js"
+import { decodeBasicAuth, verifyPasswordHash } from "../pages/auth.js"
+import { create_password_hash } from "../../codecs/argon2/dist/argon2.js"
 import { createExecutionContext, env } from "cloudflare:test"
+
+function encodeBasicAuth(username: string, password: string): string {
+  const credentials = new TextEncoder().encode(`${username}:${password}`)
+  return `Basic ${btoa(String.fromCharCode(...credentials))}`
+}
 
 test("basic auth encode and decode", () => {
   const userPasswdPairs = [
@@ -17,14 +23,23 @@ test("basic auth encode and decode", () => {
   }
 })
 
-test("Argon2 verification accepts configured hashes and rejects invalid formats", () => {
+test("Argon2 verification accepts configured hashes and rejects invalid formats", async () => {
   const hash = "$argon2id$v=19$m=19456,t=2,p=1$SaOoXR1kQZC+4qnVu54dLA$qRSeRaayqqFX8A6Wbu7vP2iv241RpSBtbfKizEcXtHI"
 
-  expect(verifyPasswordHash("correct horse battery staple", hash)).toStrictEqual(true)
-  expect(verifyPasswordHash("wrong password", hash)).toStrictEqual(false)
-  expect(verifyPasswordHash("password", "$2b$10$legacy-bcrypt-hash")).toStrictEqual(false)
-  expect(verifyPasswordHash("password", "scrypt$16384$8$5$old$salt")).toStrictEqual(false)
-  expect(verifyPasswordHash("password", "pbkdf2-sha256$600000$old$salt")).toStrictEqual(false)
+  await expect(verifyPasswordHash("correct horse battery staple", hash)).resolves.toStrictEqual(true)
+  await expect(verifyPasswordHash("wrong password", hash)).resolves.toStrictEqual(false)
+  await expect(verifyPasswordHash("password", "$2b$10$legacy-bcrypt-hash")).resolves.toStrictEqual(false)
+  await expect(verifyPasswordHash("password", "scrypt$16384$8$5$old$salt")).resolves.toStrictEqual(false)
+  await expect(verifyPasswordHash("password", "pbkdf2-sha256$600000$old$salt")).resolves.toStrictEqual(false)
+  for (const invalidParameters of ["m=7,t=1,p=1", "m=65537,t=1,p=1", "m=8192,t=7,p=1", "m=8192,t=1,p=5"]) {
+    await expect(verifyPasswordHash("password", `$argon2id$v=19$${invalidParameters}$AQ$AQ`)).resolves.toStrictEqual(
+      false,
+    )
+  }
+
+  const generatedHash = create_password_hash("generated password", new Uint8Array(16).fill(7))
+  await expect(verifyPasswordHash("generated password", generatedHash)).resolves.toStrictEqual(true)
+  await expect(verifyPasswordHash("other password", generatedHash)).resolves.toStrictEqual(false)
 })
 
 describe("basic auth", () => {
@@ -59,6 +74,11 @@ describe("basic auth", () => {
       expect(response.status, `visiting ${page}`).toStrictEqual(401)
       expect(response.headers.get("Cache-Control")).toStrictEqual("private, no-store")
     }
+  })
+
+  it("should allow accessing the P2P camera without auth", async () => {
+    const response = await workerFetch(ctx, `${BASE_URL}/qr-receiver`)
+    expect(response.status).toStrictEqual(200)
   })
 
   it("should forbid accessing curl index without auth", async () => {

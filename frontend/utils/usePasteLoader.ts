@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useReducer, useRef, useState } from "react"
 import { BINARY_MIME_TYPE, MAX_AUTO_FETCH_BYTES } from "../../shared/constants.js"
-import { detectUtf8 } from "../../shared/encoding.js"
+import { base64ToBytes, detectUtf8 } from "../../shared/encoding.js"
 import type { MetaResponse, OriginalFileInfo } from "../../shared/interfaces.js"
 import type { EncryptionScheme } from "../../shared/constants.js"
 import { decryptResponseToFile, downloadResponseToFile } from "./responseDownload.js"
 import { isMetaResponse, parsePasteResponseHeaders, stripEncryptedSuffix } from "./pasteResponse.js"
+import { triggerUrlDownload } from "./download.js"
+import { isAbortError } from "./errors.js"
 
 export interface PasteLoaderInitialState {
   pasteFile?: File
@@ -49,6 +51,22 @@ interface PastePreview {
   encoding: string | null
 }
 
+interface PasteLoaderState extends PasteLoaderInitialState {
+  isLoading: boolean
+  isDownloading: boolean
+  pendingInfo: PastePendingInfo | null
+  mediaInfo: PasteMediaInfo | null
+}
+
+interface PasteLoaderAction {
+  type: "patch"
+  patch: Partial<PasteLoaderState>
+}
+
+function pasteLoaderReducer(state: PasteLoaderState, action: PasteLoaderAction): PasteLoaderState {
+  return { ...state, ...action.patch }
+}
+
 interface PasteLoaderOptions {
   url: URL
   name: string
@@ -76,13 +94,15 @@ export function getInitialPasteState(
     }
   }
 
-  const responseBytes = Uint8Array.from(atob(initialData.content), (character) => character.charCodeAt(0))
+  const responseBytes = base64ToBytes(initialData.content)
   const scheme = initialData.metadata.encryptionScheme as EncryptionScheme | undefined
   const lang = url.searchParams.get("lang") || initialData.metadata.highlightLanguage
   const inferredFilename = filename || (ext && name + ext) || initialData.metadata.filename
 
   return {
-    pasteFile: new File([responseBytes], inferredFilename || name),
+    pasteFile: new File([responseBytes], inferredFilename || name, {
+      type: initialData.contentType || initialData.metadata.mimeType || "",
+    }),
     pasteContentBuffer: responseBytes,
     pasteLang: lang || undefined,
     isFileBinary: initialData.isBinary,
@@ -105,18 +125,13 @@ export function usePasteLoader({
   handleFailedResponse,
 }: PasteLoaderOptions) {
   const pasteUrl = `/${name}`
-  const [pasteFile, setPasteFile] = useState<File | undefined>(initialState.pasteFile)
-  const [pasteContentBuffer, setPasteContentBuffer] = useState<Uint8Array | undefined>(initialState.pasteContentBuffer)
-  const [pasteLang, setPasteLang] = useState<string | undefined>(initialState.pasteLang)
-  const [isFileBinary, setFileBinary] = useState(initialState.isFileBinary)
-  const [guessedEncoding, setGuessedEncoding] = useState<string | null>(initialState.guessedEncoding)
-  const [isDecrypted, setDecrypted] = useState<"not encrypted" | "encrypted" | "decrypted">(initialState.isDecrypted)
-  const [isLoading, setIsLoading] = useState(false)
-  const [isDownloading, setIsDownloading] = useState(false)
-  const [pendingInfo, setPendingInfo] = useState<PastePendingInfo | null>(null)
-  const [mediaInfo, setMediaInfo] = useState<PasteMediaInfo | null>(null)
-  const [metaFilename, setMetaFilename] = useState<string | undefined>(initialState.metaFilename)
-  const [originalFiles, setOriginalFiles] = useState<OriginalFileInfo[] | undefined>(initialState.originalFiles)
+  const [state, dispatch] = useReducer(pasteLoaderReducer, {
+    ...initialState,
+    isLoading: false,
+    isDownloading: false,
+    pendingInfo: null,
+    mediaInfo: null,
+  })
 
   const [abortController] = useState(() => new AbortController())
   const isFetchingBodyRef = useRef(false)
@@ -130,13 +145,13 @@ export function usePasteLoader({
   const fetchMetadata = useCallback(
     async (signal = abortController.signal): Promise<MetaResponse | null> => {
       try {
-        const response = await fetch(`/m/${name}`, { signal })
+        const response = await fetch(`/m/${name}`, { cache: "no-cache", signal })
         if (!response.ok) return null
         const metadata: unknown = await response.json()
         signal.throwIfAborted()
         return isMetaResponse(metadata) ? metadata : null
       } catch (error) {
-        if (signal.aborted || (error as Error).name === "AbortError") return null
+        if (signal.aborted || isAbortError(error)) return null
         console.warn(`Failed to fetch metadata for ${name}`, error)
         return null
       }
@@ -147,13 +162,7 @@ export function usePasteLoader({
   const downloadFile = useCallback((file: File, cleanup?: () => Promise<void>, deferCleanup?: () => void) => {
     const downloadBlob = file.type === BINARY_MIME_TYPE ? file : new Blob([file], { type: BINARY_MIME_TYPE })
     const downloadUrl = URL.createObjectURL(downloadBlob)
-    const link = document.createElement("a")
-    link.href = downloadUrl
-    link.download = file.name
-    link.style.display = "none"
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
+    triggerUrlDownload(downloadUrl, file.name)
     if (cleanup) {
       // There is no reliable browser event for when a Blob-backed download has
       // consumed its source. Keep OPFS-backed files alive for this page lifetime.
@@ -166,7 +175,7 @@ export function usePasteLoader({
   const fetchPasteFile = useCallback(
     async (includeContent = false, signal = abortController.signal): Promise<FetchedPasteFile | null> => {
       try {
-        const response = await fetch(pasteUrl, { signal })
+        const response = await fetch(pasteUrl, { cache: "no-cache", signal })
         if (!response.ok) {
           await callbacksRef.current.handleFailedResponse("Failed to Fetch Paste", response)
           return null
@@ -174,7 +183,7 @@ export function usePasteLoader({
         const responseInfo = parsePasteResponseHeaders(response.headers)
         const { encryptionScheme: scheme, remainingReads, filename: filenameFromDisposition } = responseInfo
         const lang = url.searchParams.get("lang") || responseInfo.highlightLanguage
-        let metadataFilename = metaFilename
+        let metadataFilename = state.metaFilename
         if (!filename && !ext && !filenameFromDisposition && !metadataFilename) {
           metadataFilename = stripEncryptedSuffix((await fetchMetadata(signal))?.filename)
         }
@@ -224,7 +233,7 @@ export function usePasteLoader({
             didDecrypt: true,
           }
         } catch (error) {
-          if (signal.aborted || (error as Error).name === "AbortError") return null
+          if (signal.aborted || isAbortError(error)) return null
           callbacksRef.current.showError(
             "Decryption failed",
             `${(error as Error).message}. The URL fragment may be wrong, or the paste has been replaced or corrupted.`,
@@ -232,22 +241,20 @@ export function usePasteLoader({
           return null
         }
       } catch (error) {
-        if (signal.aborted || (error as Error).name === "AbortError") return null
+        if (signal.aborted || isAbortError(error)) return null
         callbacksRef.current.showError(`Error on fetching ${pasteUrl}`, (error as Error).toString())
         console.error(error)
         return null
       }
     },
-    [abortController, ext, fetchMetadata, filename, metaFilename, name, pasteUrl, url],
+    [abortController, ext, fetchMetadata, filename, name, pasteUrl, state.metaFilename, url],
   )
 
   const loadBody = useCallback(
     async (signal = abortController.signal) => {
       if (isFetchingBodyRef.current) return
       isFetchingBodyRef.current = true
-      setIsLoading(true)
-      setPendingInfo(null)
-      setMediaInfo(null)
+      dispatch({ type: "patch", patch: { isLoading: true, pendingInfo: null, mediaInfo: null } })
       try {
         const paste = await fetchPasteFile(true, signal)
         if (!paste) return
@@ -260,33 +267,35 @@ export function usePasteLoader({
           throw new Error("The downloaded file could not be loaded for preview")
         }
 
-        setPasteLang(paste.lang)
-        if (paste.filenameFromDisp) setMetaFilename(paste.filenameFromDisp)
         await temporaryFileCleanupRef.current?.()
         if (signal.aborted) {
           await paste.cleanup?.()
           return
         }
         temporaryFileCleanupRef.current = paste.cleanup
-        setPasteFile(paste.file)
-        setPasteContentBuffer(paste.content)
-        if (paste.scheme) {
-          setDecrypted(paste.didDecrypt ? "decrypted" : "encrypted")
+        const patch: Partial<PasteLoaderState> = {
+          pasteFile: paste.file,
+          pasteContentBuffer: paste.content,
+          pasteLang: paste.lang,
+          ...(paste.filenameFromDisp ? { metaFilename: paste.filenameFromDisp } : {}),
+          ...(paste.scheme ? { isDecrypted: paste.didDecrypt ? "decrypted" : "encrypted" } : {}),
         }
         if (paste.scheme && !paste.didDecrypt) {
-          setFileBinary(true)
+          patch.isFileBinary = true
+          patch.guessedEncoding = null
         } else {
           const encoding = detectUtf8(paste.content)
-          setFileBinary(encoding === null)
-          setGuessedEncoding(encoding)
+          patch.isFileBinary = encoding === null
+          patch.guessedEncoding = encoding
         }
+        dispatch({ type: "patch", patch })
       } catch (error) {
-        if (!signal.aborted && (error as Error).name !== "AbortError") {
+        if (!signal.aborted && !isAbortError(error)) {
           callbacksRef.current.showError(`Error on fetching ${pasteUrl}`, (error as Error).toString())
         }
       } finally {
         isFetchingBodyRef.current = false
-        if (!signal.aborted) setIsLoading(false)
+        if (!signal.aborted) dispatch({ type: "patch", patch: { isLoading: false } })
       }
     },
     [abortController, fetchPasteFile, pasteUrl],
@@ -296,31 +305,54 @@ export function usePasteLoader({
     async (signal = abortController.signal) => {
       if (isDownloadingRef.current) return
       isDownloadingRef.current = true
-      setIsDownloading(true)
+      dispatch({ type: "patch", patch: { isDownloading: true } })
       try {
         const paste = await fetchPasteFile(false, signal)
         if (paste && !signal.aborted) downloadFile(paste.file, paste.cleanup, paste.deferCleanup)
         else await paste?.cleanup?.()
       } finally {
         isDownloadingRef.current = false
-        if (!signal.aborted) setIsDownloading(false)
+        if (!signal.aborted) dispatch({ type: "patch", patch: { isDownloading: false } })
       }
     },
     [abortController, downloadFile, fetchPasteFile],
   )
 
   const showPreview = useCallback((preview: PastePreview) => {
-    setPasteFile(preview.file)
-    setPasteContentBuffer(preview.content)
-    setPasteLang(preview.lang)
-    setFileBinary(preview.isBinary)
-    setGuessedEncoding(preview.encoding)
+    dispatch({
+      type: "patch",
+      patch: {
+        pasteFile: preview.file,
+        pasteContentBuffer: preview.content,
+        pasteLang: preview.lang,
+        isFileBinary: preview.isBinary,
+        guessedEncoding: preview.encoding,
+      },
+    })
+  }, [])
+
+  const showMediaPreview = useCallback((file: File) => {
+    dispatch({
+      type: "patch",
+      patch: {
+        pasteFile: file,
+        pasteContentBuffer: undefined,
+        pasteLang: undefined,
+        isFileBinary: false,
+        guessedEncoding: null,
+      },
+    })
   }, [])
 
   const clearPreview = useCallback(() => {
-    setPasteFile(undefined)
-    setPasteContentBuffer(undefined)
-    setIsLoading(false)
+    dispatch({
+      type: "patch",
+      patch: { pasteFile: undefined, pasteContentBuffer: undefined, isLoading: false },
+    })
+  }, [])
+
+  const setLoading = useCallback((isLoading: boolean) => {
+    dispatch({ type: "patch", patch: { isLoading } })
   }, [])
 
   const dispose = useCallback(() => {
@@ -347,9 +379,9 @@ export function usePasteLoader({
 
     const signal = abortController.signal
     void (async () => {
-      setIsLoading(true)
+      dispatch({ type: "patch", patch: { isLoading: true } })
       try {
-        const headResponse = await fetch(pasteUrl, { method: "HEAD", signal })
+        const headResponse = await fetch(pasteUrl, { method: "HEAD", cache: "no-cache", signal })
         if (!headResponse.ok) {
           await callbacksRef.current.handleFailedResponse(`Error on Fetching ${pasteUrl}`, headResponse)
           return
@@ -358,15 +390,21 @@ export function usePasteLoader({
         const responseInfo = parsePasteResponseHeaders(headResponse.headers)
         const {
           contentLength,
-          highlightLanguage,
+          highlightLanguage: declaredHighlightLanguage,
           encryptionScheme,
           effectiveContentType,
           filename: filenameFromHead,
           remainingReads,
         } = responseInfo
+        const highlightLanguage = url.searchParams.get("lang") || declaredHighlightLanguage
         const isEncrypted = encryptionScheme !== null
-        setDecrypted(isEncrypted ? "encrypted" : "not encrypted")
-        if (filenameFromHead) setMetaFilename(filenameFromHead)
+        dispatch({
+          type: "patch",
+          patch: {
+            isDecrypted: isEncrypted ? "encrypted" : "not encrypted",
+            ...(filenameFromHead ? { metaFilename: filenameFromHead } : {}),
+          },
+        })
 
         const shouldAwaitMetadata = contentLength === null
         const metadataPromise = fetchMetadata(signal)
@@ -374,8 +412,13 @@ export function usePasteLoader({
         signal.throwIfAborted()
         const applyMetadata = (value: MetaResponse | null) => {
           if (!value) return
-          if (!filenameFromHead && value.filename) setMetaFilename(value.filename)
-          if (value.filenames) setOriginalFiles(value.filenames)
+          dispatch({
+            type: "patch",
+            patch: {
+              ...(!filenameFromHead && value.filename ? { metaFilename: value.filename } : {}),
+              ...(value.filenames ? { originalFiles: value.filenames } : {}),
+            },
+          })
         }
         applyMetadata(metadata)
         if (!shouldAwaitMetadata) {
@@ -390,57 +433,42 @@ export function usePasteLoader({
         const isMedia =
           effectiveContentType?.startsWith("image/") ||
           effectiveContentType?.startsWith("audio/") ||
-          effectiveContentType?.startsWith("video/") ||
-          false
+          effectiveContentType?.startsWith("video/")
         const sizeOk = sizeBytes !== null && sizeBytes < MAX_AUTO_FETCH_BYTES
 
         if (isReadLimited) {
-          setPendingInfo({
-            sizeBytes,
-            rawUrl: pasteUrl,
-            contentType: effectiveContentType,
-            isReadLimited,
+          dispatch({
+            type: "patch",
+            patch: { pendingInfo: { sizeBytes, rawUrl: pasteUrl, contentType: effectiveContentType, isReadLimited } },
           })
         } else if ((isText || (isMedia && isEncrypted)) && sizeOk) {
           await loadBody(signal)
         } else if (isMedia && !isEncrypted) {
-          setMediaInfo({
-            sizeBytes,
-            rawUrl: pasteUrl,
-            contentType: effectiveContentType!,
+          dispatch({
+            type: "patch",
+            patch: { mediaInfo: { sizeBytes, rawUrl: pasteUrl, contentType: effectiveContentType! } },
           })
         } else {
-          setPendingInfo({
-            sizeBytes,
-            rawUrl: pasteUrl,
-            contentType: effectiveContentType,
+          dispatch({
+            type: "patch",
+            patch: { pendingInfo: { sizeBytes, rawUrl: pasteUrl, contentType: effectiveContentType } },
           })
         }
       } catch (error) {
-        if (signal.aborted || (error as Error).name === "AbortError") return
+        if (signal.aborted || isAbortError(error)) return
         callbacksRef.current.showError(`Error on Fetching ${pasteUrl}`, (error as Error).toString())
         console.error(error)
       } finally {
-        if (!signal.aborted) setIsLoading(false)
+        if (!signal.aborted) dispatch({ type: "patch", patch: { isLoading: false } })
       }
     })()
-  }, [abortController, enabled, fetchMetadata, loadBody, pasteUrl])
+  }, [abortController, enabled, ext, fetchMetadata, filename, loadBody, name, pasteUrl, url.searchParams])
 
   return {
-    pasteFile,
-    pasteContentBuffer,
-    pasteLang,
-    isFileBinary,
-    guessedEncoding,
-    isDecrypted,
-    isLoading,
-    isDownloading,
-    pendingInfo,
-    mediaInfo,
-    metaFilename,
-    originalFiles,
-    setLoading: setIsLoading,
+    ...state,
+    setLoading,
     showPreview,
+    showMediaPreview,
     clearPreview,
     downloadFile,
     loadBody,

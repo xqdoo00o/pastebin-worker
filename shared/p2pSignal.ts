@@ -43,12 +43,19 @@ export type P2PSignalMessage =
       iceServers?: P2PIceServer[]
     }
   | { type: "peer-left"; role: P2PRole; peerId?: string; resumable?: boolean }
-  | { type: "offer"; peerId: string; sdp: P2PSessionDescription; negotiationId?: string }
+  | {
+      type: "offer"
+      peerId: string
+      sdp: P2PSessionDescription
+      negotiationId?: string
+      directOnly?: boolean
+    }
   | { type: "answer"; peerId: string; sdp: P2PSessionDescription; negotiationId?: string }
   | { type: "candidate"; peerId: string; candidate: P2PIceCandidate; negotiationId?: string }
   | { type: "receiver-paired"; peerId: string }
   | { type: "receiver-pair-result"; peerId: string; accepted: boolean }
   | { type: "receiver-limit-reached" }
+  | { type: "receiver-reconnect-expired" }
   | { type: "transfer-complete"; peerId: string }
   | { type: "transfer-limit-complete" }
   | { type: "transfer-checkpoint" }
@@ -56,6 +63,7 @@ export type P2PSignalMessage =
   | { type: "transfer-checkpoint-result"; accepted: boolean }
   | { type: "transfer-abandon" }
   | { type: "transfer-abandoned" }
+  | { type: "receiver-leave"; resumable: boolean }
   | { type: "sender-leave" }
   | { type: "peer-reconnect-request"; peerId?: string; retryToken?: string }
   | { type: "peer-reconnect-failed"; peerId: string; retryToken: string }
@@ -97,7 +105,7 @@ export function isP2PIceServer(value: unknown): value is P2PIceServer {
   )
 }
 
-export function isP2PSessionDescription(value: unknown): value is P2PSessionDescription {
+function isP2PSessionDescription(value: unknown): value is P2PSessionDescription {
   if (!isRecord(value)) return false
   return (
     (value.type === "offer" || value.type === "answer" || value.type === "pranswer" || value.type === "rollback") &&
@@ -159,6 +167,12 @@ export function isP2PSignalMessage(value: unknown): value is P2PSignalMessage {
         (value.resumable === undefined || typeof value.resumable === "boolean")
       )
     case "offer":
+      return (
+        isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) &&
+        hasOptionalNegotiationId &&
+        isP2PSessionDescription(value.sdp) &&
+        (value.directOnly === undefined || typeof value.directOnly === "boolean")
+      )
     case "answer":
       return (
         isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) &&
@@ -191,7 +205,10 @@ export function isP2PSignalMessage(value: unknown): value is P2PSignalMessage {
       )
     case "transfer-checkpoint-result":
       return typeof value.accepted === "boolean"
+    case "receiver-leave":
+      return typeof value.resumable === "boolean"
     case "receiver-limit-reached":
+    case "receiver-reconnect-expired":
     case "transfer-limit-complete":
     case "transfer-checkpoint":
     case "transfer-checkpoint-clear":

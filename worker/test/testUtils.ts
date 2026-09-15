@@ -32,37 +32,48 @@ export const staticPages = [
 
 type FormDataBuild = Record<string, string | Blob | { content: Blob; filename: string }>
 
+interface UploadRequestOptions {
+  method?: "POST" | "PUT"
+  url?: string
+  headers?: Record<string, string>
+  context?: string
+}
+
 export async function workerFetch(ctx: ExecutionContext, req: Request | string) {
   // we are not using SELF.fetch since it sometimes do not print worker log to console
   // return await SELF.fetch(req, options)
   return await worker.fetch(new Request(req), env, ctx)
 }
 
+async function sendUploadRequest(
+  ctx: ExecutionContext,
+  kv: FormDataBuild,
+  options: UploadRequestOptions,
+): Promise<Response> {
+  return await workerFetch(
+    ctx,
+    new Request(options.url || BASE_URL, {
+      method: options.method || "POST",
+      body: createFormData(kv),
+      headers: options.headers || {},
+    }),
+  )
+}
+
+async function throwUnexpectedUploadResponse(response: Response, context?: string): Promise<never> {
+  let message = await response.text()
+  if (context) message += ` ${context}`
+  throw new Error(message)
+}
+
 export async function upload(
   ctx: ExecutionContext,
   kv: FormDataBuild,
-  options: {
-    method?: "POST" | "PUT"
-    url?: string
-    headers?: Record<string, string>
-    context?: string
-  } = {},
+  options: UploadRequestOptions = {},
 ): Promise<PasteResponse> {
-  const method = options.method || "POST"
-  const url = options.url || BASE_URL
-  const headers = options.headers || {}
-  const uploadResponse = await workerFetch(
-    ctx,
-    new Request(url, {
-      method,
-      body: createFormData(kv),
-      headers,
-    }),
-  )
+  const uploadResponse = await sendUploadRequest(ctx, kv, options)
   if (uploadResponse.status !== 200) {
-    let uploadMsg = await uploadResponse.text()
-    if (options.context) uploadMsg += ` ${options.context}`
-    throw new Error(uploadMsg)
+    await throwUnexpectedUploadResponse(uploadResponse, options.context)
   }
   expect(uploadResponse.headers.get("Content-Type")).toStrictEqual("application/json;charset=UTF-8")
   return JSON.parse(await uploadResponse.text()) as PasteResponse
@@ -71,33 +82,16 @@ export async function upload(
 export async function uploadExpectStatus(
   ctx: ExecutionContext,
   kv: FormDataBuild,
-  expectedStatuus: number,
-  options: {
-    method?: "POST" | "PUT"
-    url?: string
-    headers?: Record<string, string>
-    context?: string
-  } = {},
+  expectedStatus: number,
+  options: UploadRequestOptions = {},
 ): Promise<void> {
-  const method = options.method || "POST"
-  const url = options.url || BASE_URL
-  const headers = options.headers || {}
-  const uploadResponse = await workerFetch(
-    ctx,
-    new Request(url, {
-      method,
-      body: createFormData(kv),
-      headers,
-    }),
-  )
-  if (uploadResponse.status !== expectedStatuus) {
-    let uploadMsg = await uploadResponse.text()
-    if (options.context) uploadMsg += ` ${options.context}`
-    throw new Error(uploadMsg)
+  const uploadResponse = await sendUploadRequest(ctx, kv, options)
+  if (uploadResponse.status !== expectedStatus) {
+    await throwUnexpectedUploadResponse(uploadResponse, options.context)
   }
 }
 
-export function createFormData(kv: FormDataBuild): FormData {
+function createFormData(kv: FormDataBuild): FormData {
   const fd = new FormData()
   Object.entries(kv).forEach(([k, v]) => {
     if (typeof v === "string") {
@@ -114,7 +108,7 @@ export function createFormData(kv: FormDataBuild): FormData {
 }
 
 export function genRandomBlob(len: number): Blob {
-  const buf = Buffer.alloc(len)
+  const buf = new Uint8Array(len)
   const chunkSize = 4096
   for (let i = 0; i < len; i += chunkSize) {
     const fillLen = Math.min(len - i, chunkSize)

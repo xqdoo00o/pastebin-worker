@@ -1,32 +1,38 @@
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { readFileSync } from "node:fs"
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest"
+import { initializeXXHash } from "../wasm/xxhash-runtime.js"
+import { maxP2PControlMessageLength, parseP2PDataMessage, verificationBlockSize } from "../utils/p2p/protocol.js"
 import {
-  P2PIceCandidateBuffer,
-  P2PReconnectPolicy,
-  P2PWakeLock,
-  appendHashData,
   closeP2PConnection,
-  createP2PSignalingTransport,
-  finishHashData,
-  maxP2PControlMessageLength,
-  parseP2PDataMessage,
-  p2pControlMessageLengthLimit,
+  P2PIceCandidateBuffer,
+  refreshP2PConnectionRoute,
   selectedP2PConnectionRoute,
-  sha1Hex,
-  verificationBlockSize,
+} from "../utils/p2p/rtc.js"
+import { createP2PSignalingTransport, P2PReconnectPolicy } from "../utils/p2p/signalingTransport.js"
+import { p2pControlMessageLengthLimit } from "../utils/p2p/transfer.js"
+import {
+  appendHashData,
+  createBlockHashState,
+  finishHashData,
   verificationHashChunks,
   verificationManifestMessages,
-  type BlockHashState,
-} from "../utils/p2pCommon.js"
+  xxh3Hex,
+} from "../utils/p2p/verification.js"
+import { P2PWakeLock } from "../utils/p2p/wakeLock.js"
 import { cleanupStaleOPFSTemporaryFiles } from "../utils/opfs.js"
 import {
   P2PPersistentReceiveStore,
   cleanupStaleP2PResumeCheckpoints,
   cleanupStaleP2PSessionPeers,
-  readP2PSessionPeerId,
-  writeP2PSessionPeerId,
+  readP2PResumeCheckpoint,
+  readP2PSessionPeer,
+  setP2PSessionRecoveryRetryToken,
+  writeP2PSessionPeer,
   writeP2PResumeCheckpoint,
 } from "../utils/p2pReceiveStore.js"
 import { isP2PIceCandidate, isP2PIceServer, isP2PSignalMessage, parseP2PSignalMessage } from "../../shared/p2pSignal.js"
+
+beforeAll(() => initializeXXHash(readFileSync("frontend/wasm/xxhash/xxhash_simd.wasm")))
 
 class MockWakeLockSentinel extends EventTarget {
   released = false
@@ -62,6 +68,12 @@ describe("P2P signaling validation", () => {
 
     expect(isP2PSignalMessage(message)).toBe(true)
     expect(parseP2PSignalMessage(JSON.stringify(message))).toEqual(message)
+    expect(parseP2PSignalMessage('{"type":"receiver-reconnect-expired"}')).toEqual({
+      type: "receiver-reconnect-expired",
+    })
+    expect(
+      parseP2PSignalMessage('{"type":"offer","peerId":"receiver-1","sdp":{"type":"offer"},"directOnly":true}'),
+    ).toMatchObject({ type: "offer", directOnly: true })
   })
 
   it("rejects malformed candidates and ICE servers", () => {
@@ -69,6 +81,9 @@ describe("P2P signaling validation", () => {
     expect(isP2PIceCandidate({ candidate: "candidate", sdpMLineIndex: -1 })).toBe(false)
     expect(isP2PIceServer({ urls: [] })).toBe(false)
     expect(isP2PIceServer({ urls: "turn:turn.example.com", credentialType: "token" })).toBe(false)
+    expect(isP2PSignalMessage({ type: "offer", peerId: "receiver-1", sdp: { type: "offer" }, directOnly: "yes" })).toBe(
+      false,
+    )
   })
 
   it("rejects unknown, malformed, and oversized messages", () => {
@@ -160,6 +175,19 @@ describe("P2P reconnect policy", () => {
     expect(policy.nextDelay(35_000)).toStrictEqual(10_000)
     expect(policy.nextDelay(45_000)).toBeNull()
   })
+
+  it("selects the reconnect window from the transfer state when a reconnect cycle starts", () => {
+    let completed = false
+    const policy = new P2PReconnectPolicy(() => (completed ? 30_000 : 45_000))
+
+    expect(policy.nextDelay(0)).toStrictEqual(1_000)
+    expect(policy.nextDelay(1_000)).toStrictEqual(2_000)
+    expect(policy.nextDelay(3_000)).toStrictEqual(4_000)
+    expect(policy.nextDelay(7_000)).toStrictEqual(8_000)
+    expect(policy.nextDelay(15_000)).toStrictEqual(10_000)
+    completed = true
+    expect(policy.nextDelay(25_000)).toBeNull()
+  })
 })
 
 describe("P2P signaling transport", () => {
@@ -215,7 +243,15 @@ describe("P2P signaling transport", () => {
 
 describe("P2P data messages", () => {
   it("parses messages from each peer direction through one validator", () => {
-    const meta = { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false }
+    const meta = {
+      name: "file.bin",
+      size: 4,
+      type: "",
+      lastModified: 0,
+      senderBrowser: "Test browser",
+      originalFiles: [{ name: "source/file.bin", sizeBytes: 4 }],
+      verifyTransfer: false,
+    }
 
     expect(parseP2PDataMessage(JSON.stringify({ type: "meta", meta }), "sender")).toStrictEqual({
       type: "meta",
@@ -237,15 +273,21 @@ describe("P2P data messages", () => {
     expect(() => parseP2PDataMessage(JSON.stringify({ type: "meta", meta: {} }), "receiver")).toThrow(
       "Unexpected P2P receiver message type",
     )
+    expect(() =>
+      parseP2PDataMessage(
+        JSON.stringify({
+          type: "meta",
+          meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+        }),
+        "sender",
+      ),
+    ).toThrow("Invalid P2P file metadata")
   })
 })
 
 describe("P2P peer connection helpers", () => {
-  it.each([
-    ["host", "srflx", "direct"],
-    ["srflx", "relay", "relay"],
-  ] as const)("classifies a selected %s/%s ICE candidate pair as %s", async (localType, remoteType, route) => {
-    const reports = new Map<string, RTCStats>([
+  const candidatePairReports = (localType: RTCIceCandidateType, remoteType: RTCIceCandidateType) =>
+    new Map<string, RTCStats>([
       ["transport", { id: "transport", type: "transport", timestamp: 1, selectedCandidatePairId: "pair" } as RTCStats],
       [
         "pair",
@@ -260,11 +302,39 @@ describe("P2P peer connection helpers", () => {
       ["local", { id: "local", type: "local-candidate", timestamp: 1, candidateType: localType } as RTCStats],
       ["remote", { id: "remote", type: "remote-candidate", timestamp: 1, candidateType: remoteType } as RTCStats],
     ])
+
+  it.each([
+    ["host", "srflx", "direct"],
+    ["srflx", "relay", "relay"],
+  ] as const)("classifies a selected %s/%s ICE candidate pair as %s", async (localType, remoteType, route) => {
+    const reports = candidatePairReports(localType, remoteType)
     const connection = {
       getStats: vi.fn(() => Promise.resolve(reports as unknown as RTCStatsReport)),
     } as unknown as RTCPeerConnection
 
     await expect(selectedP2PConnectionRoute(connection)).resolves.toStrictEqual(route)
+  })
+
+  it("retries route detection while selected candidate stats are still being populated", async () => {
+    vi.useFakeTimers()
+    try {
+      let reports = new Map<string, RTCStats>()
+      const connection = {
+        getStats: vi.fn(() => Promise.resolve(reports as unknown as RTCStatsReport)),
+      } as unknown as RTCPeerConnection
+      const onRoute = vi.fn()
+
+      refreshP2PConnectionRoute(connection, onRoute)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(onRoute).not.toHaveBeenCalled()
+
+      reports = candidatePairReports("host", "srflx")
+      await vi.advanceTimersByTimeAsync(100)
+      expect(onRoute).toHaveBeenCalledOnce()
+      expect(onRoute).toHaveBeenCalledWith("direct")
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("buffers ICE candidates until a remote description is available", async () => {
@@ -326,30 +396,32 @@ describe("P2P peer connection helpers", () => {
 })
 
 describe("P2P block hashing", () => {
-  it("keeps block boundaries while hashing into one reusable contiguous buffer", async () => {
-    const bytes = new Uint8Array(verificationBlockSize + 17)
+  it("streams transport chunks into independent hashes at block boundaries", async () => {
+    const tailSize = 2 * 1024 * 1024
+    const bytes = new Uint8Array(verificationBlockSize * 2 + tailSize)
     for (let index = 0; index < bytes.length; index += 1) bytes[index] = index % 251
-    const state: BlockHashState = {
-      index: 0,
-      size: 0,
-      buffer: new Uint8Array(0),
-      hashes: [],
-    }
+    const state = createBlockHashState()
 
     await appendHashData(state, bytes.slice(0, 123_457).buffer)
+    expect(state.size).toStrictEqual(123_457)
+    expect(state.hasher).toBeDefined()
     await appendHashData(state, bytes.slice(123_457).buffer)
-    const hashes = await finishHashData(state)
+    expect(state.hashes).toHaveLength(2)
+    expect(state.size).toStrictEqual(tailSize)
+    expect(state.hasher).toBeDefined()
+    const hashes = finishHashData(state)
 
     expect(hashes).toStrictEqual([
-      await sha1Hex([bytes.slice(0, verificationBlockSize).buffer]),
-      await sha1Hex([bytes.slice(verificationBlockSize).buffer]),
+      await xxh3Hex([bytes.slice(0, verificationBlockSize).buffer]),
+      await xxh3Hex([bytes.slice(verificationBlockSize, verificationBlockSize * 2).buffer]),
+      await xxh3Hex([bytes.slice(verificationBlockSize * 2).buffer]),
     ])
     expect(state.size).toStrictEqual(0)
-    expect(state.buffer.byteLength).toStrictEqual(0)
+    expect(state.hasher).toBeUndefined()
   })
 
   it("splits verification hashes within the negotiated control message limit", () => {
-    const hashes = Array.from({ length: 10 }, (_, index) => index.toString(16).padStart(40, "0"))
+    const hashes = Array.from({ length: 10 }, (_, index) => index.toString(16).padStart(16, "0"))
     const chunks = [...verificationHashChunks(hashes, 160)]
 
     expect(chunks.length).toBeGreaterThan(1)
@@ -365,18 +437,18 @@ describe("P2P block hashing", () => {
     expect(p2pControlMessageLengthLimit(256 * 1024)).toStrictEqual(256 * 1024)
     expect(p2pControlMessageLengthLimit(0)).toStrictEqual(maxP2PControlMessageLength)
     expect(p2pControlMessageLengthLimit(2 * 1024 * 1024)).toStrictEqual(maxP2PControlMessageLength)
-    expect(() => [...verificationHashChunks(["a".repeat(40)], 32)]).toThrow("too small")
+    expect(() => [...verificationHashChunks(["a".repeat(16)], 32)]).toThrow("too small")
   })
 
   it("keeps small manifests compatible and chunks only manifests that exceed the limit", () => {
-    const smallManifest = { blockSize: verificationBlockSize, hashes: ["a".repeat(40)] }
+    const smallManifest = { blockSize: verificationBlockSize, hashes: ["a".repeat(16)] }
     expect([...verificationManifestMessages(smallManifest, 1024)]).toStrictEqual([
       { type: "done", verification: smallManifest },
     ])
 
     const largeManifest = {
       blockSize: verificationBlockSize,
-      hashes: Array.from({ length: 10 }, (_, index) => index.toString(16).padStart(40, "0")),
+      hashes: Array.from({ length: 10 }, (_, index) => index.toString(16).padStart(16, "0")),
     }
     const messages = [...verificationManifestMessages(largeManifest, 160)]
     expect(messages[0]).toStrictEqual({
@@ -535,6 +607,7 @@ describe("P2P persistent receive store", () => {
       size: 6,
       type: "text/plain",
       lastModified: 123,
+      senderBrowser: "Test browser",
       verifyTransfer: false,
     })
 
@@ -591,6 +664,42 @@ describe("P2P persistent receive store", () => {
 })
 
 describe("P2P resume checkpoint cleanup", () => {
+  it("restores checkpoints containing XXH3 hashes and rejects legacy SHA-1 hashes", () => {
+    const checkpoint = {
+      version: 1 as const,
+      roomName: "xxh3-room",
+      peerId: "00000000-0000-4000-8000-000000000063",
+      meta: {
+        revision: "revision",
+        name: "verified.bin",
+        size: verificationBlockSize * 2,
+        type: "application/octet-stream",
+        lastModified: 0,
+        senderBrowser: "Test browser",
+        verifyTransfer: true,
+      },
+      receivedBytes: verificationBlockSize,
+      completedHashes: ["0123456789abcdef"],
+      updatedAt: Date.now(),
+    }
+
+    expect(writeP2PResumeCheckpoint(checkpoint)).toStrictEqual(true)
+    expect(readP2PResumeCheckpoint(checkpoint.roomName)).toStrictEqual(checkpoint)
+
+    localStorage.setItem(
+      "pastebin-worker:p2p-resume:sha1-room",
+      JSON.stringify({
+        ...checkpoint,
+        roomName: "sha1-room",
+        completedHashes: ["0123456789abcdef0123456789abcdef01234567"],
+      }),
+    )
+    expect(readP2PResumeCheckpoint("sha1-room")).toBeUndefined()
+    expect(localStorage.getItem("pastebin-worker:p2p-resume:sha1-room")).toBeNull()
+
+    localStorage.removeItem("pastebin-worker:p2p-resume:xxh3-room")
+  })
+
   it("removes stale or malformed checkpoints for every room and preserves unrelated storage", () => {
     const now = Date.now()
     writeP2PResumeCheckpoint({
@@ -603,6 +712,7 @@ describe("P2P resume checkpoint cleanup", () => {
         size: 10,
         type: "application/octet-stream",
         lastModified: 0,
+        senderBrowser: "Test browser",
         verifyTransfer: false,
       },
       receivedBytes: 5,
@@ -621,6 +731,7 @@ describe("P2P resume checkpoint cleanup", () => {
           size: 10,
           type: "application/octet-stream",
           lastModified: 0,
+          senderBrowser: "Test browser",
           verifyTransfer: false,
         },
         receivedBytes: 5,
@@ -643,14 +754,31 @@ describe("P2P resume checkpoint cleanup", () => {
 })
 
 describe("P2P session peer cleanup", () => {
-  it("expires malformed and old peers while migrating the UUID-only format", () => {
+  it("keeps the recovery retry token with the stable session peer", () => {
+    const peerId = "00000000-0000-4000-8000-000000000071"
+    const retryToken = "00000000-0000-4000-8000-000000000072"
+
+    expect(writeP2PSessionPeer("retry-room", peerId)).toStrictEqual(true)
+    expect(setP2PSessionRecoveryRetryToken("retry-room", peerId, retryToken)).toStrictEqual(true)
+    expect(writeP2PSessionPeer("retry-room", peerId)).toStrictEqual(true)
+    expect(readP2PSessionPeer("retry-room")).toStrictEqual({ peerId, recoveryRetryToken: retryToken })
+
+    expect(setP2PSessionRecoveryRetryToken("retry-room", peerId, undefined)).toStrictEqual(true)
+    expect(readP2PSessionPeer("retry-room")).toStrictEqual({ peerId, recoveryRetryToken: undefined })
+
+    const replacementPeerId = "00000000-0000-4000-8000-000000000073"
+    expect(writeP2PSessionPeer("retry-room", replacementPeerId)).toStrictEqual(true)
+    expect(setP2PSessionRecoveryRetryToken("retry-room", peerId, retryToken)).toStrictEqual(false)
+    expect(readP2PSessionPeer("retry-room")?.peerId).toStrictEqual(replacementPeerId)
+  })
+
+  it("expires malformed and old peers", () => {
     const now = Date.now()
     const activePeerId = "00000000-0000-4000-8000-000000000071"
-    const legacyPeerId = "00000000-0000-4000-8000-000000000072"
     const stalePeerId = "00000000-0000-4000-8000-000000000073"
 
-    expect(writeP2PSessionPeerId("active-room", activePeerId)).toStrictEqual(true)
-    sessionStorage.setItem("pastebin-worker:p2p-peer:legacy-room", legacyPeerId)
+    expect(writeP2PSessionPeer("active-room", activePeerId)).toStrictEqual(true)
+    sessionStorage.setItem("pastebin-worker:p2p-peer:raw-room", "00000000-0000-4000-8000-000000000072")
     sessionStorage.setItem(
       "pastebin-worker:p2p-peer:stale-room",
       JSON.stringify({ version: 1, peerId: stalePeerId, updatedAt: now - 25 * 60 * 60 * 1000 }),
@@ -658,10 +786,9 @@ describe("P2P session peer cleanup", () => {
     sessionStorage.setItem("pastebin-worker:p2p-peer:broken-room", "not-json")
     sessionStorage.setItem("unrelated", "keep")
 
-    expect(cleanupStaleP2PSessionPeers(now)).toStrictEqual(2)
-    expect(readP2PSessionPeerId("active-room")).toStrictEqual(activePeerId)
-    expect(readP2PSessionPeerId("legacy-room")).toStrictEqual(legacyPeerId)
-    expect(sessionStorage.getItem("pastebin-worker:p2p-peer:legacy-room")).toContain('"version":1')
+    expect(cleanupStaleP2PSessionPeers(now)).toStrictEqual(3)
+    expect(readP2PSessionPeer("active-room")?.peerId).toStrictEqual(activePeerId)
+    expect(sessionStorage.getItem("pastebin-worker:p2p-peer:raw-room")).toBeNull()
     expect(sessionStorage.getItem("pastebin-worker:p2p-peer:stale-room")).toBeNull()
     expect(sessionStorage.getItem("pastebin-worker:p2p-peer:broken-room")).toBeNull()
     expect(sessionStorage.getItem("unrelated")).toStrictEqual("keep")

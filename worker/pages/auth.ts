@@ -1,17 +1,45 @@
-import { atob_utf8, btoa_utf8, WorkerError } from "../common.js"
-import argon2Module from "../../argon2/pkg/argon2_bg.wasm"
-import { initSync, verify_password_hash } from "../../argon2/pkg/argon2.js"
+import { atob_utf8, WorkerError } from "../common.js"
+import argon2Module from "../../codecs/argon2/dist/argon2_bg.wasm"
+import initArgon2, { verify_password_hash } from "../../codecs/argon2/dist/argon2.js"
 
-initSync({ module: argon2Module })
+const AUTH_CACHE_TTL_MS = 5 * 60_000
+const AUTH_CACHE_MAX_ENTRIES = 512
+const successfulAuthCache = new Map<string, number>()
+const encoder = new TextEncoder()
 
-export function verifyPasswordHash(password: string, encodedHash: string): boolean {
-  return verify_password_hash(password, encodedHash)
+async function authCacheKey(authorization: string, encodedHash: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(`${encodedHash}\0${authorization}`))
+  let key = ""
+  for (const byte of new Uint8Array(digest)) key += byte.toString(16).padStart(2, "0")
+  return key
 }
 
-// Encoding function
-export function encodeBasicAuth(username: string, password: string): string {
-  const credentials = `${username}:${password}`
-  return `Basic ${btoa_utf8(credentials)}`
+function hasCachedAuth(key: string, now: number): boolean {
+  const expiresAt = successfulAuthCache.get(key)
+  if (expiresAt === undefined) return false
+  if (expiresAt <= now) {
+    successfulAuthCache.delete(key)
+    return false
+  }
+  successfulAuthCache.delete(key)
+  successfulAuthCache.set(key, expiresAt)
+  return true
+}
+
+function cacheSuccessfulAuth(key: string, now: number): void {
+  for (const [entry, expiresAt] of successfulAuthCache) {
+    if (expiresAt <= now) successfulAuthCache.delete(entry)
+  }
+  if (successfulAuthCache.size >= AUTH_CACHE_MAX_ENTRIES) {
+    const oldest = successfulAuthCache.keys().next().value
+    if (oldest !== undefined) successfulAuthCache.delete(oldest)
+  }
+  successfulAuthCache.set(key, now + AUTH_CACHE_TTL_MS)
+}
+
+export async function verifyPasswordHash(password: string, encodedHash: string): Promise<boolean> {
+  await initArgon2(argon2Module)
+  return verify_password_hash(password, encodedHash)
 }
 
 // Decoding function
@@ -31,7 +59,7 @@ export function decodeBasicAuth(encodedString: string): {
 // return null if auth passes or is not required,
 // return auth page if auth is required
 // throw WorkerError if auth failed
-export function verifyAuth(request: Request, env: Env): Response | null {
+export async function verifyAuth(request: Request, env: Env): Promise<Response | null> {
   // pass auth if 'BASIC_AUTH' is not present
   const basic_auth = env.BASIC_AUTH as Record<string, string>
   const auth_entries = Object.entries(basic_auth)
@@ -41,14 +69,22 @@ export function verifyAuth(request: Request, env: Env): Response | null {
   // pass auth if 'BASIC_AUTH' is empty
   if (passwdMap.size === 0) return null
 
-  if (request.headers.has("Authorization")) {
-    const { username, password } = decodeBasicAuth(request.headers.get("Authorization")!)
+  const authorization = request.headers.get("Authorization")
+  if (authorization !== null) {
+    const { username, password } = decodeBasicAuth(authorization)
     const encodedHash = passwdMap.get(username)
-    if (encodedHash === undefined || !verifyPasswordHash(password, encodedHash)) {
+    if (encodedHash === undefined) {
       throw new WorkerError(401, "incorrect passwd for basic auth")
-    } else {
+    }
+    const cacheKey = await authCacheKey(authorization, encodedHash)
+    if (hasCachedAuth(cacheKey, Date.now())) {
       return null
     }
+    if (!(await verifyPasswordHash(password, encodedHash))) {
+      throw new WorkerError(401, "incorrect passwd for basic auth")
+    }
+    cacheSuccessfulAuth(cacheKey, Date.now())
+    return null
   } else {
     return new Response("HTTP basic auth is required", {
       status: 401,

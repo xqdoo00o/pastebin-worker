@@ -1,4 +1,11 @@
 worker-configuration.d.ts
 frontend/github.css
 pnpm-lock.yaml
-argon2/pkg*/
+frontend/optical/codec/
+frontend/optical/nanorq-codec/
+frontend/wasm/xxhash/
+frontend/wasm/zstd/
+codecs/.tools/
+codecs/*/build*/
+codecs/*/dist*/
+codecs/*/third_party/

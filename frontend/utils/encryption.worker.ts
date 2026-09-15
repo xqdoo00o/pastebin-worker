@@ -1,5 +1,6 @@
 import type { ChunkedEncryptionHeader } from "./encryptionCore.js"
 import { decryptChunk, encryptChunk } from "./encryptionCore.js"
+import { errorMessage } from "./errors.js"
 
 interface InitializeMessage {
   type: "initialize"
@@ -17,11 +18,13 @@ interface TransformMessage {
 type WorkerRequest = InitializeMessage | TransformMessage
 
 interface WorkerSuccess {
+  type: "result"
   id: number
   data: ArrayBuffer
 }
 
 interface WorkerFailure {
+  type: "result"
   id: number
   error: string
 }
@@ -34,6 +37,7 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   if (message.type === "initialize") {
     key = message.key
     header = message.header
+    self.postMessage({ type: "ready" })
     return
   }
 
@@ -44,12 +48,13 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
         message.type === "encrypt"
           ? await encryptChunk(key, header, message.index, message.data)
           : await decryptChunk(key, header, message.index, message.data)
-      const response: WorkerSuccess = { id: message.id, data }
+      const response: WorkerSuccess = { type: "result", id: message.id, data }
       self.postMessage(response, { transfer: [data] })
     } catch (error) {
       const response: WorkerFailure = {
+        type: "result",
         id: message.id,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage(error),
       }
       self.postMessage(response)
     }

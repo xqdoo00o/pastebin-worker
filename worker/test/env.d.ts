@@ -1,3 +1,5 @@
+/// <reference types="@cloudflare/vitest-pool-workers/types" />
+
 declare module "cloudflare:test" {
   // ProvidedEnv controls the type of `import("cloudflare:test").env`
   // eslint-disable-next-line @typescript-eslint/no-empty-object-type

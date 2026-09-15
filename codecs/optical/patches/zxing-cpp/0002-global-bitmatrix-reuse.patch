@@ -1,0 +1,100 @@
+diff --git a/core/src/BinaryBitmap.h b/core/src/BinaryBitmap.h
+index f92d629..98997df 100644
+--- a/core/src/BinaryBitmap.h
++++ b/core/src/BinaryBitmap.h
+@@ -41,6 +41,7 @@ protected:
+ 	virtual std::shared_ptr<const BitMatrix> getBlackMatrix() const = 0;
+ 
+ 	BitMatrix binarize(uint8_t threshold) const;
++	void binarize(uint8_t threshold, BitMatrix& result) const;
+ 
+ public:
+ 	BinaryBitmap(const ImageView& buffer);
+diff --git a/core/src/BinaryBitmap.cpp b/core/src/BinaryBitmap.cpp
+index 951bb1c..b1e103e 100644
+--- a/core/src/BinaryBitmap.cpp
++++ b/core/src/BinaryBitmap.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "BitMatrix.h"
+ 
++#include <cassert>
++
+ namespace ZXing {
+ 
+ struct BinaryBitmap::Cache
+@@ -17,31 +19,36 @@ struct BinaryBitmap::Cache
+ BitMatrix BinaryBitmap::binarize(const uint8_t threshold) const
+ {
+ 	BitMatrix res(width(), height());
+ 
++	binarize(threshold, res);
++	return res;
++}
++
++void BinaryBitmap::binarize(const uint8_t threshold, BitMatrix& res) const
++{
++	assert(res.width() == width() && res.height() == height());
+ 	if (_buffer.pixStride() == 1 && _buffer.rowStride() == _buffer.width()) {
+ 		// Specialize for a packed buffer with pixStride 1 to support auto vectorization (16x speedup on AVX2)
+ 		auto dst = res.row(0).begin();
+ 		for (auto src = _buffer.data(0, 0), end = _buffer.data(0, height()); src != end; ++src, ++dst)
+ 			*dst = (*src <= threshold) * BitMatrix::SET_V;
+ 	} else {
+ 		auto processLine = [&res, threshold](int y, const auto* src, const int stride) {
+ 			for (auto& dst : res.row(y)) {
+ 				dst = (*src <= threshold) * BitMatrix::SET_V;
+ 				src += stride;
+ 			}
+ 		};
+ 		for (int y = 0; y < res.height(); ++y) {
+ 			auto src = _buffer.data(0, y) + GreenIndex(_buffer.format());
+ 			// Specialize the inner loop for strides 1 and 4 to support auto vectorization
+ 			switch (_buffer.pixStride()) {
+ 			case 1: processLine(y, src, 1); break;
+ 			case 4: processLine(y, src, 4); break;
+ 			default: processLine(y, src, _buffer.pixStride()); break;
+ 			}
+ 		}
+ 	}
+-
+-	return res;
+ }
+ 
+ BinaryBitmap::BinaryBitmap(const ImageView& buffer) : _cache(new Cache), _buffer(buffer) {}
+diff --git a/core/src/GlobalHistogramBinarizer.cpp b/core/src/GlobalHistogramBinarizer.cpp
+index 7ec9721..ae0bb96 100644
+--- a/core/src/GlobalHistogramBinarizer.cpp
++++ b/core/src/GlobalHistogramBinarizer.cpp
+@@ -168,6 +168,18 @@ bool GlobalHistogramBinarizer::getPatternRow(int row, int rotation, PatternRow&
+ 	return true;
+ }
+ 
++static std::shared_ptr<BitMatrix> ReusableBitMatrix(int width, int height)
++{
++	static thread_local std::shared_ptr<BitMatrix> bits;
++
++	// BinaryBitmap holds the returned matrix for the lifetime of one read. Only
++	// reuse it after that owner is gone; a reentrant read receives fresh storage.
++	if (!bits || bits.use_count() != 1 || bits->width() != width || bits->height() != height)
++		bits = std::make_shared<BitMatrix>(width, height);
++
++	return bits;
++}
++
+ // Does not sharpen the data, as this call is intended to only be used by 2D Readers.
+ std::shared_ptr<const BitMatrix>
+ GlobalHistogramBinarizer::getBlackMatrix() const
+@@ -189,9 +201,9 @@ GlobalHistogramBinarizer::getBlackMatrix() const
+ 	if (blackPoint <= 0)
+ 		return {};
+ 
+-
+-
+-	return std::make_shared<const BitMatrix>(binarize(blackPoint));
++	auto bits = ReusableBitMatrix(width(), height());
++	binarize(blackPoint, *bits);
++	return bits;
+ }
+ 
+ } // ZXing

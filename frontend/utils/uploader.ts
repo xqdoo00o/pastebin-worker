@@ -1,14 +1,19 @@
-import type { PasteSetting } from "../components/PasteSettingPanel.js"
-import type { PasteEditState } from "../components/PasteInputPanel.js"
-import { ErrorWithTitle, verifyFileSize } from "./utils.js"
+import type { PasteEditState } from "../models/paste.js"
+import type { PasteSetting } from "./pasteSetting.js"
+import { verifyFileSize } from "./utils.js"
+import { ErrorWithTitle, isFileReadError } from "./errors.js"
+import { readFileSlice } from "./byteSource.js"
 import type { PasteResponse, PublicEnv } from "../../shared/interfaces.js"
 import { CHUNKED_ENCRYPTION_SCHEME, createChunkedEncryptionContext } from "./encryption.js"
 import { encryptedFileSize, encryptionChunkBounds, encryptionChunkCount } from "./encryptionCore.js"
 import type { UploadOptions } from "../../shared/uploadPaste.js"
 import { UploadError, uploadMPU, uploadMPUSource, uploadNormal } from "../../shared/uploadPaste.js"
 import { DIRECT_UPLOAD_MAX_BYTES } from "../../shared/constants.js"
+import { inferHighlightLanguage } from "../../shared/fileType.js"
 import { parseReadLimit } from "../../shared/verify.js"
 import { prepareContent } from "./content.js"
+
+const ENCRYPTED_MPU_CONCURRENCY = 4
 
 export interface UploadProgress {
   doneBytes: number
@@ -25,6 +30,8 @@ export async function uploadPaste(
 ): Promise<PasteResponse> {
   const prepared = await prepareContent(editorState, {
     errorTitle: "Error on Preparing Upload",
+    archiveCompression: pasteSetting.archiveCompression,
+    compressSingleFile: pasteSetting.compressSingleFile,
     signal,
   })
   const { content, originalFiles } = prepared
@@ -45,11 +52,10 @@ export async function uploadPaste(
       filenames: originalFiles,
       isUpdate: pasteSetting.uploadKind === "manage",
       isPrivate: pasteSetting.uploadKind === "long",
-      password: pasteSetting.password.length ? pasteSetting.password : undefined,
       expire: pasteSetting.expiration,
       remainingReads: readLimit,
-      name: pasteSetting.uploadKind === "custom" ? pasteSetting.name : undefined,
-      highlightLanguage: editorState.editKind === "edit" ? editorState.editHighlightLang : undefined,
+      highlightLanguage:
+        editorState.editKind === "edit" ? editorState.editHighlightLang : inferHighlightLanguage(content.name),
       encryptionScheme: pasteSetting.doEncrypt ? CHUNKED_ENCRYPTION_SCHEME : undefined,
       inferMimeType: editorState.editKind === "file",
       manageUrl: pasteSetting.manageUrl,
@@ -73,20 +79,18 @@ export async function uploadPaste(
       const context = await createChunkedEncryptionContext(content.size)
       onEncryptionKeyChange(context.encodedKey)
       const encryptionPartCount = encryptionChunkCount(content.size)
-      const encryptedChunk = async (index: number, abortSignal?: AbortSignal): Promise<Blob> => {
+      const encryptedPart = async (index: number, abortSignal?: AbortSignal): Promise<Blob> => {
         abortSignal?.throwIfAborted()
         const { start, end } = encryptionChunkBounds(content.size, index)
-        const plaintext = await content.slice(start, end).arrayBuffer()
-        abortSignal?.throwIfAborted()
+        const plaintext = (await readFileSlice(content, start, end, abortSignal)).buffer
         const ciphertext = await context.session.encrypt(index, plaintext)
         abortSignal?.throwIfAborted()
         return index === 0 ? new Blob([context.session.header.bytes, ciphertext]) : new Blob([ciphertext])
       }
-      let prefetchedEncryptionPart: { index: number; promise: Promise<Blob> } | undefined
 
       try {
         if (storedSize <= DIRECT_UPLOAD_MAX_BYTES) {
-          const encryptedContent = new File([await encryptedChunk(0, signal)], content.name)
+          const encryptedContent = new File([await encryptedPart(0, signal)], content.name)
           return await uploadNormal(
             config.DEPLOY_URL,
             { ...options, content: encryptedContent },
@@ -95,80 +99,26 @@ export async function uploadPaste(
           )
         }
 
-        // Encryption chunks are not valid R2 parts as-is: the first one also contains
-        // the container header, so it is 32 bytes larger than later full chunks. R2
-        // requires every non-final multipart part to have exactly the same size. Keep
-        // the encryption container unchanged, but reframe its byte stream into fixed
-        // 5 MiB upload parts.
-        const uploadPartCount = Math.ceil(storedSize / DIRECT_UPLOAD_MAX_BYTES)
-        let nextEncryptionPart = 0
-        let nextUploadPart = 0
-        let pending = new Blob()
-        const takeNextEncryptionPart = async (abortSignal: AbortSignal): Promise<Blob> => {
-          const index = nextEncryptionPart
-          nextEncryptionPart += 1
-          if (prefetchedEncryptionPart?.index === index) {
-            const prefetched = prefetchedEncryptionPart.promise
-            prefetchedEncryptionPart = undefined
-            return await prefetched
-          }
-          return await encryptedChunk(index, abortSignal)
-        }
-
-        const prefetchNextEncryptionPart = (abortSignal: AbortSignal) => {
-          if (prefetchedEncryptionPart || nextEncryptionPart >= encryptionPartCount) return
-          prefetchedEncryptionPart = {
-            index: nextEncryptionPart,
-            promise: encryptedChunk(nextEncryptionPart, abortSignal),
-          }
-        }
-
-        const getUploadPart = async (index: number, abortSignal: AbortSignal): Promise<Blob> => {
-          if (index !== nextUploadPart) {
-            throw new Error(`Encrypted MPU parts must be requested in order (expected ${nextUploadPart}, got ${index})`)
-          }
-          abortSignal.throwIfAborted()
-
-          const targetSize = Math.min(DIRECT_UPLOAD_MAX_BYTES, storedSize - index * DIRECT_UPLOAD_MAX_BYTES)
-          const pieces: Blob[] = []
-          let partSize = 0
-          while (partSize < targetSize) {
-            if (pending.size === 0) {
-              if (nextEncryptionPart >= encryptionPartCount) {
-                throw new Error("Encrypted upload source ended unexpectedly")
-              }
-              pending = await takeNextEncryptionPart(abortSignal)
-            }
-
-            const bytesToTake = Math.min(targetSize - partSize, pending.size)
-            pieces.push(pending.slice(0, bytesToTake))
-            pending = pending.slice(bytesToTake)
-            partSize += bytesToTake
-          }
-          nextUploadPart += 1
-          prefetchNextEncryptionPart(abortSignal)
-          return new Blob(pieces)
-        }
-
         return await uploadMPUSource(
           config.DEPLOY_URL,
           {
             name: content.name,
             size: storedSize,
-            partCount: uploadPartCount,
-            getPart: getUploadPart,
+            partCount: encryptionPartCount,
+            getPart: encryptedPart,
           },
           options,
           reportProgress,
-          1,
+          ENCRYPTED_MPU_CONCURRENCY,
           signal,
         )
       } finally {
-        const settlePrefetch = prefetchedEncryptionPart?.promise.catch(() => undefined)
         context.session.close()
-        await settlePrefetch
       }
     } catch (e) {
+      if (isFileReadError(e)) {
+        throw new ErrorWithTitle("Error on Preparing Upload", e.message)
+      }
       if (e instanceof UploadError) {
         throw new ErrorWithTitle("Error on Upload", e.message)
       }

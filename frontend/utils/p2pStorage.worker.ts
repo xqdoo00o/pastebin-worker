@@ -1,5 +1,7 @@
 /// <reference lib="webworker" />
 
+import { errorMessage } from "./errors.js"
+
 interface StorageRequest {
   id: number
   type: "open" | "write" | "flush" | "close" | "discard"
@@ -23,7 +25,7 @@ function respond(id: number, value?: unknown, transfer: Transferable[] = []): vo
 }
 
 function fail(id: number, error: unknown): void {
-  self.postMessage({ id, ok: false, error: error instanceof Error ? error.message : String(error) })
+  self.postMessage({ id, ok: false, error: errorMessage(error) })
 }
 
 async function open(request: StorageRequest): Promise<void> {

@@ -54,7 +54,7 @@ Options:
     -s, --passwd PASSWD     the password
     -p, --private           make the generated paste name longer for better privacy
     -x, --clip              clip the url to the clipboard
-    -E, --encrypt           client-side encrypt in authenticated 5 MiB AES-GCM chunks.
+    -E, --encrypt           client-side encrypt in authenticated, MPU-aligned AES-GCM chunks.
                             The key is recorded in the history file and the
                             decryption URL is printed as `decryptionUrl` in
                             the response (the server response itself never
@@ -68,7 +68,7 @@ Options:
     -e, --expire SECONDS    the expiration time of the paste (in seconds)
     -s, --passwd PASSWD     the password
     -x, --clip              clip the url to the clipboard
-    -E, --encrypt           re-encrypt in authenticated 5 MiB AES-GCM chunks
+    -E, --encrypt           re-encrypt in authenticated, MPU-aligned AES-GCM chunks
     -F, --filename NAME     override the filename stored with the paste
 
   get options:

@@ -1,20 +1,17 @@
 import {
-  archiveWorkerChunkSize,
   streamZipFiles,
+  type ArchiveCompression,
   type ArchiveWorkerRequest,
   type ArchiveWorkerResponse,
 } from "./archiveCore.js"
+import { initializeZstdEncoder } from "../wasm/zstd-runtime.js"
+import { transferableBuffer } from "../../shared/bytes.js"
+import { errorMessage } from "./errors.js"
 
 let started = false
 let nextChunkId = 1
 let pendingAck: { id: number; resolve: () => void } | undefined
-
-function transferableBuffer(chunk: Uint8Array): ArrayBuffer {
-  if (chunk.buffer instanceof ArrayBuffer && chunk.byteOffset === 0 && chunk.byteLength === chunk.buffer.byteLength) {
-    return chunk.buffer
-  }
-  return chunk.slice().buffer
-}
+let initialization: Promise<void> = Promise.resolve()
 
 function sendChunk(chunk: Uint8Array): Promise<void> {
   const id = nextChunkId++
@@ -31,15 +28,16 @@ function postError(error: unknown): void {
     type: "error",
     error: {
       name: error instanceof Error ? error.name : "Error",
-      message: error instanceof Error ? error.message : String(error),
+      message: errorMessage(error),
     },
   }
   self.postMessage(response)
 }
 
-async function buildArchive(files: File[]): Promise<void> {
+async function buildArchive(files: File[], compression: ArchiveCompression, useFflateWorker: boolean): Promise<void> {
   try {
-    await streamZipFiles(files, sendChunk, { chunkSize: archiveWorkerChunkSize })
+    await initialization
+    await streamZipFiles(files, sendChunk, { compression, useWebWorkers: useFflateWorker })
     const response: ArchiveWorkerResponse = { type: "complete" }
     self.postMessage(response)
   } catch (error) {
@@ -57,10 +55,18 @@ self.onmessage = (event: MessageEvent<ArchiveWorkerRequest>) => {
     return
   }
 
+  if (message.type === "init") {
+    initialization = message.zstdEncoderWasmModule
+      ? initializeZstdEncoder(message.zstdEncoderWasmModule)
+      : Promise.resolve()
+    void initialization.catch(() => undefined)
+    return
+  }
+
   if (started) {
     postError(new Error("Archive worker has already started"))
     return
   }
   started = true
-  void buildArchive(message.files)
+  void buildArchive(message.files, message.compression, message.useFflateWorker)
 }

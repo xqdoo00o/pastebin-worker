@@ -6,28 +6,36 @@ export interface SwitchProps extends Omit<React.InputHTMLAttributes<HTMLInputEle
   classNames?: {
     base?: string
     wrapper?: string
-    thumb?: string
   }
 }
 
-export function Switch({ isSelected, onValueChange, children, classNames = {}, className = "", ...rest }: SwitchProps) {
+export function Switch({
+  isSelected,
+  onValueChange,
+  children,
+  classNames = {},
+  className = "",
+  disabled,
+  ...rest
+}: SwitchProps) {
   const checked = isSelected ?? false
 
   return (
-    <label className={`inline-flex items-center gap-2 cursor-pointer ${classNames.base || className}`}>
-      <div className={`relative w-11 h-6 ${classNames.wrapper || ""}`}>
-        <input
-          type="checkbox"
-          checked={checked}
-          onChange={(e) => onValueChange?.(e.target.checked)}
-          className="sr-only peer"
-          {...rest}
-        />
-        <div className="w-11 h-6 bg-gray-200 dark:bg-gray-700 rounded-full peer peer-checked:bg-primary transition-colors" />
-        <div
-          className={`absolute left-0.5 top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform peer-checked:translate-x-5 ${classNames.thumb || ""}`}
-        />
-      </div>
+    <label
+      className={`inline-flex items-center gap-2 ${disabled ? "cursor-not-allowed" : "cursor-pointer"} ${className} ${classNames.base || ""}`}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onValueChange?.(e.target.checked)}
+        className="peer sr-only"
+        {...rest}
+      />
+      <span
+        aria-hidden="true"
+        className={`relative h-6 w-11 shrink-0 rounded-full bg-gray-200 transition-colors after:absolute after:top-0.5 after:left-0.5 after:size-5 after:rounded-full after:bg-white after:shadow after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:ring-2 peer-focus-visible:ring-default-400 dark:bg-gray-700 ${classNames.wrapper || ""}`}
+      />
       {children}
     </label>
   )

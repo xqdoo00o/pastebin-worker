@@ -11,21 +11,26 @@ import {
   type ChunkedEncryptionHeader,
 } from "./encryptionCore.js"
 import { CHUNKED_ENCRYPTION_SCHEME, type EncryptionScheme } from "../../shared/constants.js"
+import { base64UrlToBytes, bytesToBase64Url } from "../../shared/encoding.js"
+import { WorkerRequestMap } from "./workerRequests.js"
 
 export { CHUNKED_ENCRYPTION_SCHEME, type EncryptionScheme } from "../../shared/constants.js"
 
 const cryptoWorkerThreshold = 1024 * 1024
+const cryptoWorkerInitializationTimeoutMs = 5_000
+
+interface WorkerReady {
+  type: "ready"
+}
 
 interface WorkerResult {
+  type: "result"
   id: number
   data?: ArrayBuffer
   error?: string
 }
 
-interface PendingTransform {
-  resolve: (data: ArrayBuffer) => void
-  reject: (error: Error) => void
-}
+type WorkerResponse = WorkerReady | WorkerResult
 
 function asWorkerError(error: unknown, fallback: string): Error {
   if (error instanceof Error) return error
@@ -33,9 +38,10 @@ function asWorkerError(error: unknown, fallback: string): Error {
 }
 
 export class ChunkCryptoSession {
-  private readonly worker?: Worker
-  private readonly pending = new Map<number, PendingTransform>()
-  private nextId = 1
+  private worker?: Worker
+  private workerReady: Promise<boolean> = Promise.resolve(false)
+  private cancelWorkerInitialization?: () => void
+  private readonly requests = new WorkerRequestMap<ArrayBuffer>()
   private closed = false
   private terminalError?: Error
 
@@ -45,29 +51,49 @@ export class ChunkCryptoSession {
     useWorker = true,
   ) {
     if (useWorker && typeof window !== "undefined" && typeof Worker !== "undefined") {
-      const worker = new Worker(new URL("./encryption.worker.ts", import.meta.url), { type: "module" })
-      this.worker = worker
-      worker.onmessage = (event: MessageEvent<WorkerResult>) => {
-        const result = event.data
-        const pending = this.pending.get(result.id)
-        if (!pending) return
-        this.pending.delete(result.id)
-        if (result.data) pending.resolve(result.data)
-        else pending.reject(new Error(result.error || "Encryption worker failed"))
-      }
-      worker.onerror = (event) => {
-        event.preventDefault()
-        this.failWorker(new Error(event.message || "Encryption worker failed"))
-      }
-      worker.onmessageerror = () => {
-        this.failWorker(new Error("Encryption worker returned an invalid message"))
-      }
       try {
-        worker.postMessage({ type: "initialize", key, header })
-      } catch (error) {
-        const workerError = asWorkerError(error, "Encryption worker initialization failed")
-        this.failWorker(workerError)
-        throw workerError
+        const worker = new Worker(new URL("./encryption.worker.ts", import.meta.url), { type: "module" })
+        this.worker = worker
+        this.workerReady = new Promise((resolve) => {
+          let settled = false
+          const finish = (ready: boolean) => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            this.cancelWorkerInitialization = undefined
+            if (!ready) this.stopWorker(worker)
+            resolve(ready)
+          }
+          this.cancelWorkerInitialization = () => finish(false)
+          worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+            if (event.data?.type !== "ready") {
+              finish(false)
+              return
+            }
+            worker.onmessage = (event: MessageEvent<WorkerResponse>) => this.handleWorkerMessage(event.data)
+            worker.onerror = (event) => {
+              event.preventDefault()
+              this.failWorker(new Error(event.message || "Encryption worker failed"))
+            }
+            worker.onmessageerror = () => {
+              this.failWorker(new Error("Encryption worker returned an invalid message"))
+            }
+            finish(true)
+          }
+          worker.onerror = (event) => {
+            event.preventDefault()
+            finish(false)
+          }
+          worker.onmessageerror = () => finish(false)
+          const timer = setTimeout(() => finish(false), cryptoWorkerInitializationTimeoutMs)
+          try {
+            worker.postMessage({ type: "initialize", key, header })
+          } catch {
+            finish(false)
+          }
+        })
+      } catch {
+        this.stopWorker()
       }
     }
   }
@@ -84,25 +110,43 @@ export class ChunkCryptoSession {
     this.shutdown(new DOMException("Encryption session was closed", "AbortError"))
   }
 
-  private transform(type: "encrypt" | "decrypt", index: number, data: ArrayBuffer): Promise<ArrayBuffer> {
+  private async transform(type: "encrypt" | "decrypt", index: number, data: ArrayBuffer): Promise<ArrayBuffer> {
     if (this.closed) {
-      return Promise.reject(this.terminalError ?? new DOMException("Encryption session was closed", "AbortError"))
+      throw this.terminalError ?? new DOMException("Encryption session was closed", "AbortError")
     }
-    if (!this.worker) {
-      return type === "encrypt"
+    const workerReady = await this.workerReady
+    if (this.closed) {
+      throw this.terminalError ?? new DOMException("Encryption session was closed", "AbortError")
+    }
+    const worker = this.worker
+    if (!workerReady || !worker) {
+      return await (type === "encrypt"
         ? encryptChunk(this.key, this.header, index, data)
-        : decryptChunk(this.key, this.header, index, data)
+        : decryptChunk(this.key, this.header, index, data))
     }
 
-    const id = this.nextId++
-    return new Promise<ArrayBuffer>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-      try {
-        this.worker!.postMessage({ type, id, index, data }, [data])
-      } catch (error) {
-        this.failWorker(asWorkerError(error, "Encryption worker request failed"))
-      }
-    })
+    return this.requests.request(
+      (id) => worker.postMessage({ type, id, index, data }, [data]),
+      (error) => this.failWorker(asWorkerError(error, "Encryption worker request failed")),
+    )
+  }
+
+  private handleWorkerMessage(result: WorkerResponse): void {
+    if (result?.type !== "result") {
+      this.failWorker(new Error("Encryption worker returned an invalid message"))
+      return
+    }
+    if (result.data instanceof ArrayBuffer) this.requests.resolve(result.id, result.data)
+    else this.requests.reject(result.id, new Error(result.error || "Encryption worker failed"))
+  }
+
+  private stopWorker(worker = this.worker): void {
+    if (!worker) return
+    worker.onmessage = null
+    worker.onerror = null
+    worker.onmessageerror = null
+    worker.terminate()
+    if (this.worker === worker) this.worker = undefined
   }
 
   private failWorker(error: Error): void {
@@ -113,35 +157,11 @@ export class ChunkCryptoSession {
     if (this.closed) return
     this.closed = true
     this.terminalError = error
-    if (this.worker) {
-      this.worker.onmessage = null
-      this.worker.onerror = null
-      this.worker.onmessageerror = null
-      this.worker.terminate()
-    }
-    this.failPending(error)
+    this.cancelWorkerInitialization?.()
+    this.cancelWorkerInitialization = undefined
+    this.stopWorker()
+    this.requests.rejectAll(error)
   }
-
-  private failPending(error: Error): void {
-    for (const { reject } of this.pending.values()) reject(error)
-    this.pending.clear()
-  }
-}
-
-function base64VariantEncode(src: Uint8Array): string {
-  let binaryString = ""
-  for (const byte of src) binaryString += String.fromCharCode(byte)
-  return btoa(binaryString).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")
-}
-
-function base64VariantDecode(src: string): Uint8Array {
-  const normalized = src.replaceAll("-", "+").replaceAll("_", "/")
-  const binaryString = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="))
-  const uint8Array = new Uint8Array(binaryString.length)
-  for (let index = 0; index < binaryString.length; index += 1) {
-    uint8Array[index] = binaryString.charCodeAt(index)
-  }
-  return uint8Array
 }
 
 function verifyScheme(scheme: EncryptionScheme): void {
@@ -155,14 +175,14 @@ export async function genKey(scheme: EncryptionScheme): Promise<CryptoKey> {
 
 export async function encodeKey(key: CryptoKey): Promise<string> {
   const raw = new Uint8Array(await crypto.subtle.exportKey("raw", key))
-  return base64VariantEncode(raw)
+  return bytesToBase64Url(raw)
 }
 
 export async function decodeKey(scheme: EncryptionScheme, encoded: string): Promise<CryptoKey> {
   verifyScheme(scheme)
   let raw: Uint8Array
   try {
-    raw = base64VariantDecode(encoded)
+    raw = base64UrlToBytes(encoded)
   } catch {
     throw new Error("The AES-GCM key in the URL is not valid base64url")
   }

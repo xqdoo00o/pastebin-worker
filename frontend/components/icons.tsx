@@ -1,5 +1,25 @@
 import type { HTMLAttributes } from "react"
 
+const actionIconPaths = {
+  check: ["m9.55 18-5.7-5.7 1.425-1.425L9.55 15.15l9.175-9.175L20.15 7.4z"],
+  copy: [
+    "M20 2H10c-1 0-2 1-2 2v10c0 1 1 2 2 2h10c1 0 2-1 2-2V4c0-1-1-2-2-2zm0 12H10V4h10v10z",
+    "M14 20H4V10h2V8H4c-1 0-2 1-2 2v10c0 1 1 2 2 2h10c1 0 2-1 2-2v-2h-2v2z",
+  ],
+  download: [
+    "M20 16a1 1 0 0 1 1 1v2a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3v-2a1 1 0 0 1 2 0v2a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2a1 1 0 0 1 1-1M12 3a1 1 0 0 1 1 1v9.585l3.293-3.292a1 1 0 0 1 1.414 1.414l-5 5a1 1 0 0 1-.09.08l.09-.08a1 1 0 0 1-.674.292L12 17h-.032l-.054-.004L12 17a1 1 0 0 1-.617-.213a1 1 0 0 1-.09-.08l-5-5a1 1 0 0 1 1.414-1.414L11 13.585V4a1 1 0 0 1 1-1",
+  ],
+  preview: [
+    "M12 5c5.5 0 9.5 5.1 9.7 5.3a1 1 0 0 1 0 1.4C21.5 11.9 17.5 17 12 17S2.5 11.9 2.3 11.7a1 1 0 0 1 0-1.4C2.5 10.1 6.5 5 12 5m0 2c-3.5 0-6.4 2.8-7.6 4 1.2 1.2 4.1 4 7.6 4s6.4-2.8 7.6-4C18.4 9.8 15.5 7 12 7m0 1.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5",
+  ],
+  refresh: [
+    "M12 20q-3.35 0-5.675-2.325T4 12t2.325-5.675T12 4q1.725 0 3.3.712T18 6.75V4h2v7h-7V9h4.2q-.8-1.4-2.187-2.2T12 6Q9.5 6 7.75 7.75T6 12t1.75 4.25T12 18q1.925 0 3.475-1.1T17.65 14h2.1q-.7 2.65-2.85 4.325T12 20",
+  ],
+  share: [
+    "m9 13.5l6 3m0-9l-6 3M18 21a3 3 0 1 1 0-6a3 3 0 0 1 0 6M6 15a3 3 0 1 1 0-6a3 3 0 0 1 0 6m12-6a3 3 0 1 1 0-6a3 3 0 0 1 0 6",
+  ],
+} as const
+
 export const MoonIcon = (props: HTMLAttributes<SVGElement>) => (
   <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" className="size-6 inline" {...props}>
     <path d="M20.742 13.045a8.088 8.088 0 0 1-2.077.271c-2.135 0-4.14-.83-5.646-2.336a8.025 8.025 0 0 1-2.064-7.723A1 1 0 0 0 9.73 2.034a10.014 10.014 0 0 0-4.489 2.582c-3.898 3.898-3.898 10.243 0 14.143a9.937 9.937 0 0 0 7.072 2.93 9.93 9.93 0 0 0 7.07-2.929 10.007 10.007 0 0 0 2.583-4.491 1.001 1.001 0 0 0-1.224-1.224zm-2.772 4.301a7.947 7.947 0 0 1-5.656 2.343 7.953 7.953 0 0 1-5.658-2.344c-3.118-3.119-3.118-8.195 0-11.314a7.923 7.923 0 0 1 2.06-1.483 10.027 10.027 0 0 0 2.89 7.848 9.972 9.972 0 0 0 7.848 2.891 8.036 8.036 0 0 1-1.484 2.059z" />
@@ -31,32 +51,48 @@ export const AutoThemeIcon = (props: HTMLAttributes<SVGElement>) => (
 )
 
 export const XIcon = (props: HTMLAttributes<SVGElement>) => (
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    fill="none"
-    viewBox="0 0 24 24"
-    strokeWidth={1.5}
-    stroke="currentColor"
-    {...props}
-  >
-    <path
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      d="m9.75 9.75 4.5 4.5m0-4.5-4.5 4.5M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
-    />
+  <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" {...props}>
+    <path d="M0 0h24v24H0z" fill="none" />
+    <path d="M19 6.41L17.59 5L12 10.59L6.41 5L5 6.41L10.59 12L5 17.59L6.41 19L12 13.41L17.59 19L19 17.59L13.41 12z" />
+  </svg>
+)
+
+export const PlusIcon = (props: HTMLAttributes<SVGElement>) => (
+  <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" {...props}>
+    <path d="M0 0h24v24H0z" fill="none" />
+    <path d="M19 12.998h-6v6h-2v-6H5v-2h6v-6h2v6h6z" />
   </svg>
 )
 
 export const DownloadIcon = (props: HTMLAttributes<SVGElement>) => (
   <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" {...props}>
-    <path d="M20 16a1 1 0 0 1 1 1v2a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3v-2a1 1 0 0 1 2 0v2a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2a1 1 0 0 1 1-1M12 3a1 1 0 0 1 1 1v9.585l3.293-3.292a1 1 0 0 1 1.414 1.414l-5 5a1 1 0 0 1-.09.08l.09-.08a1 1 0 0 1-.674.292L12 17h-.032l-.054-.004L12 17a1 1 0 0 1-.617-.213a1 1 0 0 1-.09-.08l-5-5a1 1 0 0 1 1.414-1.414L11 13.585V4a1 1 0 0 1 1-1" />
+    {actionIconPaths.download.map((path) => (
+      <path key={path} d={path} />
+    ))}
   </svg>
 )
 
 export const CopyIcon = (props: HTMLAttributes<SVGElement>) => (
   <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" {...props}>
-    <path d="M20 2H10c-1 0-2 1-2 2v10c0 1 1 2 2 2h10c1 0 2-1 2-2V4c0-1-1-2-2-2zm0 12H10V4h10v10z" />
-    <path d="M14 20H4V10h2V8H4c-1 0-2 1-2 2v10c0 1 1 2 2 2h10c1 0 2-1 2-2v-2h-2v2z" />
+    {actionIconPaths.copy.map((path) => (
+      <path key={path} d={path} />
+    ))}
+  </svg>
+)
+
+export const RefreshIcon = (props: HTMLAttributes<SVGElement>) => (
+  <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" {...props}>
+    {actionIconPaths.refresh.map((path) => (
+      <path key={path} d={path} />
+    ))}
+  </svg>
+)
+
+export const ShareIcon = (props: HTMLAttributes<SVGElement>) => (
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" viewBox="0 0 24 24" {...props}>
+    {actionIconPaths.share.map((path) => (
+      <path key={path} stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d={path} />
+    ))}
   </svg>
 )
 
@@ -107,7 +143,9 @@ export const ExternalLinkIcon = (props: HTMLAttributes<SVGElement>) => (
 
 export const CheckIcon = (props: HTMLAttributes<SVGElement>) => (
   <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" {...props}>
-    <path d="m9.55 18l-5.7-5.7l1.425-1.425L9.55 15.15l9.175-9.175L20.15 7.4z" />
+    {actionIconPaths.check.map((path) => (
+      <path key={path} d={path} />
+    ))}
   </svg>
 )
 
@@ -144,38 +182,6 @@ export const ChevronDownIcon = (props: HTMLAttributes<SVGElement>) => (
     {...props}
   >
     <path strokeLinecap="round" strokeLinejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" />
-  </svg>
-)
-
-export const QuestionMarkCircleIcon = (props: HTMLAttributes<SVGElement>) => (
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    fill="none"
-    viewBox="2.25 2.25 19.5 19.5"
-    strokeWidth={1.5}
-    stroke="currentColor"
-    {...props}
-  >
-    <path
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 5.25h.008v.008H12v-.008Z"
-    />
-  </svg>
-)
-
-export const SpinnerIcon = ({ className = "", ...props }: HTMLAttributes<SVGElement>) => (
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    fill="none"
-    viewBox="0 0 24 24"
-    strokeWidth={2}
-    stroke="currentColor"
-    className={`animate-spin ${className}`}
-    {...props}
-  >
-    <circle cx="12" cy="12" r="9" opacity="0.25" />
-    <path strokeLinecap="round" d="M21 12a9 9 0 0 0-9-9" />
   </svg>
 )
 

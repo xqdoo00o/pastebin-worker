@@ -87,7 +87,7 @@ export function QrCodeTooltip({
       variant="light"
       aria-label={tooltip ?? "Show QR code"}
       aria-expanded={open}
-      className={`cursor-pointer text-default-600 focus:ring-0 ${className || "hover:bg-default-200"}`}
+      className={`cursor-pointer text-default-600 ${className || "hover:bg-default-200"}`}
       onPress={() => setOpen((current) => !current)}
     >
       <QrCodeIcon className="size-6" />

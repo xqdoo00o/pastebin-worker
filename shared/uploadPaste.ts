@@ -1,5 +1,3 @@
-// we will move this file to a shared directory later
-
 import type { MPUCreateResponse, OriginalFileInfo, PasteResponse } from "./interfaces.js"
 import type { EncryptionScheme } from "./constants.js"
 import { BINARY_MIME_TYPE, TEXT_MIME_TYPE } from "./constants.js"
@@ -25,7 +23,6 @@ export interface UploadOptions {
   isPrivate?: boolean
 
   password?: string
-  name?: string
 
   highlightLanguage?: string
   encryptionScheme?: EncryptionScheme
@@ -157,49 +154,29 @@ async function appendUploadMetadata(fd: FormData, options: UploadMetadataOptions
   if (options.highlightLanguage !== undefined) fd.set("lang", options.highlightLanguage)
 }
 
+function requireManageUrl(manageUrl: string | undefined, operation: string): string {
+  if (manageUrl === undefined) throw new TypeError(`${operation}: no manageUrl specified in update`)
+  return manageUrl
+}
+
 // note that apiUrl should be manageUrl when isUpload
 export async function uploadNormal(
   apiUrl: string,
-  {
-    content,
-    filenames,
-    isUpdate,
-    isPrivate,
-    password,
-    name,
-    highlightLanguage,
-    encryptionScheme,
-    inferMimeType,
-    expire,
-    remainingReads,
-    manageUrl,
-  }: UploadOptions,
+  options: UploadOptions,
   progressCallback?: (doneBytes: number, allBytes: number) => void,
   signal?: AbortSignal,
 ): Promise<PasteResponse> {
+  const { content, isUpdate, isPrivate, manageUrl } = options
   const fd = new FormData()
 
   // typescript cannot handle overload on union types
   fd.set("c", content)
-  await appendUploadMetadata(fd, {
-    content,
-    filenames,
-    password,
-    highlightLanguage,
-    encryptionScheme,
-    inferMimeType,
-    expire,
-    remainingReads,
-  })
+  await appendUploadMetadata(fd, options)
 
-  if (isUpdate && manageUrl === undefined) {
-    throw TypeError("uploadMPU: no manageUrl specified in update")
-  }
-
-  if (!isUpdate && name !== undefined) fd.set("n", name)
   if (isPrivate) fd.set("p", "1")
 
-  const resp = await xhrSend(isUpdate ? manageUrl! : apiUrl, {
+  const targetUrl = isUpdate ? requireManageUrl(manageUrl, "uploadNormal") : apiUrl
+  const resp = await xhrSend(targetUrl, {
     method: isUpdate ? "PUT" : "POST",
     body: fd,
     onUploadProgress: progressCallback
@@ -270,24 +247,12 @@ async function abortMultipartUpload(apiUrl: string, createResp: MPUCreateRespons
 export async function uploadMPUSource(
   apiUrl: string,
   source: MPUUploadSource,
-  {
-    content,
-    filenames,
-    isUpdate,
-    isPrivate,
-    password,
-    name,
-    highlightLanguage,
-    encryptionScheme,
-    inferMimeType,
-    expire,
-    remainingReads,
-    manageUrl,
-  }: UploadOptions,
+  options: UploadOptions,
   progressCallback?: (doneBytes: number, allBytes: number) => void,
   concurrency: number = DEFAULT_MPU_CONCURRENCY,
   signal?: AbortSignal,
 ): Promise<PasteResponse> {
+  const { isUpdate, isPrivate, expire, manageUrl } = options
   // Internal controller: cancels all in-flight subrequests when one chunk fails or external signal aborts.
   const ctrl = new AbortController()
   const onExternalAbort = () => ctrl.abort()
@@ -312,17 +277,13 @@ export async function uploadMPUSource(
   async function doMPU(): Promise<PasteResponse> {
     const createReqUrl = isUpdate ? new URL(`${apiUrl}/mpu/create-update`) : new URL(`${apiUrl}/mpu/create`)
     if (!isUpdate) {
-      if (name !== undefined) {
-        createReqUrl.searchParams.set("n", name)
-      }
       if (isPrivate) {
         createReqUrl.searchParams.set("p", "1")
       }
     } else {
-      if (manageUrl === undefined) {
-        throw TypeError("uploadMPU: no manageUrl specified in update")
-      }
-      const { name: nameFromUrl, password: passwordFromUrl } = parsePath(new URL(manageUrl).pathname)
+      const { name: nameFromUrl, password: passwordFromUrl } = parsePath(
+        new URL(requireManageUrl(manageUrl, "uploadMPU")).pathname,
+      )
       if (passwordFromUrl === undefined) {
         throw TypeError("uploadMPU: password not specified in manageUrl")
       }
@@ -397,16 +358,7 @@ export async function uploadMPUSource(
     completeUrl.searchParams.set("key", createKey)
     completeUrl.searchParams.set("uploadId", createUploadId)
     completeFormData.set("c", new File([JSON.stringify(uploadedParts)], source.name))
-    await appendUploadMetadata(completeFormData, {
-      content,
-      filenames,
-      password,
-      highlightLanguage,
-      encryptionScheme,
-      inferMimeType,
-      expire,
-      remainingReads,
-    })
+    await appendUploadMetadata(completeFormData, options)
     const completeReqResp = await fetch(completeUrl, {
       method: isUpdate ? "PUT" : "POST",
       body: completeFormData,

@@ -1,5 +1,11 @@
 import React, { useState, useRef, useEffect } from "react"
-import { XIcon } from "../icons.js"
+import {
+  FieldLabel,
+  fieldControlSizeClass,
+  InputClearButton,
+  ListboxPopover,
+  type FieldSize,
+} from "./FieldPrimitives.js"
 
 export interface AutocompleteItemProps {
   value: string
@@ -12,7 +18,7 @@ export function AutocompleteItem({ children }: AutocompleteItemProps) {
 
 export interface AutocompleteProps {
   label?: string
-  size?: "sm" | "md" | "lg"
+  size?: FieldSize
   inputValue?: string
   selectedKey?: string | null
   defaultItems?: { key: string }[]
@@ -32,7 +38,7 @@ export interface AutocompleteProps {
 
 export function Autocomplete({
   label,
-  size: _size = "md",
+  size = "md",
   inputValue = "",
   selectedKey,
   defaultItems = [],
@@ -106,9 +112,9 @@ export function Autocomplete({
 
   return (
     <div ref={ref} className={`relative ${classNames.base || ""} ${className || ""}`}>
-      {label && <label className="pl-1 text-sm text-default-500 block mb-1.5">{label}</label>}
+      {label && <FieldLabel className="mb-1.5 block">{label}</FieldLabel>}
       <div
-        className={`flex items-center w-full bg-default-100 rounded-xl border transition-colors ${isOpen ? "border-default-400" : "border-default-200 hover:border-default-400"}`}
+        className={`flex items-center rounded-xl border bg-default-100 transition-colors ${isOpen ? "border-default-400" : "border-default-200 hover:border-default-400"}`}
       >
         <input
           ref={inputRef}
@@ -138,12 +144,10 @@ export function Autocomplete({
               setFocusedKey(null)
             }
           }}
-          className={`flex-1 min-w-0 px-3 py-2 bg-transparent text-sm text-foreground focus:outline-none ${classNames.input || ""}`}
+          className={`flex-1 min-w-0 px-3 bg-transparent text-foreground focus:outline-none ${fieldControlSizeClass[size]} ${classNames.input || ""}`}
         />
         {isClearable && internalValue !== "" && (
-          <button
-            type="button"
-            tabIndex={-1}
+          <InputClearButton
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => {
               setInternalValue("")
@@ -151,42 +155,35 @@ export function Autocomplete({
               onSelectionChange?.(null)
               inputRef.current?.focus()
             }}
-            className="flex-shrink-0 px-2 text-default-400 hover:text-default-700 color-tst focus:outline-none"
-            aria-label="Clear input"
-          >
-            <XIcon className="w-4 h-4" />
-          </button>
+            className="px-2"
+          />
         )}
       </div>
       {isOpen && filtered.length > 0 && (
-        <div
-          className={`absolute z-10 w-full mt-1 bg-content1 border border-default-200 rounded-lg overflow-hidden shadow-medium ${classNames.listbox || ""}`}
-        >
-          <div ref={listRef} tabIndex={-1} className="overflow-auto max-h-60">
-            {filtered.map((item) => {
-              const element = children(item)
-              return (
-                <button
-                  key={item.key}
-                  data-key={item.key}
-                  type="button"
-                  tabIndex={-1}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => {
-                    onSelectionChange?.(item.key)
-                    setInternalValue(item.key)
-                    onInputChange?.(item.key)
-                    setIsOpen(false)
-                    setFocusedKey(null)
-                  }}
-                  className={`w-full px-3 py-2 text-left text-sm transition-colors ${item.key === focusedKey ? "bg-default-100" : "hover:bg-default-100"}`}
-                >
-                  {element.props.children as React.ReactNode}
-                </button>
-              )
-            })}
-          </div>
-        </div>
+        <ListboxPopover ref={listRef} className={`w-full ${classNames.listbox || ""}`}>
+          {filtered.map((item) => {
+            const element = children(item)
+            return (
+              <button
+                key={item.key}
+                data-key={item.key}
+                type="button"
+                tabIndex={-1}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  onSelectionChange?.(item.key)
+                  setInternalValue(item.key)
+                  onInputChange?.(item.key)
+                  setIsOpen(false)
+                  setFocusedKey(null)
+                }}
+                className={`w-full px-3 text-left transition-colors ${fieldControlSizeClass[size]} ${item.key === focusedKey ? "bg-default-100" : "hover:bg-default-100"}`}
+              >
+                {element.props.children as React.ReactNode}
+              </button>
+            )
+          })}
+        </ListboxPopover>
       )}
     </div>
   )

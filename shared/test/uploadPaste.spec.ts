@@ -109,7 +109,6 @@ describe("uploadNormal", () => {
       isUpdate: false,
       isPrivate: true,
       password: "pw",
-      name: "abcd",
       highlightLanguage: "ts",
       encryptionScheme: "AES-GCM-CHUNKED",
       expire: "10m",
@@ -124,7 +123,6 @@ describe("uploadNormal", () => {
     const fd = calls[0].body as FormData
     expect(fd.get("e")).toStrictEqual("10m")
     expect(fd.get("s")).toStrictEqual("pw")
-    expect(fd.get("n")).toStrictEqual("abcd")
     expect(fd.get("encryption-scheme")).toStrictEqual("AES-GCM-CHUNKED")
     expect(fd.get("lang")).toStrictEqual("ts")
     expect(fd.get("reads")).toStrictEqual("3")
@@ -149,14 +147,13 @@ describe("uploadNormal", () => {
     expect((calls[0].body as FormData).get("mimeType")).toStrictEqual(BINARY_MIME_TYPE)
   })
 
-  it("checks the configured binary sniff prefix when inferring mimeType", async () => {
-    expect(BINARY_SNIFF_BYTES).toStrictEqual(1024)
+  it("ignores binary markers beyond the configured sniff prefix", async () => {
     const calls = setupXhr(() => ({
       status: 200,
       body: JSON.stringify({ url: "https://example.com/abcd", manageUrl: "https://example.com/abcd:pw" }),
     }))
     const content = new Uint8Array(BINARY_SNIFF_BYTES + 1).fill(1)
-    content[BINARY_SNIFF_BYTES - 1] = 0
+    content[BINARY_SNIFF_BYTES] = 0
 
     await uploadNormal(API_URL, {
       content: new File([content], "blob"),
@@ -164,7 +161,7 @@ describe("uploadNormal", () => {
       isUpdate: false,
     })
 
-    expect((calls[0].body as FormData).get("mimeType")).toStrictEqual(BINARY_MIME_TYPE)
+    expect((calls[0].body as FormData).get("mimeType")).toStrictEqual(TEXT_MIME_TYPE)
   })
 
   it("adds text mimeType for extensionless normal text uploads", async () => {
@@ -197,14 +194,13 @@ describe("uploadNormal", () => {
     expect((calls[0].body as FormData).get("mimeType")).toBeNull()
   })
 
-  it("PUTs to manageUrl on update and skips name field", async () => {
+  it("PUTs to manageUrl on update", async () => {
     const calls = setupXhr(() => ({ status: 200, body: JSON.stringify({ url: "u", manageUrl: "m" }) }))
 
     await uploadNormal(API_URL, {
       content: makeFile(8),
       isUpdate: true,
       manageUrl: "https://example.com/abcd:pw",
-      name: "abcd",
     })
 
     expect(calls[0].url).toStrictEqual("https://example.com/abcd:pw")
@@ -279,7 +275,6 @@ describe("uploadMPU", () => {
       {
         content: makeFile(10, "file.bin"),
         isUpdate: false,
-        name: "abcd",
         isPrivate: true,
         password: "pw",
         highlightLanguage: "rust",
@@ -299,7 +294,6 @@ describe("uploadMPU", () => {
     const create = fetchCalls[0]
     expect(create.method).toStrictEqual("POST")
     expect(create.url).toContain("/mpu/create")
-    expect(create.url).toContain("n=abcd")
     expect(create.url).toContain("p=1")
     expect(create.url).toContain("e=1d")
 

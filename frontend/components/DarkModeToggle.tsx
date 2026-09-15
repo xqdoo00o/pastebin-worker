@@ -4,7 +4,6 @@ import type { ButtonProps } from "./ui/index.js"
 import { Button, Tooltip } from "./ui/index.js"
 
 import { AutoThemeIcon, MoonIcon, SunIcon } from "./icons.js"
-import { tst } from "../utils/overrides.js"
 
 const modeSelections = ["system", "light", "dark"]
 type ModeSelection = (typeof modeSelections)[number]
@@ -82,7 +81,7 @@ export function DarkModeToggle({ modeSelection, setModeSelection, className = ""
         isIconOnly
         size="sm"
         variant="light"
-        className={`cursor-pointer text-default-600 ${tst} ${className}`}
+        className={`cursor-pointer text-default-600 ${className}`}
         aria-label="Theme"
         style={{ visibility: "hidden" }}
         {...rest}
@@ -98,7 +97,7 @@ export function DarkModeToggle({ modeSelection, setModeSelection, className = ""
         isIconOnly
         size="sm"
         variant="light"
-        className={`cursor-pointer text-default-600 ${tst} ${className}`}
+        className={`cursor-pointer text-default-600 transition-colors ${className}`}
         aria-label="Theme"
         onPress={() => {
           const newSelected = modeSelections[(modeSelections.indexOf(currentMode) + 1) % modeSelections.length]

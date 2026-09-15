@@ -4,14 +4,33 @@ import {
   type DataMessage,
   type P2PVerificationManifest,
 } from "./protocol.js"
+import { createStreamingXXH3, xxh3, xxh3Chunks, type StreamingXXH3 } from "../../wasm/xxhash-runtime.js"
+import { fileByteSource, readByteSourceChunks } from "../byteSource.js"
 
 export const maxVerificationRepairAttempts = 3
 
 export interface BlockHashState {
-  index: number
   size: number
-  buffer: Uint8Array<ArrayBuffer>
   hashes: string[]
+  hasher?: StreamingXXH3
+}
+
+export function createBlockHashState(hashes: string[] = []): BlockHashState {
+  return { size: 0, hashes }
+}
+
+function digestCurrentBlock(state: BlockHashState, reuse: boolean): string {
+  const hasher = state.hasher
+  if (!hasher) throw new Error("P2P verification hash state is incomplete.")
+  try {
+    return hashToHex(hasher.digest())
+  } finally {
+    if (reuse) hasher.reset()
+    else {
+      hasher.free()
+      state.hasher = undefined
+    }
+  }
 }
 
 export function* verificationHashChunks(
@@ -46,9 +65,9 @@ export function* verificationManifestMessages(
   maxMessageLength: number,
 ): Generator<DataMessage> {
   const limit = Math.min(maxP2PControlMessageLength, Math.floor(maxMessageLength))
-  const legacyMessage: DataMessage = { type: "done", verification: manifest }
-  if (JSON.stringify(legacyMessage).length <= limit) {
-    yield legacyMessage
+  const inlineMessage: DataMessage = { type: "done", verification: manifest }
+  if (JSON.stringify(inlineMessage).length <= limit) {
+    yield inlineMessage
     return
   }
 
@@ -65,20 +84,27 @@ export function* verificationManifestMessages(
   yield { type: "done" }
 }
 
-function digestToHex(buffer: ArrayBuffer): string {
-  return Array.from(new Uint8Array(buffer), (byte) => byte.toString(16).padStart(2, "0")).join("")
+function hashToHex(hash: bigint): string {
+  return hash.toString(16).padStart(16, "0")
 }
 
-export async function sha1Hex(parts: ArrayBuffer[]): Promise<string> {
-  if (parts.length === 1) return digestToHex(await crypto.subtle.digest("SHA-1", parts[0]))
-  const size = parts.reduce((sum, part) => sum + part.byteLength, 0)
-  const bytes = new Uint8Array(size)
-  let offset = 0
-  for (const part of parts) {
-    bytes.set(new Uint8Array(part), offset)
-    offset += part.byteLength
+/** Hash one verification block with official XXH3-64. Multiple received data
+ * channel parts are fed through the streaming API without concatenation. */
+export async function xxh3Hex(parts: readonly ArrayBuffer[]): Promise<string> {
+  if (parts.length === 1) return hashToHex(await xxh3(new Uint8Array(parts[0])))
+  return hashToHex(await xxh3Chunks(parts.map((part) => new Uint8Array(part))))
+}
+
+export async function hashFileVerificationBlocks(file: File, signal?: AbortSignal): Promise<string[]> {
+  const state = createBlockHashState()
+  try {
+    for await (const chunk of readByteSourceChunks(fileByteSource(file), verificationBlockSize, signal)) {
+      await appendHashData(state, chunk)
+    }
+    return finishHashData(state)
+  } finally {
+    disposeHashData(state)
   }
-  return digestToHex(await crypto.subtle.digest("SHA-1", bytes))
 }
 
 export function sliceArrayBuffer(buffer: ArrayBuffer, start: number, end: number): ArrayBuffer {
@@ -89,30 +115,38 @@ export async function appendHashData(
   state: BlockHashState,
   chunk: ArrayBuffer | Uint8Array<ArrayBuffer>,
 ): Promise<void> {
-  if (state.buffer.byteLength !== verificationBlockSize) state.buffer = new Uint8Array(verificationBlockSize)
   const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)
   let chunkOffset = 0
   while (chunkOffset < bytes.byteLength) {
+    state.hasher ??= await createStreamingXXH3()
     const takeBytes = Math.min(verificationBlockSize - state.size, bytes.byteLength - chunkOffset)
-    state.buffer.set(bytes.subarray(chunkOffset, chunkOffset + takeBytes), state.size)
+    state.hasher.update(bytes.subarray(chunkOffset, chunkOffset + takeBytes))
     state.size += takeBytes
     chunkOffset += takeBytes
     if (state.size === verificationBlockSize) {
-      state.hashes[state.index] = digestToHex(await crypto.subtle.digest("SHA-1", state.buffer))
-      state.index += 1
+      state.hashes.push(digestCurrentBlock(state, true))
       state.size = 0
     }
   }
 }
 
-export async function finishHashData(state: BlockHashState): Promise<string[]> {
+export function finishHashData(state: BlockHashState): string[] {
   if (state.size > 0) {
-    state.hashes[state.index] = digestToHex(await crypto.subtle.digest("SHA-1", state.buffer.subarray(0, state.size)))
-    state.index += 1
+    state.hashes.push(digestCurrentBlock(state, false))
+    state.size = 0
+  } else {
+    state.hasher?.free()
+    state.hasher = undefined
+  }
+  return state.hashes
+}
+
+export function disposeHashData(state: BlockHashState | undefined): void {
+  state?.hasher?.free()
+  if (state) {
+    state.hasher = undefined
     state.size = 0
   }
-  state.buffer = new Uint8Array(0)
-  return state.hashes
 }
 
 export function verificationHashIndices(manifest: P2PVerificationManifest, indices?: Iterable<number>): number[] {

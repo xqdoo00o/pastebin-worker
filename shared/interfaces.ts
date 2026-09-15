@@ -27,23 +27,35 @@ export interface PasteResponse extends MetaResponse {
   expirationSeconds: number
 }
 
-export type PublicEnv = Pick<
-  Env,
-  | "DEPLOY_URL"
-  | "REPO"
-  | "MAX_EXPIRATION"
-  | "DEFAULT_READS"
-  | "DEFAULT_EXPIRATION"
-  | "DEFAULT_TAB"
-  | "DEFAULT_P2P_EXPIRATION"
-  | "MAX_P2P_EXPIRATION"
-  | "DEFAULT_P2P_TRANSFERS"
-  | "DEFAULT_P2P_VERIFY"
-  | "DEFAULT_P2P_TRANSFER"
-  | "INDEX_PAGE_TITLE"
-  | "R2_MAX_ALLOWED"
-  | "DISALLOWED_MIME_FOR_PASTE"
->
+const PUBLIC_ENV_KEYS = [
+  "DEPLOY_URL",
+  "REPO",
+  "MAX_EXPIRATION",
+  "DEFAULT_READS",
+  "DEFAULT_EXPIRATION",
+  "DEFAULT_TAB",
+  "DEFAULT_ARCHIVE_COMPRESSION",
+  "DEFAULT_P2P_EXPIRATION",
+  "MAX_P2P_EXPIRATION",
+  "DEFAULT_P2P_TRANSFERS",
+  "DEFAULT_P2P_VERIFY",
+  "DEFAULT_TRANSFER_METHOD",
+  "DEFAULT_LINK_TYPE",
+  "DEFAULT_E2E_ENCRYPTION",
+  "DEFAULT_QR_TX_FPS",
+  "DEFAULT_QR_FRAME_BYTES",
+  "DEFAULT_QR_ECC",
+  "DEFAULT_QR_LAYOUT",
+  "INDEX_PAGE_TITLE",
+  "R2_MAX_ALLOWED",
+  "DISALLOWED_MIME_FOR_PASTE",
+] as const satisfies readonly (keyof Env)[]
+
+export type PublicEnv = Pick<Env, (typeof PUBLIC_ENV_KEYS)[number]>
+
+export function pickPublicEnv(env: Env): PublicEnv {
+  return Object.fromEntries(PUBLIC_ENV_KEYS.map((key) => [key, env[key]])) as PublicEnv
+}
 
 export interface P2PCreateResponse {
   name: string
@@ -78,6 +90,7 @@ export interface MPUCreateResponse {
 
 export interface SerializedPasteData {
   content: string
+  contentType?: string
   metadata: MetaResponse
   name: string
   isBinary: boolean

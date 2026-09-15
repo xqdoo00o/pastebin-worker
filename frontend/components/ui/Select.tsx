@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useImperativeHandle } from "react"
+import { FieldLabel, fieldControlSizeClass, ListboxPopover, type FieldSize } from "./FieldPrimitives.js"
 
 export interface SelectItemProps {
   children: React.ReactNode
@@ -15,7 +16,7 @@ export interface SelectHandle {
 
 export interface SelectProps extends Omit<React.HTMLAttributes<HTMLDivElement>, "onChange"> {
   label?: string
-  size?: "sm" | "md" | "lg"
+  size?: FieldSize
   selectedKeys?: string[]
   onSelectionChange?: (keys: Set<string>) => void
   classNames?: {
@@ -27,7 +28,7 @@ export interface SelectProps extends Omit<React.HTMLAttributes<HTMLDivElement>, 
 }
 
 export const Select = React.forwardRef<SelectHandle, SelectProps>(function Select(
-  { label, size: _size = "md", selectedKeys = [], onSelectionChange, className, classNames = {}, children, ...rest },
+  { label, size = "md", selectedKeys = [], onSelectionChange, className, classNames = {}, children, ...rest },
   forwardedRef,
 ) {
   const [isOpen, setIsOpen] = useState(false)
@@ -91,7 +92,7 @@ export const Select = React.forwardRef<SelectHandle, SelectProps>(function Selec
 
   return (
     <div ref={innerRef} className={`relative ${classNames.base || ""} ${className || ""}`} {...rest}>
-      {label && <label className="pl-1 text-sm text-default-500 block mb-1.5">{label}</label>}
+      {label && <FieldLabel className="mb-1.5 block">{label}</FieldLabel>}
       <button
         ref={triggerRef}
         type="button"
@@ -113,37 +114,33 @@ export const Select = React.forwardRef<SelectHandle, SelectProps>(function Selec
         }}
         onClick={() => setIsOpen(!isOpen)}
         onKeyDown={handleKeyDown}
-        className={`w-full px-3 py-2 bg-default-100 border rounded-xl text-left text-sm transition-colors focus:outline-none ${isOpen ? "border-default-400" : "border-default-200 hover:border-default-400"} ${classNames.trigger || ""}`}
+        className={`w-full px-3 bg-default-100 border rounded-xl text-left transition-colors focus:outline-none ${fieldControlSizeClass[size]} ${isOpen ? "border-default-400" : "border-default-200 hover:border-default-400"} ${classNames.trigger || ""}`}
       >
         {displayText}
       </button>
       {isOpen && (
-        <div
-          className={`absolute z-10 left-0 right-0 mt-1 bg-content1 border border-default-200 rounded-lg max-h-60 overflow-hidden shadow-medium ${classNames.listbox || ""}`}
-        >
-          <div ref={listRef} tabIndex={-1} className="overflow-auto max-h-60">
-            {items.map((item, index) => {
-              const itemValue = getItemValue(item)
-              return (
-                <button
-                  key={itemValue}
-                  data-index={index}
-                  type="button"
-                  tabIndex={-1}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => {
-                    onSelectionChange?.(new Set([itemValue]))
-                    setIsOpen(false)
-                    setFocusedIndex(-1)
-                  }}
-                  className={`w-full px-3 py-2 text-left text-sm transition-colors whitespace-nowrap ${index === focusedIndex ? "bg-default-100" : "hover:bg-default-100"}`}
-                >
-                  {item.props.children}
-                </button>
-              )
-            })}
-          </div>
-        </div>
+        <ListboxPopover ref={listRef} className={`right-0 left-0 ${classNames.listbox || ""}`}>
+          {items.map((item, index) => {
+            const itemValue = getItemValue(item)
+            return (
+              <button
+                key={itemValue}
+                data-index={index}
+                type="button"
+                tabIndex={-1}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  onSelectionChange?.(new Set([itemValue]))
+                  setIsOpen(false)
+                  setFocusedIndex(-1)
+                }}
+                className={`w-full px-3 text-left transition-colors whitespace-nowrap ${fieldControlSizeClass[size]} ${index === focusedIndex ? "bg-default-100" : "hover:bg-default-100"}`}
+              >
+                {item.props.children}
+              </button>
+            )
+          })}
+        </ListboxPopover>
       )}
     </div>
   )

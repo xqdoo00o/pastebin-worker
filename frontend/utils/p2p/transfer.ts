@@ -66,7 +66,7 @@ export function waitForBufferedAmount(channel: RTCDataChannel): Promise<void> {
 let yieldChannel: MessageChannel | undefined
 const yieldWaiters: (() => void)[] = []
 
-export function yieldToEventLoop(): Promise<void> {
+function yieldToEventLoop(): Promise<void> {
   if (typeof MessageChannel === "undefined") return new Promise((resolve) => setTimeout(resolve, 0))
 
   yieldChannel ??= new MessageChannel()
@@ -87,6 +87,7 @@ interface StreamBlobToDataChannelOptions {
   shouldContinue: () => boolean
   onReaderChange?: (reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>, active: boolean) => void
   onChunkSent?: (chunk: Uint8Array<ArrayBuffer>) => void | Promise<void>
+  mapReadError?: (cause: unknown) => Error
   yieldIntervalMs?: number
 }
 
@@ -97,15 +98,27 @@ export async function streamBlobToDataChannel({
   shouldContinue,
   onReaderChange,
   onChunkSent,
+  mapReadError,
   yieldIntervalMs = 8,
 }: StreamBlobToDataChannelOptions): Promise<boolean> {
-  const reader = blob.stream().getReader()
+  let reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>
+  try {
+    reader = blob.stream().getReader()
+  } catch (cause) {
+    throw mapReadError?.(cause) ?? cause
+  }
   onReaderChange?.(reader, true)
   let lastYieldAt = performance.now()
 
   try {
     while (shouldContinue() && channel.readyState === "open") {
-      const { done, value } = await reader.read()
+      let result: ReadableStreamReadResult<Uint8Array<ArrayBuffer>>
+      try {
+        result = await reader.read()
+      } catch (cause) {
+        throw mapReadError?.(cause) ?? cause
+      }
+      const { done, value } = result
       if (!shouldContinue()) return false
       if (done) return true
 

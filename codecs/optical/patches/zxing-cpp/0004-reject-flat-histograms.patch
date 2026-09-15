@@ -1,0 +1,17 @@
+diff --git a/core/src/GlobalHistogramBinarizer.cpp b/core/src/GlobalHistogramBinarizer.cpp
+index 7ec9721..2f0c8b9 100644
+--- a/core/src/GlobalHistogramBinarizer.cpp
++++ b/core/src/GlobalHistogramBinarizer.cpp
+@@ -102,6 +102,12 @@ static int EstimateBlackPoint(const Histogram& buckets)
+ 		}
+ 	}
+ 
++	// A single occupied bucket has no usable contrast. Without this check a
++	// bright flat frame mistakes empty bucket zero for a distant second peak and
++	// needlessly binarizes the full image; a dark flat frame already exits below.
++	if (secondPeakScore == 0)
++		return -1;
++
+ 	// Make sure firstPeak corresponds to the black peak.
+ 	if (firstPeak > secondPeak) {
+ 		std::swap(firstPeak, secondPeak);

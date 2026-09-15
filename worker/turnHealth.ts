@@ -103,7 +103,7 @@ export async function deriveTurnLongTermKey(
   return new Uint8Array(await crypto.subtle.digest("MD5", value))
 }
 
-export async function buildAuthenticatedAllocateRequest(
+async function buildAuthenticatedAllocateRequest(
   username: string,
   credential: string,
   realm: string,

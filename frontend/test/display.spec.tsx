@@ -7,7 +7,7 @@ import { userEvent } from "@testing-library/user-event"
 import { setupServer } from "msw/node"
 import { http, HttpResponse } from "msw"
 import { encodeKey, encrypt, genKey } from "../utils/encryption.js"
-import { stubBrowerFunctions, unStubBrowerFunctions } from "./testUtils.js"
+import { stubBrowserFunctions, unStubBrowserFunctions } from "./testUtils.js"
 import {
   BINARY_MIME_TYPE,
   DEFAULT_EDIT_FILENAME,
@@ -59,7 +59,7 @@ function rememberLocalUpload(key = "abcd") {
 const server = setupServer()
 
 beforeAll(() => {
-  stubBrowerFunctions()
+  stubBrowserFunctions()
   globalThis.URL.createObjectURL = () => "blob:mock"
   globalThis.URL.revokeObjectURL = () => undefined
   server.listen()
@@ -73,7 +73,7 @@ afterEach(() => {
 })
 
 afterAll(() => {
-  unStubBrowerFunctions()
+  unStubBrowserFunctions()
   server.close()
 })
 
@@ -125,7 +125,7 @@ describe("DisplayPaste", () => {
 
     const view = render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
     try {
-      await userEvent.click(await screen.findByRole("button", { name: "Download" }))
+      await userEvent.click(await screen.findByRole("button", { name: "Download file" }))
       await waitFor(() => expect(createObjectUrlSpy).toHaveBeenCalledWith(downloadFile))
 
       expect(timeoutSpy.mock.calls.some(([, delay]) => delay === 60_000)).toStrictEqual(false)
@@ -163,7 +163,34 @@ describe("DisplayPaste", () => {
     expect(article.textContent).toStrictEqual(text)
   })
 
-  it("places the text copy button at the far right of the preview title bar", async () => {
+  it("previews an uploaded SVG even when the response is sanitized to text/plain", async () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"><circle cx="4" cy="4" r="4" /></svg>'
+    const createObjectUrlSpy = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:svg-preview")
+    server.use(
+      ...mockPaste("abcd", {
+        body: new TextEncoder().encode(svg).buffer,
+        headers: {
+          "Content-Type": TEXT_MIME_TYPE,
+          "Content-Disposition": "inline; filename*=UTF-8''image.svg",
+        },
+      }),
+    )
+    vi.stubGlobal("location", new URL("https://example.com/d/abcd"))
+
+    try {
+      render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
+
+      const preview = await screen.findByRole("img", { name: "image.svg" })
+      await waitFor(() => expect(preview).toHaveAttribute("src", "blob:svg-preview"))
+      const previewBlob = createObjectUrlSpy.mock.calls[createObjectUrlSpy.mock.calls.length - 1]?.[0]
+      expect(previewBlob).toBeInstanceOf(Blob)
+      expect((previewBlob as Blob).type).toStrictEqual("image/svg+xml")
+    } finally {
+      createObjectUrlSpy.mockRestore()
+    }
+  })
+
+  it("renders received text with a verified header and bottom save/copy actions", async () => {
     const text = "const answer = 42"
     server.use(
       ...mockPaste("abcd", {
@@ -181,12 +208,36 @@ describe("DisplayPaste", () => {
     const article = await screen.findByRole("article")
     const language = screen.getByText("javascript")
     const copyButton = screen.getByRole("button", { name: "Copy" })
-    const titleBar = article.parentElement?.previousElementSibling
-    const previewFrame = article.closest(".bg-default-100")
-    expect(titleBar).toContainElement(copyButton)
-    expect(previewFrame).toHaveClass("p-3", "pt-1")
-    expect(language.parentElement).toContainElement(copyButton)
-    expect(language.compareDocumentPosition(copyButton) & Node.DOCUMENT_POSITION_FOLLOWING).not.toStrictEqual(0)
+    const content = article.closest(".received-preview-content")
+    const titleBar = content?.previousElementSibling
+    const actions = content?.nextElementSibling
+    expect(titleBar).toHaveTextContent("Verified")
+    expect(titleBar).not.toContainElement(copyButton)
+    expect(titleBar).toContainElement(language)
+    expect(language.previousElementSibling).toHaveTextContent("·")
+    const saveFile = screen.getByText("Save")
+    expect(actions).toContainElement(saveFile)
+    expect(saveFile.parentElement?.querySelector("svg")).not.toBeNull()
+    expect(actions).toContainElement(copyButton)
+  })
+
+  it("does not infer syntax highlighting on the upload receiver", async () => {
+    const text = "const answer = 42"
+    server.use(
+      ...mockPaste("abcd", {
+        body: new TextEncoder().encode(text).buffer,
+        headers: {
+          "Content-Type": "text/javascript",
+          "Content-Disposition": "inline; filename*=UTF-8''answer.js",
+        },
+      }),
+    )
+    vi.stubGlobal("location", new URL("https://example.com/d/abcd"))
+
+    render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
+
+    expect(await screen.findByRole("article")).toHaveTextContent(text)
+    expect(screen.queryByText("javascript")).not.toBeInTheDocument()
   })
 
   it("renders plain image via raw URL without downloading bytes", async () => {
@@ -214,6 +265,8 @@ describe("DisplayPaste", () => {
 
     const img = await screen.findByRole("img")
     expect(img.getAttribute("src")).toStrictEqual("/abcd")
+    expect(screen.getByText("Verified")).toBeInTheDocument()
+    expect(screen.getByText("Save")).toHaveAttribute("href", "/abcd?a")
     expect(getCalled).toStrictEqual(false)
   })
 
@@ -373,7 +426,7 @@ describe("DisplayPaste", () => {
     render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
 
     expect(await screen.findByText("load anyway")).toBeInTheDocument()
-    expect(screen.getByText("Download raw")).toBeInTheDocument()
+    expect(screen.getByText("Download")).toBeInTheDocument()
     expect(getCalled).toStrictEqual(false)
   })
 
@@ -479,7 +532,7 @@ describe("DisplayPaste", () => {
 
     render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
 
-    await userEvent.click(await screen.findByText("Download raw"))
+    await userEvent.click(await screen.findByText("Download"))
 
     await waitFor(() => {
       expect(clickSpy).toHaveBeenCalled()
@@ -535,8 +588,56 @@ describe("DisplayPaste", () => {
     expect(article.textContent).toStrictEqual(text)
     const heading = await screen.findByRole("heading")
     expect(heading.textContent).toContain("ssr.txt")
-    const previewTitle = article.parentElement?.previousElementSibling?.querySelector("span[title]")
+    const previewTitle = article
+      .closest(".received-preview-content")
+      ?.previousElementSibling?.querySelector("strong[title]")
     expect(previewTitle).toHaveAttribute("title", "ssr.txt")
+  })
+
+  it("shows file sharing for an SSR-injected MP3 with its effective MIME type", async () => {
+    const originalShare = Object.getOwnPropertyDescriptor(navigator, "share")
+    const originalCanShare = Object.getOwnPropertyDescriptor(navigator, "canShare")
+    const originalUserAgent = Object.getOwnPropertyDescriptor(navigator, "userAgent")
+    const canShare = vi.fn().mockReturnValue(true)
+    Object.defineProperty(navigator, "share", { configurable: true, value: vi.fn().mockResolvedValue(undefined) })
+    Object.defineProperty(navigator, "canShare", { configurable: true, value: canShare })
+    Object.defineProperty(navigator, "userAgent", {
+      configurable: true,
+      value: "Mozilla/5.0 Chrome/140.0.0.0 Safari/537.36",
+    })
+
+    try {
+      const content = "ID3"
+      window.__PASTE_DATA__ = {
+        content: btoa(content),
+        contentType: "audio/mpeg",
+        name: "abcd",
+        isBinary: true,
+        guessedEncoding: null,
+        metadata: {
+          lastModifiedAt: "",
+          createdAt: "",
+          expireAt: "",
+          sizeBytes: content.length,
+          location: "KV",
+          filename: "song.mp3",
+        },
+      }
+      vi.stubGlobal("location", new URL("https://example.com/d/abcd"))
+
+      render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
+
+      expect(await screen.findByTitle("Share file")).toBeInTheDocument()
+      const fileShareData = canShare.mock.calls.map(([data]) => data as ShareData).find((data) => data.files?.length)
+      expect(fileShareData?.files?.[0]).toMatchObject({ name: "song.mp3", type: "audio/mpeg" })
+    } finally {
+      if (originalShare) Object.defineProperty(navigator, "share", originalShare)
+      else Reflect.deleteProperty(navigator, "share")
+      if (originalCanShare) Object.defineProperty(navigator, "canShare", originalCanShare)
+      else Reflect.deleteProperty(navigator, "canShare")
+      if (originalUserAgent) Object.defineProperty(navigator, "userAgent", originalUserAgent)
+      else Reflect.deleteProperty(navigator, "userAgent")
+    }
   })
 
   it("removes local upload when SSR data consumes the final read", async () => {
@@ -594,7 +695,7 @@ describe("DisplayPaste", () => {
     const heading = await screen.findByRole("heading")
     expect(heading.textContent).not.toContain(DEFAULT_EDIT_FILENAME)
     expect(screen.getByText(DEFAULT_EDIT_FILENAME)).toBeInTheDocument()
-    expect(screen.getByRole("link", { name: "Download" }).getAttribute("download")).toStrictEqual(DEFAULT_EDIT_FILENAME)
+    expect(screen.getByRole("link", { name: "Save" }).getAttribute("download")).toStrictEqual(DEFAULT_EDIT_FILENAME)
   })
 
   it("shows SSR-injected zip content as a non-renderable archive", async () => {
@@ -619,11 +720,18 @@ describe("DisplayPaste", () => {
     render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
 
     expect(await screen.findByText(/Not a renderable file \(application\/zip\)/)).toBeInTheDocument()
-    expect(screen.getByText("Download raw")).toBeInTheDocument()
+    expect(screen.getByText("Download")).toBeInTheDocument()
+    await userEvent.click(screen.getByText("Click to show"))
+    expect(await screen.findByRole("article")).toHaveTextContent("PK")
     expect(screen.queryByText(/not in UTF-8/)).not.toBeInTheDocument()
   })
 
   it("fetches and renders content when user clicks load anyway on oversized text", async () => {
+    const originalShare = Object.getOwnPropertyDescriptor(navigator, "share")
+    const originalCanShare = Object.getOwnPropertyDescriptor(navigator, "canShare")
+    const share = vi.fn((_data: ShareData) => Promise.resolve())
+    Object.defineProperty(navigator, "share", { configurable: true, value: share })
+    Object.defineProperty(navigator, "canShare", { configurable: true, value: () => true })
     const oversized = new TextEncoder().encode("a".repeat(MAX_AUTO_FETCH_BYTES + 4))
     server.use(
       ...mockPaste("abcd", {
@@ -633,13 +741,25 @@ describe("DisplayPaste", () => {
     )
     vi.stubGlobal("location", new URL("https://example.com/d/abcd"))
 
-    render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
+    try {
+      render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
 
-    const loadAnyway = await screen.findByText("load anyway")
-    await userEvent.click(loadAnyway)
+      const loadAnyway = await screen.findByText("load anyway")
+      await userEvent.click(loadAnyway)
 
-    const article = await screen.findByRole("article")
-    expect(article.textContent?.length).toBeGreaterThan(MAX_AUTO_FETCH_BYTES)
+      const article = await screen.findByRole("article")
+      expect(article.textContent?.length).toBeGreaterThan(MAX_AUTO_FETCH_BYTES)
+
+      await userEvent.click(await screen.findByTitle("Share file"))
+      expect(share).toHaveBeenCalledOnce()
+      expect(share.mock.calls[0][0].text).toBeUndefined()
+      expect(share.mock.calls[0][0].files?.[0]).toMatchObject({ name: "abcd", size: oversized.byteLength })
+    } finally {
+      if (originalShare) Object.defineProperty(navigator, "share", originalShare)
+      else Reflect.deleteProperty(navigator, "share")
+      if (originalCanShare) Object.defineProperty(navigator, "canShare", originalCanShare)
+      else Reflect.deleteProperty(navigator, "canShare")
+    }
   })
 
   it("auto-decrypts and renders small encrypted video via blob URL", async () => {
@@ -712,8 +832,37 @@ describe("DisplayPaste", () => {
     render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
 
     expect(await screen.findByText(/Not a renderable file/)).toBeInTheDocument()
-    expect(screen.getByText("Download raw")).toBeInTheDocument()
-    expect(screen.getByRole("link", { name: "Download" }).getAttribute("href")).toStrictEqual("/abcd?a")
+    expect(screen.getByText("Download")).toBeInTheDocument()
+    const downloadLink = screen.getByText("Download", { selector: "a.primary-button" })
+    expect(downloadLink.getAttribute("href")).toStrictEqual("/abcd?a")
+  })
+
+  it("warns when an encrypted upload URL is missing its fragment key", async () => {
+    server.use(
+      ...mockPaste("abcd", {
+        body: new ArrayBuffer(8),
+        headers: {
+          "X-PB-Encryption-Scheme": "AES-GCM-CHUNKED",
+          "X-PB-Decrypted-Content-Type": "application/zip",
+          "Content-Type": BINARY_MIME_TYPE,
+        },
+      }),
+    )
+    vi.stubGlobal("location", new URL("https://example.com/d/abcd"))
+
+    render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
+
+    expect(await screen.findByText("Decryption key is missing")).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        "This file is encrypted. Open the complete share URL, including # and the key after it, to decrypt the file.",
+      ),
+    ).toBeInTheDocument()
+    expect(screen.getByText("Download", { selector: "a.primary-button" })).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss missing decryption key notice" }))
+    expect(screen.queryByText("Decryption key is missing")).not.toBeInTheDocument()
+    expect(screen.getByText("Download", { selector: "a.primary-button" })).toBeInTheDocument()
   })
 
   it("downloads pending plain media through attachment URL without paste data", async () => {
@@ -738,7 +887,7 @@ describe("DisplayPaste", () => {
     render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
 
     await screen.findByLabelText("clip.mp4")
-    const downloadLink = screen.getByRole("link", { name: "Download" })
+    const downloadLink = screen.getByRole("link", { name: "Save" })
     expect(downloadLink.getAttribute("href")).toStrictEqual("/abcd?a")
     expect(downloadLink.getAttribute("download")).toStrictEqual("clip.mp4")
     expect(getCalled).toStrictEqual(false)
@@ -777,15 +926,15 @@ describe("DisplayPaste", () => {
     render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
 
     try {
-      const downloadButton = await screen.findByRole("button", { name: "Download" })
+      const downloadButton = await screen.findByRole("button", { name: "Download file" })
       await userEvent.click(downloadButton)
 
       await waitFor(() => {
         expect(createObjectUrlSpy).toHaveBeenCalled()
       })
-      expect(screen.getByRole("button", { name: "Download" })).toBeInTheDocument()
-      expect(screen.getByText("Download decrypted")).toBeInTheDocument()
-      expect(screen.queryByRole("link", { name: "Download" })).not.toBeInTheDocument()
+      expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument()
+      expect(screen.getByText("Download")).toBeInTheDocument()
+      expect(screen.queryByRole("link", { name: "Save" })).not.toBeInTheDocument()
     } finally {
       clickSpy.mockRestore()
       createObjectUrlSpy.mockRestore()
@@ -840,7 +989,7 @@ describe("DisplayPaste", () => {
     })
 
     try {
-      await userEvent.click(await screen.findByRole("button", { name: "Download" }))
+      await userEvent.click(await screen.findByRole("button", { name: "Download file" }))
 
       await waitFor(() => {
         expect(downloadAnchor?.download).toStrictEqual("original-name")

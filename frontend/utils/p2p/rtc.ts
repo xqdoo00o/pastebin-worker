@@ -2,9 +2,27 @@ import type { P2PIceServer } from "../../../shared/interfaces.js"
 import type { P2PConnectionRoute } from "./protocol.js"
 
 const defaultIceServers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }]
+const connectionRouteRetryDelaysMs = [100, 250, 500, 1000, 2000] as const
 
-export function rtcConfig(iceServers: P2PIceServer[] | undefined): RTCConfiguration {
-  return { iceServers: iceServers?.length ? iceServers : defaultIceServers }
+export type P2PIceMode = "all" | "direct"
+
+function withoutRelayServers(iceServers: RTCIceServer[]): RTCIceServer[] {
+  return iceServers.flatMap((server) => {
+    const urls = typeof server.urls === "string" ? [server.urls] : server.urls
+    const directUrls = urls.filter((url) => !/^turns?:/i.test(url.trim()))
+    if (directUrls.length === 0) return []
+    return [
+      { ...server, urls: typeof server.urls === "string" && directUrls.length === 1 ? directUrls[0] : directUrls },
+    ]
+  })
+}
+
+export function rtcConfig(
+  iceServers: P2PIceServer[] | undefined,
+  options: { mode?: P2PIceMode } = {},
+): RTCConfiguration {
+  const configuredServers: RTCIceServer[] = iceServers?.length ? iceServers : defaultIceServers
+  return { iceServers: options.mode === "direct" ? withoutRelayServers(configuredServers) : configuredServers }
 }
 
 interface P2PTransportStats extends RTCStats {
@@ -54,6 +72,55 @@ export async function selectedP2PConnectionRoute(
   return local.candidateType === "relay" || remote.candidateType === "relay" ? "relay" : "direct"
 }
 
+interface ConnectionRouteRefreshState {
+  generation: number
+  timer?: ReturnType<typeof setTimeout>
+}
+
+const connectionRouteRefreshes = new WeakMap<RTCPeerConnection, ConnectionRouteRefreshState>()
+
+export function refreshP2PConnectionRoute(
+  connection: RTCPeerConnection,
+  onRoute: (route: P2PConnectionRoute) => void,
+  isCurrent: () => boolean = () => true,
+): void {
+  const state = connectionRouteRefreshes.get(connection) ?? { generation: 0 }
+  state.generation += 1
+  if (state.timer !== undefined) clearTimeout(state.timer)
+  state.timer = undefined
+  connectionRouteRefreshes.set(connection, state)
+  const generation = state.generation
+
+  const attempt = async (retryIndex: number): Promise<void> => {
+    const route = await selectedP2PConnectionRoute(connection).catch(() => undefined)
+    if (!isCurrent() || state.generation !== generation) return
+    if (route) {
+      connectionRouteRefreshes.delete(connection)
+      onRoute(route)
+      return
+    }
+    const delay = connectionRouteRetryDelaysMs[retryIndex]
+    if (delay === undefined) {
+      connectionRouteRefreshes.delete(connection)
+      return
+    }
+    state.timer = setTimeout(() => {
+      state.timer = undefined
+      void attempt(retryIndex + 1)
+    }, delay)
+  }
+
+  void attempt(0)
+}
+
+function cancelP2PConnectionRouteRefresh(connection: RTCPeerConnection): void {
+  const state = connectionRouteRefreshes.get(connection)
+  if (!state) return
+  state.generation += 1
+  if (state.timer !== undefined) clearTimeout(state.timer)
+  connectionRouteRefreshes.delete(connection)
+}
+
 export class P2PIceCandidateBuffer {
   private readonly pending: RTCIceCandidateInit[] = []
 
@@ -96,6 +163,7 @@ export function closeP2PConnection(connection: RTCPeerConnection | undefined, ch
     channel.close()
   }
   if (connection) {
+    cancelP2PConnectionRouteRefresh(connection)
     connection.onicecandidate = null
     connection.oniceconnectionstatechange = null
     connection.onconnectionstatechange = null

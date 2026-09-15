@@ -38,17 +38,20 @@ const MAX_P2P_SIGNAL_BYTES = 256 * 1024
 const RECEIVER_RECONNECT_GRACE_MS = P2P_SIGNAL_RECONNECT_GRACE_MS
 type P2PRole = "sender" | "receiver"
 
-function isUuidValue(value: unknown): value is string {
-  return isUuid(typeof value === "string" ? value : null)
+function earliestTimestamp(values: readonly (number | undefined)[]): number | undefined {
+  return values.reduce<number | undefined>(
+    (earliest, value) => (value === undefined ? earliest : earliest === undefined ? value : Math.min(earliest, value)),
+    undefined,
+  )
 }
 
 function isValidP2PClientSignalMessage(value: unknown): value is P2PSignalMessage {
   if (!isP2PSignalMessage(value)) return false
 
-  if ("negotiationId" in value && value.negotiationId !== undefined && !isUuidValue(value.negotiationId)) {
+  if ("negotiationId" in value && value.negotiationId !== undefined && !isUuid(value.negotiationId)) {
     return false
   }
-  if ("retryToken" in value && value.retryToken !== undefined && !isUuidValue(value.retryToken)) {
+  if ("retryToken" in value && value.retryToken !== undefined && !isUuid(value.retryToken)) {
     return false
   }
 
@@ -57,15 +60,16 @@ function isValidP2PClientSignalMessage(value: unknown): value is P2PSignalMessag
     value.type === "transfer-checkpoint" ||
     value.type === "transfer-checkpoint-clear" ||
     value.type === "transfer-abandon" ||
+    value.type === "receiver-leave" ||
     value.type === "sender-leave"
   ) {
     return true
   }
   if (value.type === "peer-reconnect-request") {
-    return value.peerId === undefined || isUuidValue(value.peerId)
+    return value.peerId === undefined || isUuid(value.peerId)
   }
 
-  if (!("peerId" in value) || !isUuidValue(value.peerId)) return false
+  if (!("peerId" in value) || !isUuid(value.peerId)) return false
   return (
     value.type === "offer" ||
     value.type === "answer" ||
@@ -157,12 +161,7 @@ export class P2PRoom {
 
     const roomAlarmAt = !this.sender ? expiresAt : undefined
     const heartbeatAt = this.hasOpenSockets() ? now + P2P_HEARTBEAT_INTERVAL_MS : undefined
-    const scheduledAlarmAt = [roomAlarmAt, receiverCleanupAt, heartbeatAt]
-      .filter((value): value is number => value !== undefined)
-      .reduce<number | undefined>(
-        (earliest, value) => (earliest === undefined ? value : Math.min(earliest, value)),
-        undefined,
-      )
+    const scheduledAlarmAt = earliestTimestamp([roomAlarmAt, receiverCleanupAt, heartbeatAt])
     if (scheduledAlarmAt !== undefined && scheduledAlarmAt > now) await this.state.storage.setAlarm(scheduledAlarmAt)
   }
 
@@ -284,19 +283,19 @@ export class P2PRoom {
             RECEIVER_CLEANUP_AT_KEY,
           ])
         : undefined
-    const isCompletedReceiver =
-      role === "receiver" &&
-      peerId !== null &&
-      storedStringIds(receiverAdmission?.get(SUCCESSFUL_RECEIVER_IDS_KEY)).includes(peerId)
-    if (isCompletedReceiver) {
-      return new Response("P2P receiver transfer already completed", { status: 429 })
-    }
     const isReceiverReconnect =
       role === "receiver" &&
       peerId !== null &&
       (this.receivers.has(peerId) ||
         (storedReceiverDeadlines(receiverAdmission?.get(RECEIVER_CLEANUP_AT_KEY))[peerId] ?? 0) > Date.now() ||
         storedStringIds(receiverAdmission?.get(RESUMABLE_RECEIVER_IDS_KEY)).includes(peerId))
+    const isCompletedReceiver =
+      role === "receiver" &&
+      peerId !== null &&
+      storedStringIds(receiverAdmission?.get(SUCCESSFUL_RECEIVER_IDS_KEY)).includes(peerId)
+    if (isCompletedReceiver && !isReceiverReconnect) {
+      return this.terminalReceiverSocket(peerId, { type: "receiver-reconnect-expired" })
+    }
     if (
       role === "receiver" &&
       !isReceiverReconnect &&
@@ -413,6 +412,22 @@ export class P2PRoom {
 
     await this.state.storage.put(roomState)
     await this.state.storage.setAlarm(expiresAt)
+  }
+
+  private terminalReceiverSocket(peerId: string, message: P2PSignalMessage): Response {
+    const pair = new WebSocketPair()
+    const [client, server] = Object.values(pair)
+    const connectedAt = Date.now()
+    server.serializeAttachment({
+      role: "receiver",
+      peerId,
+      connectedAt,
+      lastPongAt: connectedAt,
+    } satisfies P2PWebSocketAttachment)
+    this.state.acceptWebSocket(server)
+    this.send(server, message)
+    server.close(1000, "P2P receiver reconnect window expired")
+    return new Response(null, { status: 101, webSocket: client })
   }
 
   private async updateRoom(request: Request): Promise<Response> {
@@ -649,6 +664,16 @@ export class P2PRoom {
         socket.close(1000, "P2P transfer abandoned")
         return
       }
+      if (parsed.type === "receiver-leave") {
+        const resumable = parsed.resumable ? await this.recordResumableReceiver(receiverPeerId) : false
+        if (!resumable) await this.releaseReceiver(receiverPeerId, true)
+        await this.cancelReceiverCleanup(receiverPeerId)
+        this.receivers.delete(receiverPeerId)
+        this.send(this.sender, { type: "peer-left", role: "receiver", peerId: receiverPeerId, resumable })
+        socket.close(1000, "receiver left")
+        await this.rescheduleRoomAlarm()
+        return
+      }
       if (parsed.type === "peer-reconnect-request") {
         this.send(this.sender, {
           type: "peer-reconnect-request",
@@ -771,12 +796,7 @@ export class P2PRoom {
     const receiverCleanupAt = receiverDeadlines.length > 0 ? Math.min(...receiverDeadlines) : undefined
     const roomAlarmAt = this.sender ? (expiresAt > now ? expiresAt : undefined) : expiresAt
     const heartbeatAt = this.hasOpenSockets() ? now + P2P_HEARTBEAT_INTERVAL_MS : undefined
-    const nextAlarmAt = [roomAlarmAt, receiverCleanupAt, heartbeatAt]
-      .filter((value): value is number => value !== undefined)
-      .reduce<number | undefined>(
-        (earliest, value) => (earliest === undefined ? value : Math.min(earliest, value)),
-        undefined,
-      )
+    const nextAlarmAt = earliestTimestamp([roomAlarmAt, receiverCleanupAt, heartbeatAt])
     if (nextAlarmAt === undefined) {
       await this.state.storage.deleteAlarm()
     } else if (nextAlarmAt <= now) {
@@ -808,11 +828,6 @@ export class P2PRoom {
       if (Object.keys(deadlines).length > 0) await this.state.storage.put(RECEIVER_CLEANUP_AT_KEY, deadlines)
       else await this.state.storage.delete(RECEIVER_CLEANUP_AT_KEY)
     })
-  }
-
-  private async nextReceiverCleanupAt(): Promise<number | undefined> {
-    const deadlines = Object.values(await this.receiverCleanupDeadlines())
-    return deadlines.length > 0 ? Math.min(...deadlines) : undefined
   }
 
   private async cleanupExpiredReceivers(now: number): Promise<number | undefined> {

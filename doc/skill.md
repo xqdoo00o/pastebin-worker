@@ -1,86 +1,154 @@
 ---
 name: shz-al
-description: Upload, fetch, update, or delete text/binary content via {{BASE_URL}}, a curl-friendly pastebin. Use when you need a quick public URL for sharing long output, hosting a small file, shortening a URL, or rendering markdown as HTML.
+description: Upload, fetch, inspect, update, or delete text and binary content through {{BASE_URL}}. Use for a temporary public URL, a small file, rendered Markdown, a URL redirect, or browser-based P2P/QR transfer.
 ---
 
-# shz.al
+# Pastebin Worker
 
-A pastebin hosted on Cloudflare Workers at `{{BASE_URL}}`. Every operation is
-plain HTTP and works with `curl`. Random paste names appear bare (e.g. `abcd`);
-custom names are returned with a leading `~` (e.g. `~hitagi`).
+Use `{{BASE_URL}}` as the API origin. Stored pastes receive a random 6-character
+name, or a random 24-character name in private mode. The API does not support
+client-selected names.
 
-## Upload
+## Safety and selection rules
+
+- Treat every normal paste URL as public. Private mode makes the name difficult
+  to guess; it does not add authentication or encryption.
+- Never expose the returned `manageUrl`: it is the credential for replacement
+  and deletion. Share only `url` or `/d/<name>`.
+- Direct `POST`/`PUT` content is limited to 5 MiB. For larger content, use the
+  web UI or the [`pb`]({{REPO}}/tree/goshujin/scripts) client, which uses R2
+  multipart upload up to the deployment limit (`{{R2_MAX_ALLOWED}}`).
+- Setting `encryption-scheme` only labels already-encrypted bytes; the server
+  does not encrypt them. Use the web UI or `pb -E` when actual client-side
+  encryption is required.
+- A raw `GET`, rendered display/article, or URL redirect consumes one read from
+  a read-limited paste. Inspect with `HEAD` or `/m/<name>` first when reads are
+  scarce.
+
+If this deployment requires HTTP Basic authentication, add
+`-u '<user>:<password>'` to creation requests.
+
+## Create a stored paste
 
 ```shell
-curl -Fc='hello, world' {{BASE_URL}}        # text
-curl -Fc=@file.png      {{BASE_URL}}        # file
-<cmd> | curl -Fc=@-     {{BASE_URL}}        # stdin
+curl -sS -F c='hello, world' {{BASE_URL}}                 # text
+curl -sS -F c=@file.png {{BASE_URL}}                      # file
+<command> | curl -sS -F c=@- {{BASE_URL}}                 # stdin
 ```
 
-Response:
+The JSON response contains at least:
 
 ```json
 {
-  "url": "{{BASE_URL}}/abcd",
-  "manageUrl": "{{BASE_URL}}/abcd:<password>",
-  "expireAt": "2026-05-21T10:33:06.114Z"
+  "url": "{{BASE_URL}}/BxWH2a",
+  "manageUrl": "{{BASE_URL}}/BxWH2a:<password>",
+  "expirationSeconds": 259200,
+  "expireAt": "2026-08-28T10:33:06.000Z",
+  "sizeBytes": 12,
+  "location": "KV"
 }
 ```
 
-Persist `manageUrl` if the paste may need to be updated or deleted later — it
-is the only way to authenticate as the owner.
+Retain the complete response when later management or metadata is relevant.
 
-## Optional upload fields
+Optional form fields:
 
-- `-Fn=<name>` — custom name (≥3 chars, returned prefixed with `~`).
-- `-Fe=<expire>` — expiration: integer/float with unit `s`/`m`/`h`/`d`
-  (default seconds). E.g. `-Fe=30m`, `-Fe=14d`.
-- `-Fs=<password>` — set a specific management password.
-- `-Flang=<lang>` — mark for syntax highlighting on the display page.
-- `-Fp=1` — private mode: 24-char unguessable random name.
+- `-F e=<duration>` — expiration (`30m`, `2h`, `14d`; default
+  `{{DEFAULT_EXPIRATION}}`, maximum `{{MAX_EXPIRATION}}`).
+- `-F p=1` — use a 24-character unguessable random name.
+- `-F reads=<integer>` — maximum content reads; `0` means unlimited.
+- `-F s=<password>` — management password, 8–128 characters, no newline.
+- `-F lang=<language>` — syntax highlighting on `/d/<name>`.
 
-## Fetch
-
-```shell
-curl {{BASE_URL}}/<name>                    # raw content
-curl -OJ {{BASE_URL}}/~<name>               # save with server filename
-curl {{BASE_URL}}/m/<name>                  # JSON metadata (size, dates, …)
-curl -I {{BASE_URL}}/<name>                 # HEAD only
-```
-
-Append `?a` for `Content-Disposition: attachment`, `?mime=<mime>` to override
-the response Content-Type, or append `.<ext>` to the path to set Content-Type
-by extension.
-
-## Update / delete
+Example with common options:
 
 ```shell
-curl -X PUT    -Fc='new content' <manageUrl>
-curl -X DELETE                   <manageUrl>
+curl -sS \
+  -F c=@report.md \
+  -F e=7d \
+  -F p=1 \
+  -F reads=3 \
+  -F lang=markdown \
+  {{BASE_URL}}
 ```
 
-`PUT` accepts the same fields as upload; `e` recalculates expiration from now.
+## Inspect and fetch
 
-## Other URL forms
+```shell
+curl -sS {{BASE_URL}}/m/<name> | jq .      # metadata; does not consume a read
+curl -sSI {{BASE_URL}}/<name>              # headers; does not consume a read
+curl -sS {{BASE_URL}}/<name>               # raw bytes; consumes a limited read
+curl -sS -OJ {{BASE_URL}}/<name>           # save using stored filename
+curl -sS -OJ '{{BASE_URL}}/<name>?a'       # force attachment disposition
+```
 
-- `/d/<name>` — display code with syntax highlighting. Append `?lang=<lang>` to override
-  the highlighting language.
-- `/a/<name>` — render a markdown paste as HTML (GitHub-flavored Markdown + MathJax).
-- `/u/<name>` — redirect to the URL stored in the paste (URL shortener).
+Useful URL forms:
 
-## Limitations
+- `/<name>.json` or `/<name>/file.json` — override MIME inference; the latter
+  also overrides the response filename.
+- `/<name>?mime=application/json` — explicit MIME override.
+- `/d/<name>?lang=rust` — browser display/highlighting page.
+- `/a/<name>` — sanitized GitHub-flavored Markdown + MathJax rendering.
+- `/u/<name>` — `302` redirect when the paste contains a valid URL of at most
+  2,000 bytes.
 
-- Default expiration is `{{DEFAULT_EXPIRATION}}`, max `{{MAX_EXPIRATION}}`. Pastes are deleted on expiry.
-- Max upload size is `{{R2_MAX_ALLOWED}}`.
-- A single request body is capped at 100 MB by Cloudflare (you get
-  HTTP `413 Payload Too Large` back, returned by the platform before the
-  worker runs). Files larger than 100 MB therefore cannot be sent via a
-  single `curl -Fc=@…` — use the web UI at `{{BASE_URL}}` or the `pb` CLI
-  (see [scripts/](https://github.com/SharzyL/pastebin-worker/tree/goshujin/scripts)),
-  both of which split large files automatically.
-- Treat the service as ephemeral storage — do not rely on it for archival.
+R2-backed pastes without read limits support a single HTTP byte range and
+resumable downloads. KV-backed and read-limited pastes ignore `Range`.
 
-## Full docs
+## Update or delete
 
-- `{{BASE_URL}}/doc/curl.md` — comprehensive curl guide.
-- `{{BASE_URL}}/doc/api.md` — HTTP API reference.
+Use the exact secret `manageUrl` returned by creation:
+
+```shell
+curl -sS -X PUT -F c='replacement' '<manageUrl>'
+curl -sS -X DELETE '<manageUrl>'
+```
+
+`PUT` replaces the content. `-F e=...` starts a new expiration window,
+`-F reads=...` resets the read limit, and `-F s=...` rotates the management
+password. Use the new response's `manageUrl` after every update.
+
+## Large files and encrypted content
+
+Prefer the official CLI rather than manually orchestrating `/mpu/*`:
+
+```shell
+pb post -f large.bin
+pb post -E -f sensitive.bin
+pb get --save <name>
+pb update -f replacement.bin '<name>:<password>'
+pb delete '<name>:<password>'
+```
+
+`pb` switches to multipart upload above 5 MiB, retains management credentials
+in its history, refuses binary terminal output by default, and can encrypt or
+decrypt `AES-GCM-CHUNKED` content locally. Its encrypted display URL puts the
+key after `#`, so the key is never sent to the server.
+
+## Browser transfer modes
+
+- P2P mode in the main UI sends files browser-to-browser over WebRTC and does
+  not store their bytes on the pastebin. The share URL is `/p/<room>`.
+- QR mode streams prepared data screen-to-camera without uploading it. Open
+  `{{BASE_URL}}/qr-receiver` on the receiver; it supports camera, screen
+  capture, and exported APNG input.
+
+Use these modes through the browser UI unless implementing their signaling or
+optical protocols deliberately.
+
+## Failure handling
+
+- `400`: correct the form field, expiration, read limit, or path.
+- `401`: provide deployment HTTP Basic authentication.
+- `403`: management password or P2P sender token is wrong.
+- `404`: paste is absent, expired, or has exhausted its reads.
+- `410`: multipart upload or P2P room has expired; start a new one.
+- `413`: direct content exceeds 5 MiB, or completed multipart content exceeds
+  `{{R2_MAX_ALLOWED}}`.
+- `416`: requested R2 byte range is unsatisfiable.
+
+## Complete references
+
+- [curl guide]({{BASE_URL}}/doc/curl.md)
+- [HTTP API reference]({{BASE_URL}}/doc/api.md)
+- [service index]({{BASE_URL}}/index.md)

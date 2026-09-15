@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
-import { create_password_hash } from "../argon2/pkg-node/argon2.js"
+import { readFile } from "node:fs/promises"
 import { randomBytes } from "node:crypto"
 import readline from "readline"
+import initArgon2, { create_password_hash } from "../codecs/argon2/dist/argon2.js"
+
+await initArgon2(await readFile(new URL("../codecs/argon2/dist/argon2_bg.wasm", import.meta.url)))
 
 function main() {
   if (process.argv.length > 2) {

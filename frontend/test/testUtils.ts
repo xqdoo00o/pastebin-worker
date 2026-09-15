@@ -1,6 +1,6 @@
 import { vi } from "vitest"
 
-export function stubBrowerFunctions() {
+export function stubBrowserFunctions() {
   vi.stubGlobal("matchMedia", (_query: string): MediaQueryList => {
     return {
       matches: false,
@@ -30,7 +30,7 @@ export function stubBrowerFunctions() {
   vi.stubGlobal("ResizeObserver", ResizeObserver)
 }
 
-export function unStubBrowerFunctions() {
+export function unStubBrowserFunctions() {
   vi.resetAllMocks()
   vi.unstubAllGlobals()
 }

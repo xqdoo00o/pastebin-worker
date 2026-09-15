@@ -3,6 +3,7 @@ import { createExecutionContext } from "cloudflare:test"
 
 import { BASE_URL, workerFetch } from "./testUtils.js"
 import { TEXT_MIME_TYPE } from "../../shared/constants.js"
+import { handleStaticPages } from "../handlers/staticPages.js"
 
 const curlHeaders = { "User-Agent": "curl/8.0.0" }
 const browserHeaders = {
@@ -37,7 +38,7 @@ describe("doc pages", () => {
     for (const page of ["/doc", "/doc/", "/doc/missing", "/doc/cli", "/doc/missing.md"]) {
       const resp = await workerFetch(ctx, `${BASE_URL}${page}`)
       expect(resp.status, `visiting ${page}`).toStrictEqual(404)
-      expect(await resp.text(), `visiting ${page}`).toContain("doc page")
+      await resp.body?.cancel()
     }
   })
 
@@ -81,5 +82,29 @@ describe("doc pages", () => {
     const resp = await workerFetch(ctx, new Request(BASE_URL, { headers: browserHeaders }))
     expect(resp.status).toStrictEqual(200)
     expect(resp.headers.get("Content-Type")).toStrictEqual("text/html;charset=UTF-8")
+    expect(resp.headers.get("Cross-Origin-Opener-Policy")).toStrictEqual("same-origin")
+    expect(resp.headers.get("Cross-Origin-Embedder-Policy")).toStrictEqual("require-corp")
+  })
+
+  it("allows workers created by the isolated SPA to inherit COEP", async () => {
+    const env = {
+      ASSETS: { fetch: () => Promise.resolve(new Response("export {}")) },
+      CACHE_STATIC_PAGE_AGE: 0,
+    } as unknown as Env
+    const resp = await handleStaticPages(new Request(`${BASE_URL}/assets/generated-worker.js`), env)
+
+    expect(resp?.status).toStrictEqual(200)
+    expect(resp?.headers.get("Cross-Origin-Embedder-Policy")).toStrictEqual("require-corp")
+  })
+
+  it("serves the QR camera receiver at its fixed URL", async () => {
+    for (const page of ["/qr-receiver", "/qr-receiver/"]) {
+      const resp = await workerFetch(ctx, new Request(`${BASE_URL}${page}`, { headers: browserHeaders }))
+      expect(resp.status, `visiting ${page}`).toStrictEqual(200)
+      expect(resp.headers.get("Content-Type")).toStrictEqual("text/html;charset=UTF-8")
+      const body = await resp.text()
+      expect(body).toContain('<div id="root"></div>')
+      expect(body).toContain('type="module"')
+    }
   })
 })

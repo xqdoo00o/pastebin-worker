@@ -1,10 +1,10 @@
 import React, { useRef } from "react"
-import { XIcon } from "../icons.js"
+import { FieldLabel, fieldControlSizeClass, InputClearButton, type FieldSize } from "./FieldPrimitives.js"
 
 export interface InputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, "size"> {
   label?: string
   labelExtra?: React.ReactNode
-  size?: "sm" | "md" | "lg"
+  size?: FieldSize
   description?: string
   errorMessage?: string
   warningMessage?: string
@@ -30,7 +30,7 @@ export interface InputProps extends Omit<React.InputHTMLAttributes<HTMLInputElem
 export function Input({
   label,
   labelExtra,
-  size: _size,
+  size = "md",
   description,
   errorMessage,
   warningMessage,
@@ -46,7 +46,6 @@ export function Input({
   className = "",
   classNames = {},
   onChange,
-  defaultValue: _defaultValue,
   value,
   ...rest
 }: InputProps) {
@@ -75,37 +74,26 @@ export function Input({
   return (
     <div className={`flex flex-col gap-1.5 min-w-0 ${className} ${classNames.base || ""}`}>
       {label && (
-        <label className={`inline-flex w-fit items-center pl-1 text-sm text-default-500 ${classNames.label || ""}`}>
+        <FieldLabel className={`inline-flex w-fit items-center ${classNames.label || ""}`}>
           {label}
           {isRequired && <span className="ml-1 text-red-500">*</span>}
           {labelExtra}
-        </label>
+        </FieldLabel>
       )}
       <div
-        className={`flex items-center ${boxBg} border rounded-xl color-tst ${borderColor} ${startContent || endContent || showClearButton ? "pl-3 pr-1" : ""} ${classNames.box || ""}`}
+        className={`flex items-center ${boxBg} border rounded-xl ${borderColor} ${startContent || endContent || showClearButton ? "pl-3 pr-1" : ""} ${classNames.box || ""}`}
       >
         {startContent && <div className="flex-shrink-0">{startContent}</div>}
         <input
           ref={inputRef}
           aria-label={label}
           aria-invalid={isInvalid}
-          className={`min-w-0 flex-1 py-2 bg-transparent text-sm text-foreground focus:outline-none color-tst ${startContent || endContent || showClearButton ? "" : "px-3"} ${classNames.input || ""}`}
+          className={`min-w-0 flex-1 bg-transparent text-foreground focus:outline-none ${fieldControlSizeClass[size]} ${startContent || endContent || showClearButton ? "" : "px-3"} ${classNames.input || ""}`}
           onChange={handleChange}
           value={value}
           {...rest}
         />
-        {showClearButton && (
-          <button
-            type="button"
-            tabIndex={-1}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={handleClear}
-            className="flex-shrink-0 text-default-400 hover:text-default-700 color-tst focus:outline-none"
-            aria-label="Clear input"
-          >
-            <XIcon className="w-4 h-4" />
-          </button>
-        )}
+        {showClearButton && <InputClearButton onMouseDown={(e) => e.preventDefault()} onClick={handleClear} />}
         {endContent && <div className="inline-flex flex-shrink-0 items-center">{endContent}</div>}
       </div>
       {(description || errorMessage || warningMessage || successMessage) && (

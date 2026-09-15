@@ -1,6 +1,7 @@
 import type { OriginalFileInfo, PasteResponse } from "../../shared/interfaces.js"
 import { isOriginalFileInfo } from "../../shared/verify.js"
 import { makeDisplayUrl, pasteKeyFromUrl } from "./pasteUrls.js"
+import { browserStorage, readStorageJson, writeStorageJson } from "./browserStorage.js"
 
 export interface LocalUploadRecord {
   key: string
@@ -71,37 +72,24 @@ function isExpired(record: LocalUploadRecord, now = Date.now()): boolean {
 }
 
 export function readLocalUploads(): LocalUploadRecord[] {
-  if (typeof window === "undefined") return []
-
-  try {
-    const raw = window.localStorage.getItem(LOCAL_UPLOADS_KEY)
-    if (!raw) return []
-
-    const parsed: unknown = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    const records = parsed.flatMap((item) => {
-      const record = normalizeLocalUploadRecord(item)
-      return record === undefined ? [] : [record]
-    })
-    const activeRecords = records.filter((record) => !isExpired(record))
-    if (activeRecords.length !== records.length) {
-      writeLocalUploads(activeRecords)
-    }
-    return activeRecords
-  } catch {
-    return []
+  const parsed = readStorageJson(browserStorage("local"), LOCAL_UPLOADS_KEY, (value) =>
+    Array.isArray(value) ? value : undefined,
+  )
+  if (!parsed) return []
+  const records = parsed.flatMap((item) => {
+    const record = normalizeLocalUploadRecord(item)
+    return record === undefined ? [] : [record]
+  })
+  const activeRecords = records.filter((record) => !isExpired(record))
+  if (activeRecords.length !== records.length) {
+    writeLocalUploads(activeRecords)
   }
+  return activeRecords
 }
 
-export function writeLocalUploads(records: LocalUploadRecord[]): LocalUploadRecord[] {
+function writeLocalUploads(records: LocalUploadRecord[]): LocalUploadRecord[] {
   const nextRecords = records.slice(0, MAX_LOCAL_UPLOADS)
-  if (typeof window !== "undefined") {
-    try {
-      window.localStorage.setItem(LOCAL_UPLOADS_KEY, JSON.stringify(nextRecords))
-    } catch {
-      // Local upload history is best-effort; storage failures should not break uploads.
-    }
-  }
+  writeStorageJson(browserStorage("local"), LOCAL_UPLOADS_KEY, nextRecords)
   return nextRecords
 }
 

@@ -1,0 +1,82 @@
+diff --git a/core/src/qrcode/QRReader.h b/core/src/qrcode/QRReader.h
+index c435781..0a7e67b 100644
+--- a/core/src/qrcode/QRReader.h
++++ b/core/src/qrcode/QRReader.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include "ByteArray.h"
+ #include "Reader.h"
+ 
+ namespace ZXing::QRCode {
+@@ -18,4 +19,8 @@ public:
+ 	BarcodesData read(const BinaryBitmap& image, int maxSymbols) const override;
+ };
++/** Return only valid Model 1/2 payload bytes, without constructing metadata,
++ * positions, or retained symbol matrices. */
++std::vector<ByteArray> ReadStandardPayloads(const BinaryBitmap& image, int maxSymbols, const ReaderOptions& opts);
++
+ 
+ } // namespace ZXing::QRCode
+diff --git a/core/src/qrcode/QRReader.cpp b/core/src/qrcode/QRReader.cpp
+index 7c2f0eb..2d89428 100644
+--- a/core/src/qrcode/QRReader.cpp
++++ b/core/src/qrcode/QRReader.cpp
+@@ -146,4 +146,56 @@ BarcodesData Reader::read(const BinaryBitmap& image, int maxSymbols) const
+ 	return res;
+ }
+ 
++std::vector<ByteArray> ReadStandardPayloads(const BinaryBitmap& image, int maxSymbols, const ReaderOptions& opts)
++{
++	std::vector<ByteArray> res;
++	if (maxSymbols > 0)
++		res.reserve(maxSymbols);
++
++	auto binImg = image.getBitMatrix();
++	if (binImg == nullptr || !opts.hasFormat(BarcodeFormat::QRCodeModel1 | BarcodeFormat::QRCodeModel2))
++		return res;
++
++	if (opts.isPure()) {
++		auto detectorResult = DetectPureQR(*binImg);
++		if (!detectorResult.isValid())
++			return res;
++		auto decoderResult = Decode(detectorResult.bits());
++		if (decoderResult.isValid()) {
++			auto content = std::move(decoderResult).content();
++			res.push_back(std::move(content.bytes));
++		}
++		return res;
++	}
++
++	auto allFPs = FindFinderPatterns(*binImg, opts.tryHarder());
++	auto allFPSets = GenerateFinderPatternSets(allFPs);
++	std::vector<ConcentricPattern> usedFPs;
++	usedFPs.reserve(res.capacity() * 3);
++	for (const auto& fpSet : allFPSets) {
++		if (Contains(usedFPs, fpSet.bl) || Contains(usedFPs, fpSet.tl) || Contains(usedFPs, fpSet.tr))
++			continue;
++
++		logFPSet(fpSet);
++		for (auto&& detectorResult : SampleQR(*binImg, fpSet)) {
++			auto decoderResult = Decode(detectorResult.bits());
++			if ((decoderResult.content().symbology.modifier == '0' && !opts.hasFormat(BarcodeFormat::QRCodeModel1))
++				|| (decoderResult.content().symbology.modifier == '1' && !opts.hasFormat(BarcodeFormat::QRCodeModel2)))
++				continue;
++			if (!decoderResult.isValid())
++				continue;
++
++			usedFPs.push_back(fpSet.bl);
++			usedFPs.push_back(fpSet.tl);
++			usedFPs.push_back(fpSet.tr);
++			auto content = std::move(decoderResult).content();
++			res.push_back(std::move(content.bytes));
++			break;
++		}
++		if (maxSymbols > 0 && Size(res) == maxSymbols)
++			break;
++	}
++	return res;
++}
++
+ } // namespace ZXing::QRCode

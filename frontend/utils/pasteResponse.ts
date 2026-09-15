@@ -1,6 +1,8 @@
 import type { MetaResponse } from "../../shared/interfaces.js"
 import { parseFilenameFromContentDisposition } from "../../shared/parsers.js"
 import type { EncryptionScheme } from "../../shared/constants.js"
+import { parseNonNegativeSafeInteger } from "../../shared/numbers.js"
+import { mimeEssence } from "../../shared/fileType.js"
 
 export interface ParsedPasteResponse {
   contentType: string | null
@@ -20,9 +22,7 @@ export function isMetaResponse(value: unknown): value is MetaResponse {
 }
 
 export function parseContentLength(value: string | null): number | null {
-  if (value === null) return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null
+  return parseNonNegativeSafeInteger(value)
 }
 
 export function stripEncryptedSuffix(filename: string | undefined): string | undefined {
@@ -50,7 +50,7 @@ export function parsePasteResponseHeaders(
     encryptionScheme,
     decryptedContentType,
     effectiveContentType,
-    mimeType: effectiveContentType?.split(";", 1)[0]?.trim() || "",
+    mimeType: mimeEssence(effectiveContentType ?? ""),
     contentDisposition,
     filename: encryptionScheme === null ? parsedFilename : stripEncryptedSuffix(parsedFilename),
     remainingReads: headers.get("X-PB-Remaining-Reads"),

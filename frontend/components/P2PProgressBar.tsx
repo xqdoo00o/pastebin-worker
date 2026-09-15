@@ -1,5 +1,5 @@
 import { formatSize, formatSpeed } from "../utils/utils.js"
-import type { P2PConnectionRoute, P2PProgress } from "../utils/p2pCommon.js"
+import type { P2PConnectionRoute, P2PProgress } from "../utils/p2p/protocol.js"
 import { DirectConnectionIcon, RelayConnectionIcon } from "./icons.js"
 
 interface P2PProgressBarProps {
@@ -104,18 +104,20 @@ export function P2PProgressBar({
               </span>
             )}
           </div>
-          {sizeLabel && <span className="shrink-0 text-xs text-foreground-500 tabular-nums">{sizeLabel}</span>}
+          {sizeLabel && <span className="shrink-0 text-xs text-default-500 tabular-nums">{sizeLabel}</span>}
         </div>
       )}
       <div className="relative h-8 w-full overflow-hidden rounded bg-default-200">
         <div className="h-full rounded bg-primary transition-[width] duration-300" style={{ width: `${percent}%` }} />
-        <span className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 select-none text-xs font-semibold text-white mix-blend-difference">
+        <span
+          className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 select-none text-xs font-semibold transition-colors duration-300 ${percent >= 50 ? "text-primary-foreground" : "text-foreground"}`}
+        >
           {percent}%
         </span>
       </div>
       {(showTransferStats || reserveTransferStatsSpace) && (
         <div
-          className={`mt-2 flex items-center justify-between text-sm text-foreground-500 tabular-nums ${showTransferStats ? "visible" : "invisible"}`}
+          className={`mt-2 flex items-center justify-between text-sm text-default-500 tabular-nums ${showTransferStats ? "visible" : "invisible"}`}
         >
           <span>{formatSpeed(progress?.speedBytesPerSecond ?? 0)}</span>
           <span>{remainingTime(progress)}</span>

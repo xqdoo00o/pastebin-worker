@@ -6,7 +6,7 @@ This is a pastebin running on Cloudflare workers. Try it on [shz.al](https://shz
 
 **Features**:
 
-1. Share your paste with as short as 4 characters, or even customized URL.
+1. Share your paste with a short random URL.
 1. **Syntax highlighting** powered by highlight.js.
 1. Client-side encryption.
 1. Share **markdown** file with rendered HTML.
@@ -149,8 +149,8 @@ Passwords are hashed with Argon2id using a unique 16-byte random salt, 8192 KiB 
 lane. Generate each password hash by running `pnpm password`. Existing bcrypt, scrypt, and PBKDF2 hashes are not
 accepted.
 
-Building the Worker and generating hashes require Rust with the `wasm32-unknown-unknown` target. Install that target
-with `rustup target add wasm32-unknown-unknown`; `pnpm install` installs the pinned `wasm-pack` build tool.
+Building the Worker and generating hashes require the pinned Emscripten toolchain. Set it up with
+`pnpm setup:emscripten`; the Argon2 build is then handled by `pnpm ensure:argon2`.
 
 Now every access to POST request, and every access to static pages, requires an HTTP basic auth with the user-password pair listed above. For example:
 

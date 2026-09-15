@@ -125,34 +125,6 @@ describe("paste record body opening", () => {
 })
 
 describe("pasteNameAvailable", () => {
-  it("treats expired pastes as available so the same name can be reused", async () => {
-    const ctx = createExecutionContext()
-
-    vi.setSystemTime(new Date(2031, 0, 1))
-    const customName = "reusable"
-    await upload(ctx, { c: new Blob(["first"]), n: customName, e: "70" })
-
-    // re-uploading immediately should conflict
-    const conflictResp = await workerFetch(
-      ctx,
-      new Request(BASE_URL, {
-        method: "POST",
-        body: (() => {
-          const fd = new FormData()
-          fd.set("c", new Blob(["second"]))
-          fd.set("n", customName)
-          return fd
-        })(),
-      }),
-    )
-    expect(conflictResp.status).toStrictEqual(409)
-
-    // after the original has expired, the same name should become available again
-    vi.setSystemTime(new Date(2031, 0, 5))
-    const reuseResp = await upload(ctx, { c: new Blob(["second"]), n: customName, e: "70" })
-    expect(reuseResp.url.endsWith("/~" + customName)).toStrictEqual(true)
-  })
-
   it("retries generated names that are already active", async () => {
     const getWithMetadata = vi
       .fn()

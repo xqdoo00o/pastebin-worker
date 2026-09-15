@@ -1,7 +1,7 @@
 import { createExecutionContext, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { P2PRoom, getTurnIceServers, handleP2PUpdate, selfHostedTurnCredentialsCacheKey } from "../p2p.js"
-import { PASTE_NAME_LEN } from "../../shared/constants.js"
+import { PASTE_NAME_LEN, PRIVATE_PASTE_NAME_LEN } from "../../shared/constants.js"
 import type { P2PCreateResponse } from "../../shared/interfaces.js"
 import { workerFetch } from "./testUtils.js"
 
@@ -55,6 +55,20 @@ describe("P2P room creation", () => {
     const displayResponse = await workerFetch(createExecutionContext(), new Request(result.displayUrl))
     expect(displayResponse.status).toStrictEqual(200)
     expect(await displayResponse.text()).toContain(`<title>${env.INDEX_PAGE_TITLE} / ${result.name} (P2P)</title>`)
+  })
+
+  it("creates a long pairing URL when requested", async () => {
+    const response = await workerFetch(
+      createExecutionContext(),
+      new Request(`${env.DEPLOY_URL}/p2p/create`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isPrivate: true }),
+      }),
+    )
+
+    expect(response.status).toStrictEqual(200)
+    expect((await response.json<P2PCreateResponse>()).name).toHaveLength(PRIVATE_PASTE_NAME_LEN)
   })
 
   it("invalidates self-hosted TURN credentials when the shared secret changes", async () => {
@@ -512,6 +526,27 @@ describe("P2P room transfer limits", () => {
       .toStrictEqual({ type: "peer-reconnect-failed", peerId, retryToken })
   })
 
+  it("removes a receiver immediately when the page reports a clean leave", async () => {
+    const name = crypto.randomUUID()
+    const senderToken = "sender-token"
+    const stub = env.P2P_ROOM.get(env.P2P_ROOM.idFromName(name))
+    await stub.fetch("https://p2p-room/init", {
+      method: "POST",
+      body: JSON.stringify({ senderToken, expiresAt: Date.now() + 60_000, maxTransfers: 1 }),
+    })
+    const sender = await connect(stub, "sender", { token: senderToken })
+    const peerId = "00000000-0000-4000-8000-000000000025"
+    const receiver = await connect(stub, "receiver", { peerId })
+    sockets.push(sender.socket, receiver.socket)
+
+    receiver.socket.send(JSON.stringify({ type: "receiver-leave", resumable: false }))
+
+    await expect
+      .poll(() => sender.messages.find((message) => message.type === "peer-left" && message.peerId === peerId))
+      .toStrictEqual({ type: "peer-left", role: "receiver", peerId, resumable: false })
+    expect((await (await stub.fetch("https://p2p-room/status")).json()).hasReceiver).toStrictEqual(false)
+  })
+
   it("keeps the room recoverable while backgrounded signaling sockets reconnect", async () => {
     const name = crypto.randomUUID()
     const senderToken = "sender-token"
@@ -626,7 +661,7 @@ describe("P2P room transfer limits", () => {
     ).toHaveLength(0)
   })
 
-  it("keeps only checkpointed receiver IDs resumable and retires them after completion", async () => {
+  it("lets a completed receiver restore signaling during grace and retires it after the deadline", async () => {
     const name = crypto.randomUUID()
     const senderToken = "sender-token"
     const stub = env.P2P_ROOM.get(env.P2P_ROOM.idFromName(name))
@@ -677,12 +712,53 @@ describe("P2P room transfer limits", () => {
     })
     const displayResponse = await workerFetch(createExecutionContext(), new Request(`${env.DEPLOY_URL}/p/${name}`))
     expect(displayResponse.status).toStrictEqual(200)
+
+    resumed.socket.close()
+    await expect
+      .poll(
+        () =>
+          sender.messages.filter(
+            (message) => message.type === "peer-signaling-disconnected" && message.peerId === peerId,
+          ).length,
+      )
+      .toStrictEqual(2)
+    const recovered = await connect(stub, "receiver", { peerId })
+    sockets.push(recovered.socket)
+    await expect
+      .poll(
+        () => sender.messages.filter((message) => message.type === "peer-joined" && message.peerId === peerId).length,
+      )
+      .toStrictEqual(3)
+    expect(await (await stub.fetch("https://p2p-room/status")).json()).toMatchObject({
+      active: true,
+      joinable: false,
+    })
+
+    recovered.socket.close()
+    await expect
+      .poll(
+        () =>
+          sender.messages.filter(
+            (message) => message.type === "peer-signaling-disconnected" && message.peerId === peerId,
+          ).length,
+      )
+      .toStrictEqual(3)
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("receiverCleanupAt", { [peerId]: Date.now() - 1 })
+      await state.storage.setAlarm(Date.now() + 60_000)
+    })
+    expect(await runDurableObjectAlarm(stub)).toStrictEqual(true)
+
     const completedUrl = new URL("https://p2p-room/ws")
     completedUrl.searchParams.set("role", "receiver")
     completedUrl.searchParams.set("peerId", peerId)
     const completedResponse = await stub.fetch(new Request(completedUrl, { headers: { Upgrade: "websocket" } }))
-    expect(completedResponse.status).toStrictEqual(429)
-    resumed.socket.close()
+    const expired = collectSocket(completedResponse)
+    sockets.push(expired.socket)
+    await expect
+      .poll(() => expired.messages.some((message) => message.type === "receiver-reconnect-expired"))
+      .toStrictEqual(true)
+    await expect.poll(() => expired.socket.readyState).toStrictEqual(WebSocket.CLOSED)
   })
 
   it("allows a checkpointed receiver to reconnect after new receiver admission expires", async () => {

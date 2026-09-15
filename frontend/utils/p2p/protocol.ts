@@ -1,8 +1,16 @@
-import type { P2PCreateResponse, P2PUpdateResponse } from "../../../shared/interfaces.js"
+import type { OriginalFileInfo, P2PCreateResponse, P2PUpdateResponse } from "../../../shared/interfaces.js"
+import { isNonNegativeSafeInteger } from "../../../shared/numbers.js"
 import { parseP2PSignalMessage, type P2PSignalMessage } from "../../../shared/p2pSignal.js"
+import { isOriginalFileInfo } from "../../../shared/verify.js"
 
 export const verificationBlockSize = 4 * 1024 * 1024
+const verificationHashHexLength = 16
 export const maxP2PControlMessageLength = 1024 * 1024
+const verificationHashPattern = new RegExp(`^[a-f0-9]{${verificationHashHexLength}}$`, "i")
+
+export function isVerificationHash(value: unknown): value is string {
+  return typeof value === "string" && verificationHashPattern.test(value)
+}
 const maxP2PFileNameLength = 1024
 const maxP2PTypeLength = 256
 const maxP2PMessageTextLength = 2048
@@ -13,6 +21,8 @@ export interface P2PFileMeta {
   size: number
   type: string
   lastModified: number
+  senderBrowser: string
+  originalFiles?: OriginalFileInfo[]
   highlightLanguage?: string
   verifyTransfer: boolean
 }
@@ -31,6 +41,14 @@ export function isP2PFileMeta(value: unknown): value is P2PFileMeta {
     candidate.type.length <= maxP2PTypeLength &&
     typeof candidate.lastModified === "number" &&
     Number.isFinite(candidate.lastModified) &&
+    typeof candidate.senderBrowser === "string" &&
+    candidate.senderBrowser.length > 0 &&
+    candidate.senderBrowser.length <= 256 &&
+    (candidate.originalFiles === undefined ||
+      (Array.isArray(candidate.originalFiles) &&
+        candidate.originalFiles.every(
+          (file) => isOriginalFileInfo(file) && file.name.length <= maxP2PFileNameLength,
+        ))) &&
     typeof candidate.verifyTransfer === "boolean" &&
     (candidate.revision === undefined ||
       (typeof candidate.revision === "string" && candidate.revision.length > 0 && candidate.revision.length <= 128)) &&
@@ -104,6 +122,7 @@ export interface P2PSenderSession {
     verifyTransfer: boolean,
     highlightLanguage?: string,
     cleanup?: P2PFileCleanup,
+    originalFiles?: OriginalFileInfo[],
   ) => P2PSenderFileInfo
   close: () => void
 }
@@ -190,10 +209,6 @@ const receiverDataMessageTypes = new Set<DataMessage["type"]>([
   "received",
 ])
 
-function isSafeNonNegativeInteger(value: unknown): value is number {
-  return Number.isSafeInteger(value) && (value as number) >= 0
-}
-
 function hasValidRevision(message: Record<string, unknown>): boolean {
   return (
     message.revision === undefined ||
@@ -214,22 +229,22 @@ export function parseP2PDataMessage(raw: string, source: P2PDataMessageSource): 
       if (!isP2PFileMeta(message.meta)) throw new Error("Invalid P2P file metadata.")
       break
     case "download":
-      if (!isSafeNonNegativeInteger(message.offset)) throw new Error("Invalid P2P download offset.")
+      if (!isNonNegativeSafeInteger(message.offset)) throw new Error("Invalid P2P download offset.")
       break
     case "progress":
-      if (!isSafeNonNegativeInteger(message.doneBytes)) throw new Error("Invalid P2P progress.")
+      if (!isNonNegativeSafeInteger(message.doneBytes)) throw new Error("Invalid P2P progress.")
       break
     case "verification-start":
-      if (message.blockSize !== verificationBlockSize || !isSafeNonNegativeInteger(message.hashCount)) {
+      if (message.blockSize !== verificationBlockSize || !isNonNegativeSafeInteger(message.hashCount)) {
         throw new Error("Invalid P2P verification manifest header.")
       }
       break
     case "verification-chunk":
       if (
-        !isSafeNonNegativeInteger(message.startIndex) ||
+        !isNonNegativeSafeInteger(message.startIndex) ||
         !Array.isArray(message.hashes) ||
         message.hashes.length === 0 ||
-        !message.hashes.every((hash) => typeof hash === "string" && /^[a-f0-9]{40}$/i.test(hash))
+        !message.hashes.every(isVerificationHash)
       ) {
         throw new Error("Invalid P2P verification manifest chunk.")
       }
@@ -243,24 +258,24 @@ export function parseP2PDataMessage(raw: string, source: P2PDataMessageSource): 
         if (
           verification.blockSize !== verificationBlockSize ||
           !Array.isArray(verification.hashes) ||
-          !verification.hashes.every((hash) => typeof hash === "string" && /^[a-f0-9]{40}$/i.test(hash))
+          !verification.hashes.every(isVerificationHash)
         ) {
           throw new Error("Invalid P2P verification manifest.")
         }
       }
       break
     case "repair-request":
-      if (!Array.isArray(message.indices) || !message.indices.every(isSafeNonNegativeInteger)) {
+      if (!Array.isArray(message.indices) || !message.indices.every(isNonNegativeSafeInteger)) {
         throw new Error("Invalid P2P repair request.")
       }
       break
     case "repair-start":
-      if (!isSafeNonNegativeInteger(message.index) || !isSafeNonNegativeInteger(message.size)) {
+      if (!isNonNegativeSafeInteger(message.index) || !isNonNegativeSafeInteger(message.size)) {
         throw new Error("Invalid P2P repair block.")
       }
       break
     case "repair-end":
-      if (!isSafeNonNegativeInteger(message.index)) throw new Error("Invalid P2P repair block index.")
+      if (!isNonNegativeSafeInteger(message.index)) throw new Error("Invalid P2P repair block index.")
       break
     case "error":
       if (typeof message.message !== "string" || message.message.length > maxP2PMessageTextLength) {

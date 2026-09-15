@@ -110,7 +110,7 @@ describe("makeMarkdown sanitization", () => {
     expect(out).toContain("<td>")
   })
 
-  it("emits a line-number gutter with one span per line, surviving sanitization", () => {
+  it("emits a text-only line-number gutter, surviving sanitization", () => {
     const out = render("```js\nconst a = 1\nconst b = 2\nconst c = 3\n```")
     // outer wrapper present
     expect(out).toContain('<div class="code-block">')
@@ -118,14 +118,15 @@ describe("makeMarkdown sanitization", () => {
     expect(out).toMatch(/<span class="line-number-rows" aria-hidden="true">/)
     // language class still on the inner <code>
     expect(out).toContain('<code class="language-js">')
-    // 3 gutter cells for 3 lines (one empty <span></span> per line).
-    expect((out.match(/<span><\/span>/g) ?? []).length).toBe(3)
+    // One text node replaces a nested span for every source line.
+    expect(out).toContain('<span class="line-number-rows" aria-hidden="true">1\n2\n3</span>')
+    expect(out).not.toContain("<span></span>")
   })
 
   it("includes a gutter for fenced blocks with no language", () => {
     const out = render("```\nfirst\nsecond\n```")
     expect(out).toContain('<div class="code-block">')
-    expect(out).toMatch(/<span class="line-number-rows"[^>]*>(<span><\/span>){2}<\/span>/)
+    expect(out).toContain('<span class="line-number-rows" aria-hidden="true">1\n2</span>')
     expect(out).toMatch(/<pre><code>first\nsecond\n<\/code><\/pre>/)
   })
 

@@ -1,7 +1,7 @@
 {
   "extends": "../tsconfig.json",
   "compilerOptions": {
-    "types": ["vite/client", "../vite-env.d.ts", "@testing-library/jest-dom"]
+    "types": ["vite/client", "../vite-env.d.ts", "@testing-library/jest-dom", "node"]
   },
   "include": ["**/*.tsx", "**/*.ts", "../../worker-configuration.d.ts"]
 }

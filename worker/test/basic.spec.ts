@@ -27,17 +27,17 @@ describe("upload", () => {
 
     // check url
     const url: string = responseJson.url
-    expect(url.startsWith(BASE_URL))
+    expect(url.startsWith(BASE_URL)).toBe(true)
 
     // check name
     const name: string = url.slice(BASE_URL.length + 1)
     expect(name.length).toStrictEqual(PASTE_NAME_LEN)
-    expect(RAND_NAME_REGEX.test(name))
+    expect(RAND_NAME_REGEX.test(name)).toBe(true)
 
     // check manageUrl
     const manageUrl: string = responseJson.manageUrl
     expect(manageUrl).toBeDefined()
-    expect(manageUrl.startsWith(BASE_URL))
+    expect(manageUrl.startsWith(BASE_URL)).toBe(true)
     expect(manageUrl.slice(BASE_URL.length + 1, manageUrl.lastIndexOf(":"))).toStrictEqual(name)
 
     // check passwd

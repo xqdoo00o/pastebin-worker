@@ -1,229 +1,360 @@
-# HTTP API Reference
+# HTTP API reference
 
-## GET `/`
+All examples use `{{BASE_URL}}` as the deployment origin. Paste names are
+server-generated: 6 characters normally and 24 characters in private mode.
+Clients cannot request a custom name.
 
-Return the index page.
+Read-limited paste responses use `Cache-Control: no-store`. Other paste
+responses use `Cache-Control: public, no-cache, must-revalidate`, so caches may
+store them but must validate freshness before reuse. Unless noted otherwise,
+successful operations return `200`, errors are plain text, and the API permits
+cross-origin requests. A deployment may require HTTP Basic authentication for
+creation requests and its web UI; public paste reads remain unauthenticated.
 
-## **GET** `/<name>[.<ext>]` or `/<name>/<filename>`
+## Stored-paste API
 
-Fetch the paste with name `<name>`. By default, it will return the raw content of the paste.
+### `POST /`
 
-The `Content-Type` header is set to the mime type inferred from the filename of the paste, or `text/plain;charset=UTF-8` if no filename is present. If `<ext>` is given, the worker will infer mime-type from `<ext>` and change `Content-Type`. If the paste is uploaded with a filename, the worker will infer mime-type from the filename. This method accepts the following query string parameters:
+Create a paste from `multipart/form-data`. A normal request accepts at most
+5 MiB in each form part; use the [multipart-upload API](#multipart-upload-api)
+for larger content.
 
-The `Content-Disposition` header is set to `inline` by default. But can be overriden by `?a` query string. If the paste is uploaded with filename, or `<filename>` is set in given request URL, `Content-Disposition` is appended with `filename*` indicating the filename. If the paste is encrypted, the filename is appended with `.encrypted` suffix.
+Form fields:
 
-If the paste is encrypted, an `X-PB-Encryption-Scheme` header will be set to the encryption scheme. An `X-PB-Decrypted-Content-Type` header is also set to the mime type that the decrypted content would have (inferred from the same sources as `Content-Type` but ignoring the encryption-induced `application/octet-stream` fallback), so clients can decide how to render the plaintext without an extra round trip.
+- `c` — required string or file containing the stored bytes. A file part's
+  filename is saved as metadata.
+- `e` — optional expiration such as `300`, `30m`, `2h`, or `25d`. The unit is
+  seconds when omitted. The deployment default is `{{DEFAULT_EXPIRATION}}`;
+  values above `{{MAX_EXPIRATION}}` are clamped.
+- `s` — optional management password. It must be 8–128 characters with no
+  newline. A random 24-character password is generated when omitted.
+- `p` — optional flag; its presence selects a 24-character random name instead
+  of the normal 6-character name.
+- `reads` — optional non-negative integer maximum number of content reads.
+  `0` means unlimited. If omitted, the deployment default is used.
+- `lang` — optional syntax-highlighting language recorded for `/d/<name>` and
+  returned in `X-PB-Highlight-Language`.
+- `encryption-scheme` — optional client-defined encryption label. The server
+  stores the bytes unchanged and returns the label in
+  `X-PB-Encryption-Scheme`. Official clients use `AES-GCM-CHUNKED`.
+- `filenames` — optional JSON array describing files packed into the uploaded
+  object: `[ { "name": "path/file.txt", "sizeBytes": 123 } ]`. This is used
+  by the official clients for archive display.
+- `mimeType` — optional content hint. The accepted values are
+  `text/plain;charset=UTF-8` and `application/octet-stream`; official clients
+  use it for extensionless uploads.
 
-If the paste is uploaded with a `lang` parameter, an `X-PB-Highlight-Language` header will be set to the highlight language.
-
-- `?a=`: optional. Set `Content-Disposition` to `attachment` if present.
-
-- `?mime=<mime>`: optional. Specify the mime-type, suppressing the effect of `<ext>`. No effect if `lang` is specified (in which case the mime-type is always `text/html`).
-
-Examples: `GET /abcd?lang=js`, `GET /abcd?mime=application/json`.
-
-Raw pastes stored in R2 support a single HTTP byte range. A satisfiable `Range: bytes=...` request returns `206 Partial Content` with `Accept-Ranges`, `Content-Range`, and `Content-Length`; an unsatisfiable range returns `416`. `If-Range` may contain the current strong ETag or an HTTP date. Range requests are ignored for KV-backed pastes and for pastes with a read limit, because a segmented download must not consume multiple reads.
-
-A successful full response uses `200`; a successful range response uses `206`. Error responses include:
-
-- `404`: the paste of given name is not found.
-- `416`: the requested R2 byte range is unsatisfiable.
-- `500`: unexpected exception. You may report this to the author to give it a fix.
-
-## GET `/<name>:<passwd>`
-
-Return the web page to edit the paste of name `<name>` and password `<passwd>`.
-
-If error occurs, the worker returns status code different from `200`:
-
-- `404`: the paste of given name is not found.
-- `500`: unexpected exception. You may report this to the author to give it a fix.
-
-## GET `/u/<name>`
-
-Redirect to the URL recorded in the paste of name `<name>`.
-
-If error occurs, the worker returns status code different from `302`:
-
-- `404`: the paste of given name is not found.
-- `500`: unexpected exception. You may report this to the author to give it a fix.
-
-## **GET** `/d/<name>[.<ext>]` or `/d/<name>/<filename>`
-
-Return the web page that will display the content of the paste of name `<name>`. If the paste is encrypted, a key can be appended to the URL to decrypt the paste of name `<name>` in browser.
-
-If error occurs, the worker returns status code different from `200`:
-
-- `404`: the paste of given name is not found.
-- `500`: unexpected exception. You may report this to the author to give it a fix.
-
-## GET `/p/<name>`
-
-Return the receiver page for an active P2P room. The page remains renderable when the room has no free slot so that a receiver with a saved checkpoint can reconnect with its existing peer ID; admission is decided by the signaling connection.
-
-When supported by the browser, an in-progress receive is checkpointed to OPFS. Reopening or reloading the receiver page restores the last durable offset in a paused state and requires the receiver to explicitly resume it. Each browser tab also keeps a lightweight receiver peer ID in session storage independently of the checkpoint, so refreshing that tab reconnects as the same signaling peer even before any file data has been checkpointed. A terminal transfer result rotates the stored ID for the next session. Pausing enters a local pending state immediately, continues committing already in-flight ordered data until the sender acknowledges the pause, and then checkpoints the final received offset. If the peer connection is already unavailable, pausing is committed locally and synchronized after reconnection. Terminating immediately presents zero progress, clears the checkpoint and partial receive data, and discards further in-flight data while retaining a lightweight pending stop intent. The existing signaling and WebRTC connections are reused when possible, and a rebuilt peer connection repeats the stop handshake before another download starts in the same receiver session. A temporary signaling disconnect within the same open page does not close a healthy WebRTC data channel, so an active transfer continues without restarting. The signaling socket reconnects independently and then reconciles the existing peer, checkpoint, pairing, and completion state. Returning from a long background suspension replaces a potentially half-open signaling socket before synchronization. The server keeps a disconnected receiver's slot for a 30-second signaling grace period; receiver signaling retries extend beyond that grace period as a fallback when session storage is unavailable. After the grace period, only a checkpointed receiver remains resumable. Completing a transfer retires its peer ID while keeping the successful transfer counted.
-
-P2P checkpoints use the browser's default best-effort storage policy; the application does not request persistent-storage protection. Stale P2P temporary files older than 24 hours are removed the next time a P2P receiver initializes, and the browser may reclaim them earlier under storage pressure.
-
-If WebRTC fails while signaling is connected, the receiver requests a sender-driven peer rebuild after a short grace period. If WebRTC also fails while signaling is offline, recovery waits until both signaling endpoints are available instead of consuming the WebRTC retry window. If signaling becomes unavailable after WebRTC recovery has already started, pending recovery timers are cancelled and the deadline is reset; a complete new recovery window starts after signaling is ready again. Recovery attempts use bounded backoff while retaining the peer ID, selected file version, progress, and receiver storage. A stale negotiation cannot replace a newer one. If recovery cannot be completed within approximately 30 seconds of signaling availability, the transfer becomes paused and the receiver may explicitly resume to start a new recovery window.
-
-## GET `/m/<name>`
-
-Get the metadata of the paste of name `<name>`.
-
-If error occurs, the worker returns status code different from `200`:
-
-- `404`: the paste of given name is not found.
-- `500`: unexpected exception. You may report this to the author to give it a fix.
-
-The response body is a JSON object, for example:
+Example response:
 
 ```json
 {
-  "lastModifiedAt": "2025-05-05T10:33:06.114Z",
-  "createdAt": "2025-05-01T10:33:06.114Z",
-  "expireAt": "2025-05-08T10:33:06.114Z",
+  "url": "{{BASE_URL}}/BxWH2a",
+  "manageUrl": "{{BASE_URL}}/BxWH2a:w2eHqyZGc@CQzWLN=BiJiQxZ",
+  "expirationSeconds": 259200,
+  "lastModifiedAt": "2026-08-25T10:33:06.000Z",
+  "createdAt": "2026-08-25T10:33:06.000Z",
+  "expireAt": "2026-08-28T10:33:06.000Z",
   "sizeBytes": 4096,
   "location": "KV",
-  "filename": "a.jpg",
+  "remainingReads": 2,
+  "filename": "example.rs",
+  "filenames": [{ "name": "example.rs", "sizeBytes": 4096 }],
+  "mimeType": "application/octet-stream",
   "highlightLanguage": "rust",
   "encryptionScheme": "AES-GCM-CHUNKED"
 }
 ```
 
-Explanation of the fields:
+`url` is public. `manageUrl` is `url` followed by `:<password>` and is a secret
+owner credential. Metadata fields that do not apply are omitted. `location` is
+`KV` or `R2`; storage selection is transparent to clients.
 
-- `lastModifiedAt`: String. An ISO String representing the last modification time of the paste.
-- `expireAt`: String. An ISO String representing when the paste will expire.
-- `createdAt`: String. An ISO String representing when the paste was created.
-- `sizeBytes`: Integer. The size of the content of the paste in bytes.
-- `filename`: Optional string. The file name of the paste.
-- `location`: String, either "KV" or "R2". Representing whether the paste content is stored in Cloudflare KV storage or R2 object storage.
-- `highlightLanguage`: Optional string. The syntax highlighting language uploaded with the `lang` form field.
-- `encryptionScheme`: Optional string. The official clients currently use `AES-GCM-CHUNKED`: a 32-byte header followed by independently authenticated 5 MiB AES-GCM chunks. The encryption scheme used to encrypt the paste.
+Errors include `400` for invalid forms/options, `401` when deployment Basic
+Auth fails, `413` when a direct form part exceeds 5 MiB, and `503` when an
+unused random name cannot be allocated.
 
-## GET `/a/<name>`
+### `GET /<name>[.<ext>]`
 
-Return the HTML converted from the markdown file stored in the paste of name `<name>`. The markdown conversion follows GitHub Flavored Markdown (GFM) Spec, supported by [remark-gfm](https://github.com/remarkjs/remark-gfm).
+### `GET /<name>/<filename>`
 
-Syntax highlighting is supported by [prism.js](https://prismjs.com/). LaTeX mathematics is supported by [MathJax](https://www.mathjax.org).
+Return the raw stored bytes. `.<ext>` overrides MIME inference; `/<filename>`
+overrides both MIME inference and the response filename. Neither form changes
+stored metadata.
 
-If error occurs, the worker returns status code different from `200`:
+Query parameters:
 
-- `404`: the paste of given name is not found.
-- `500`: unexpected exception. You may report this to the author to give it a fix.
+- `a` — its presence changes `Content-Disposition` from `inline` to
+  `attachment`.
+- `mime=<type>` — highest-priority response MIME override.
 
-Usage example:
+MIME inference priority is `?mime`, requested extension/filename, stored
+filename, uploaded `mimeType`, then `text/plain;charset=UTF-8`. HTML, SVG, XML,
+multipart content, and deployment-configured disallowed MIME types are served
+as plain text to prevent active content execution.
 
-```md
-# Header 1
+Response headers can include:
 
-This is the content of `test.md`
+- `Content-Disposition`, with an RFC 5987 `filename*` when a filename is known.
+- `Content-Length` and `Last-Modified`.
+- `ETag` for an opened R2 object.
+- `X-PB-Highlight-Language` when `lang` metadata exists.
+- `X-PB-Encryption-Scheme` and `X-PB-Decrypted-Content-Type` for encrypted
+  content. With no path/MIME override, ciphertext uses
+  `application/octet-stream` and a stored filename gains `.encrypted`.
+- `X-PB-Remaining-Reads` for a read-limited paste. It reports the count at the
+  start of this successful read; the next read sees one fewer.
 
-<script>
-alert("Script should be removed")
-</script>
+A valid `If-Modified-Since` at or after the paste's last modification returns
+`304`. Invalid dates are ignored.
 
-## Header 2
+R2-backed pastes without a read limit accept a single byte range. Valid
+`Range: bytes=...` requests return `206` with `Accept-Ranges`, `Content-Range`,
+and `Content-Length`; unsatisfiable ranges return `416`. `If-Range` accepts the
+current strong ETag or an HTTP date. Multiple/malformed ranges, ranges for KV
+pastes, and ranges for read-limited pastes are ignored and receive the full
+`200` response.
 
-| abc | defghi |
-| :-: | -----: |
-| bar |    baz |
+`404` means the paste is absent, expired, or has exhausted its read limit.
 
-**Bold**, `Monospace`, _Italics_, ~~Strikethrough~~, [URL](https://github.com)
+### `HEAD /<name>[.<ext>]`
 
-- A
-- A1
-- A2
-- B
+Return raw-paste headers without the body and without consuming a limited
+read. R2 responses advertise `Accept-Ranges`, but a `Range` header on `HEAD`
+does not create a partial response. `HEAD` also works on the other `GET`
+routes, although generated HTML routes may not have the raw paste's length.
 
-![Panty](https://shz.al/~panty.jpg)
+### `GET /m/<name>`
 
-1. first
-2. second
-
-> Quotation
-
-$$
-\int_{-\infty}^{\infty} e^{-x^2} = \sqrt{\pi}
-$$
-```
-
-## **HEAD** `/*`
-
-Request a paste without returning the body. It accepts same parameters as all `GET` requests, and returns the same `Content-Type`, `Content-Disposition`, `Content-Length` and cache control headers with the corresponding `GET` request. Note that the `Content-Length` with `/a/<name>`, `?lang=<lang>` is the length of the paste instead of the length of the actual HTML page.
-
-## **POST** `/`
-
-Upload your paste. It accept parameters in form-data:
-
-- `c`: mandatory. The **content** of your paste, text or binary. The maximum allowed size is set by the deployment (`R2_MAX_ALLOWED`). The `filename` in its `Content-Disposition` will be present when fetching the paste. Note that a single Cloudflare Workers request body is capped at 100 MB — request bodies larger than that are rejected by the platform with HTTP `413 Payload Too Large` before the worker is invoked. For larger files, use the official web UI at `/` or the [`pb`](https://github.com/SharzyL/pastebin-worker/tree/goshujin/scripts) CLI, which transparently chunk the content via the multipart-upload endpoints.
-
-- `e`: optional. The **expiration** time of the paste. After this period of time, the paste is permanently deleted. It should be an integer or a float point number suffixed with an optional unit (seconds by default). Supported units: `s` (seconds), `m` (minutes), `h` (hours), `d` (days). For example, `360.25` means 360.25 seconds, and `25d` means 25 days. The actual expiration might be shorter than specified expiration due to limitations imposed by the administrator. If unspecified, a default expiration time setting is used.
-
-- `s`: optional. The **password** which allows you to modify and delete the paste. If not specified, the worker will generate a random string as password.
-
-- `n`: optional. The customized **name** of your paste. If not specified, the worker will generate a random string (4 characters by default) as the name. You need to prefix the name with `~` when fetching the paste of customized name. The name is at least 3 characters long, consisting of alphabet, digits and characters in `+_-[]*$=@,;/`.
-
-- `p`: optional. The flag of **private mode**. If specified to any value, the name of the paste is as long as 24 characters. No effect if `n` is used.
-
-- `encryption-scheme`: optional. The encryption scheme used in the uploaded paste. Official clients use `AES-GCM-CHUNKED`. It will be returned as `X-PB-Encryption-Scheme` on fetching the paste. The backend stores the ciphertext as-is and does not perform encryption or decryption.
-
-- `lang`: optional. The language of the uploaded paste for syntax highlighting. Should be a lower-case name of language listed in [highlight.js documentation](https://github.com/highlightjs/highlight.js/blob/main/SUPPORTED_LANGUAGES.md). This will be returned as `X-PB-Highlight-Language` header on fetching paste.
-
-`POST` method returns a JSON string by default, if no error occurs, for example:
+Return live paste metadata as JSON without consuming a limited read:
 
 ```json
 {
-  "url": "https://shz.al/abcd",
-  "manageUrl": "https://shz.al/abcd:w2eHqyZGc@CQzWLN=BiJiQxZ",
-  "expirationSeconds": 1209600,
-  "lastModifiedAt": "2025-05-01T10:33:06.114Z",
-  "createdAt": "2025-05-01T10:33:06.114Z",
-  "expireAt": "2025-05-05T10:33:06.114Z",
+  "lastModifiedAt": "2026-08-25T10:33:06.000Z",
+  "createdAt": "2026-08-25T10:33:06.000Z",
+  "expireAt": "2026-08-28T10:33:06.000Z",
   "sizeBytes": 4096,
-  "location": "KV",
-  "filename": "a.jpg",
+  "location": "R2",
+  "remainingReads": 1,
+  "filename": "example.rs",
+  "filenames": [{ "name": "example.rs", "sizeBytes": 4096 }],
+  "mimeType": "application/octet-stream",
   "highlightLanguage": "rust",
   "encryptionScheme": "AES-GCM-CHUNKED"
 }
 ```
 
-Explanation of the fields:
+`lastModifiedAt`, `createdAt`, and `expireAt` are ISO 8601 strings;
+`sizeBytes` is the stored byte length. Optional fields are omitted when unset.
+Official `AES-GCM-CHUNKED` ciphertext starts with a 24-byte `PBE2` header and
+uses independently authenticated AES-GCM chunks whose serialized non-final
+size is 5 MiB. The decryption key is client-side data and is never returned by
+this endpoint.
 
-- `url`: String. The URL to fetch the paste. When using a customized name, it looks like `https://shz.al/~myname`.
-- `manageUrl`: String. The URL to update and delete the paste, which is `url` suffixed by `:` and the password.
-- `expirationSeconds`: Number. The expiration seconds.
+### `GET /d/<name>[.<ext>]`
 
-The remaining fields mirror the [`GET /m/<name>`](#get-mname) metadata response: `lastModifiedAt`, `createdAt`, `expireAt`, `sizeBytes`, `location`, and the optional `filename`, `highlightLanguage`, `encryptionScheme`.
+### `GET /d/<name>/<filename>`
 
-If error occurs, the worker returns status code different from `200`:
+Return the browser display page. `?lang=<language>` overrides the stored
+highlight language for display. Plain content may be server-rendered; binary,
+archive, or encrypted content is handled by the browser client. For official
+client-side encryption, append the decryption key as a URL fragment:
+`/d/<name>#<key>`. Fragments are not sent to the server.
 
-- `400`: your request is in bad format.
-- `409`: the name is already used.
-- `413`: the request body exceeds Cloudflare's 100 MB per-request cap (returned by the platform before the worker runs), or the content exceeds the deployment's `R2_MAX_ALLOWED`.
-- `500`: unexpected exception. You may report this to the author to give it a fix.
+A display that loads paste content consumes one limited read.
 
-## **PUT** `/<name>:<passwd>`
+### `GET /a/<name>`
 
-Update your paste of the name `<name>` and password `<passwd>`. It accepts all the same form-data fields as `POST` (`c`, `e`, `s`, `lang`, `encryption-scheme`) **except** `n` (the name cannot be changed; supplying it returns `400`) and `p` (silently ignored). When `e` is supplied, the expiration is recalculated from the update time.
+Render the paste as sanitized HTML using GitHub-flavored Markdown, highlight.js
+syntax highlighting, and MathJax. A successful request consumes one limited
+read.
 
-The returning of `PUT` method is the same as `POST` method.
+### `GET /u/<name>`
 
-If error occurs, the worker returns status code different from `200`:
+Interpret the paste as a URL and return `302` to that URL. The content must be
+a parseable URL no longer than 2,000 bytes. Reading the body through this route
+consumes one limited read, even if URL validation then fails. Invalid or
+oversized URL content returns `400`.
 
-- `400`: your request is in bad format.
-- `403`: your password is not correct.
-- `404`: the paste of given name is not found.
-- `413`: the request body exceeds Cloudflare's 100 MB per-request cap (returned by the platform before the worker runs), or the content exceeds the deployment's `R2_MAX_ALLOWED`.
-- `500`: unexpected exception. You may report this to the author to give it a fix.
+### `GET /<name>:<password>`
 
-## DELETE `/<name>:<passwd>`
+Return the browser editor shell for a management URL. The page uses the
+password-bearing URL to load and update the paste; the shell itself does not
+validate that the paste exists. Treat this URL as a secret.
 
-Delete the paste of name `<name>` and password `<passwd>`. It may take seconds to synchronize the deletion globally.
+### `PUT /<name>:<password>`
 
-If error occurs, the worker returns status code different from `200`:
+Replace a paste. The request is `multipart/form-data`, requires `c`, and has
+the same 5 MiB direct-content limit as `POST /`. It accepts `e`, `s`, `reads`,
+`lang`, `encryption-scheme`, `filenames`, and `mimeType`; `p` has no effect.
 
-- `403`: your password is not correct.
-- `404`: the paste of given name is not found.
-- `500`: unexpected exception. You may report this to the author to give it a fix.
+All supplied metadata describes the replacement. Omitting `s` retains the old
+password; omitting `e` or `reads` applies the corresponding deployment default;
+other omitted metadata is cleared. Expiration starts again at update time. The
+response has the same shape as `POST /`; always retain its `manageUrl` in case
+the password changed.
+
+Errors include `403` for a missing/wrong password, `404` for a missing paste,
+and `413` when the direct content exceeds 5 MiB.
+
+### `DELETE /<name>:<password>`
+
+Delete a paste. A successful response says `the paste will be deleted in
+seconds`; propagation can take a few seconds. A wrong password returns `403`
+and a missing paste returns `404`.
+
+## Multipart-upload API
+
+The web UI and official [`pb`]({{REPO}}/tree/goshujin/scripts) client use R2
+multipart upload for content above 5 MiB. Each non-final data part is 5 MiB.
+The completed object may not exceed this deployment's `{{R2_MAX_ALLOWED}}`
+limit. `key` and `uploadId` together are sensitive upload credentials.
+
+### `POST /mpu/create[?p=1&e=<expire>]`
+
+Allocate a random paste name and R2 multipart upload. `p` selects the
+24-character private name. `e` is used for abandoned-object cleanup; send the
+same expiration again on completion.
+
+```json
+{
+  "name": "BxWH2a",
+  "key": "BxWH2a",
+  "uploadId": "..."
+}
+```
+
+### `POST /mpu/create-update?name=<name>&password=<password>[&e=<expire>]`
+
+Authenticate an existing paste and start a replacement multipart upload.
+Returns the same object as `/mpu/create`. Errors are `403` for a wrong password
+and `404` for a missing paste.
+
+### `PUT /mpu/resume?key=<key>&uploadId=<id>&partNumber=<n>`
+
+Upload one raw binary part. Part numbers start at 1. The response is R2's
+uploaded-part descriptor:
+
+```json
+{ "partNumber": 1, "etag": "..." }
+```
+
+An expired, aborted, or already-completed upload returns `410`; restart from a
+create endpoint.
+
+### `POST|PUT /mpu/complete?name=<name>&key=<key>&uploadId=<id>`
+
+Complete a new upload with `POST`, or an update created by
+`/mpu/create-update` with `PUT`. Send `multipart/form-data`: `c` is a file part
+containing the JSON array of uploaded-part descriptors, in order. The other
+form fields are the same metadata fields accepted by normal creation/update.
+The filename on `c` becomes the stored filename, so clients should use the
+original/prepared content filename rather than `parts.json`.
+
+The response is the normal paste JSON and includes an R2 `ETag` header. An
+object above `{{R2_MAX_ALLOWED}}` returns `413` and is deleted best-effort.
+Invalid or stale multipart state returns `410`.
+
+### `POST /mpu/abort?key=<key>&uploadId=<id>`
+
+Release an unfinished multipart upload. The operation is idempotent and
+returns `204`, including when the upload is already absent.
+
+## P2P API
+
+P2P transfers use HTTP only for room management and WebSocket signaling; file
+bytes travel over WebRTC (or a configured TURN relay) and are not stored in KV
+or R2.
+
+### `POST /p2p/create`
+
+Create a room. Prefer a JSON body:
+
+```json
+{
+  "expire": "6h",
+  "maxTransfers": 2,
+  "isPrivate": false
+}
+```
+
+`expire` defaults to the deployment's P2P default and may not exceed its P2P
+maximum. `maxTransfers` is a non-negative integer; `0` means unlimited.
+`isPrivate: true` selects a 24-character name. For compatibility, `expire` and
+`maxTransfers` may instead be query parameters; if either is present, the JSON
+body is ignored.
+
+```json
+{
+  "name": "BxWH2a",
+  "url": "{{BASE_URL}}/p/BxWH2a",
+  "displayUrl": "{{BASE_URL}}/p/BxWH2a",
+  "senderToken": "...",
+  "expireAt": "2026-08-25T16:33:06.000Z",
+  "expirationSeconds": 21600
+}
+```
+
+The `senderToken` controls the sender signaling connection and room updates;
+keep it secret. Invalid options return `400`; allocation failure returns
+`503`.
+
+### `POST /p2p/update/<name>`
+
+Replace a room's expiration window and receiver limit:
+
+```json
+{
+  "senderToken": "...",
+  "expire": "6h",
+  "maxTransfers": 2
+}
+```
+
+The response contains `expireAt`, `expirationSeconds`, `maxTransfers`,
+`joinable`, `pairedReceivers`, and `successfulReceivers`. A sender token that
+is invalid or no longer belongs to an active room returns `403`.
+
+### `GET /p/<name>`
+
+Return the browser receiver page for an active room. An expired/missing room
+returns `410`. Room capacity is enforced when signaling connects, so the page
+can still render for a checkpointed receiver when no new slot is available.
+
+The receiver stores resumable progress in OPFS when available. Storage is
+best-effort; stale temporary data older than 24 hours is removed on receiver
+initialization and the browser may reclaim it earlier. A disconnected receiver
+keeps its signaling slot for 30 seconds; checkpointed receivers can resume
+after that grace period.
+
+### `GET /p2p/ws/<name>` (WebSocket upgrade)
+
+Connect the sender with
+`?role=sender&token=<senderToken>`. Connect a receiver with
+`?role=receiver&peerId=<uuid>`; the peer ID enables reconnect/checkpoint
+semantics. A non-WebSocket request returns `426`, invalid roles return `400`,
+invalid sender tokens return `403`, expired rooms return `410`, and receiver
+admission failures return `429`.
+
+Signaling messages are JSON and carry readiness, peer presence, SDP offers and
+answers, ICE candidates, checkpoint/abandon state, room-option updates, and
+ping/pong heartbeats. The official browser client is the reference
+implementation; signaling alone does not carry file bytes.
+
+## Web and documentation routes
+
+- `GET /` — browser UI. With a `curl/*` user agent, returns the concise Markdown
+  index instead.
+- `GET /index.md` — concise Markdown index for any user agent.
+- `GET /doc/{api,curl,skill,tos}` — rendered HTML for browsers, raw Markdown
+  for `curl/*` user agents.
+- `GET /doc/{api,curl,skill,tos}.md` — raw Markdown for every user agent.
+- `GET /qr-receiver[/]` — QR transfer receiver supporting camera, screen
+  capture, and exported APNG input. QR transfer is offline after page assets
+  load and does not create a paste or P2P room.
+
+## `OPTIONS /*` and unsupported methods
+
+CORS preflight returns `Access-Control-Allow-Origin: *`, allows
+`GET, HEAD, PUT, POST, OPTIONS`, accepts requested headers, and caches the
+preflight for 86,400 seconds. A non-preflight `OPTIONS` returns the `Allow`
+header, including `DELETE`. Other methods return `405`.

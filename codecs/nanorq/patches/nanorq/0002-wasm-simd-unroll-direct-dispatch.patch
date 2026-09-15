@@ -1,0 +1,372 @@
+diff --git a/deps/obl/oblas_lite.c b/deps/obl/oblas_lite.c
+index 0e3d1bf..7ec8e71 100644
+--- a/deps/obl/oblas_lite.c
++++ b/deps/obl/oblas_lite.c
+@@ -445,64 +445,110 @@ static void obl_scal_ref_wrapper(u8 *a, u8 u, unsigned k)
+ #if defined(__wasm_simd128__)
+ /* WebAssembly SIMD implementation of the same nibble-table GF(256)
+  * multiplication used by the upstream SSSE3 and NEON paths. */
+-static inline v128_t obl_wasm_mul(v128_t value, u8 u)
+-{
+-    const v128_t low_table = wasm_v128_load(GF2_8_SHUF_LO + ((unsigned)u * 16));
+-    const v128_t high_table = wasm_v128_load(GF2_8_SHUF_HI + ((unsigned)u * 16));
+-    const v128_t mask = wasm_i8x16_splat(0x0f);
+-    const v128_t low = wasm_v128_and(value, mask);
+-    const v128_t high = wasm_v128_and(wasm_u8x16_shr(value, 4), mask);
++static inline v128_t obl_wasm_mul(v128_t value, v128_t low_table, v128_t high_table)
++{
++    const v128_t mask = wasm_i8x16_splat(0x0f);
++    const v128_t low = wasm_v128_and(value, mask);
++    const v128_t high = wasm_v128_and(wasm_u8x16_shr(value, 4), mask);
+     return wasm_v128_xor(wasm_i8x16_swizzle(low_table, low),
+-                         wasm_i8x16_swizzle(high_table, high));
+-}
+-
+-static void obl_axpy_wasm(u8 *restrict a, u8 *restrict b, u8 u, unsigned k)
+-{
+-    unsigned offset = 0;
+-    if (u == 1) {
+-        for (; offset + 16 <= k; offset += 16) {
+-            wasm_v128_store(a + offset,
+-                            wasm_v128_xor(wasm_v128_load(a + offset),
+-                                          wasm_v128_load(b + offset)));
+-        }
+-    } else {
+-        for (; offset + 16 <= k; offset += 16) {
+-            const v128_t product = obl_wasm_mul(wasm_v128_load(b + offset), u);
+-            wasm_v128_store(a + offset,
+-                            wasm_v128_xor(wasm_v128_load(a + offset), product));
+-        }
+-    }
+-    obl_axpy_ref(a + offset, b + offset, u, k - offset);
+-}
+-
+-static void obl_axiy_wasm(u8 *a, u8 *b, u8 u, unsigned k)
+-{
+-    unsigned offset = 0;
++                         wasm_i8x16_swizzle(high_table, high));
++}
++
++static inline void obl_wasm_xor16(u8 *restrict a, const u8 *restrict b)
++{
++    wasm_v128_store(a, wasm_v128_xor(wasm_v128_load(a), wasm_v128_load(b)));
++}
++
++static inline void obl_wasm_axpy16(u8 *restrict a, const u8 *restrict b,
++                                   v128_t low_table, v128_t high_table)
++{
++    const v128_t product = obl_wasm_mul(wasm_v128_load(b), low_table, high_table);
++    wasm_v128_store(a, wasm_v128_xor(wasm_v128_load(a), product));
++}
++
++void obl_axpy_wasm(u8 *restrict a, u8 *restrict b, u8 u, unsigned k)
++{
++    unsigned offset = 0;
++    if (u == 1) {
++        for (; offset + 64 <= k; offset += 64) {
++            obl_wasm_xor16(a + offset, b + offset);
++            obl_wasm_xor16(a + offset + 16, b + offset + 16);
++            obl_wasm_xor16(a + offset + 32, b + offset + 32);
++            obl_wasm_xor16(a + offset + 48, b + offset + 48);
++        }
++        for (; offset + 16 <= k; offset += 16)
++            obl_wasm_xor16(a + offset, b + offset);
++    } else {
++        const v128_t low_table = wasm_v128_load(GF2_8_SHUF_LO + ((unsigned)u * 16));
++        const v128_t high_table = wasm_v128_load(GF2_8_SHUF_HI + ((unsigned)u * 16));
++        for (; offset + 64 <= k; offset += 64) {
++            obl_wasm_axpy16(a + offset, b + offset, low_table, high_table);
++            obl_wasm_axpy16(a + offset + 16, b + offset + 16, low_table, high_table);
++            obl_wasm_axpy16(a + offset + 32, b + offset + 32, low_table, high_table);
++            obl_wasm_axpy16(a + offset + 48, b + offset + 48, low_table, high_table);
++        }
++        for (; offset + 16 <= k; offset += 16)
++            obl_wasm_axpy16(a + offset, b + offset, low_table, high_table);
++    }
++    obl_axpy_ref(a + offset, b + offset, u, k - offset);
++}
++
++static inline void obl_wasm_axiy16(u8 *a, const u8 *b, v128_t low_table, v128_t high_table)
++{
++    wasm_v128_store(a, obl_wasm_mul(wasm_v128_load(b), low_table, high_table));
++}
++
++void obl_axiy_wasm(u8 *a, u8 *b, u8 u, unsigned k)
++{
++    unsigned offset = 0;
+     if (u == 0) {
+         memset(a, 0, k);
+         return;
+     }
+     if (u == 1) {
+-        if (a != b)
+-            memcpy(a, b, k);
+-        return;
+-    }
+-    for (; offset + 16 <= k; offset += 16)
+-        wasm_v128_store(a + offset,
+-                        obl_wasm_mul(wasm_v128_load(b + offset), u));
+-    obl_axiy_ref(a + offset, b + offset, u, k - offset);
+-}
+-
+-static void obl_scal_wasm(u8 *a, u8 u, unsigned k)
+-{
+-    obl_axiy_wasm(a, a, u, k);
+-}
++        if (a != b)
++            memcpy(a, b, k);
++        return;
++    }
++    const v128_t low_table = wasm_v128_load(GF2_8_SHUF_LO + ((unsigned)u * 16));
++    const v128_t high_table = wasm_v128_load(GF2_8_SHUF_HI + ((unsigned)u * 16));
++    for (; offset + 64 <= k; offset += 64) {
++        obl_wasm_axiy16(a + offset, b + offset, low_table, high_table);
++        obl_wasm_axiy16(a + offset + 16, b + offset + 16, low_table, high_table);
++        obl_wasm_axiy16(a + offset + 32, b + offset + 32, low_table, high_table);
++        obl_wasm_axiy16(a + offset + 48, b + offset + 48, low_table, high_table);
++    }
++    for (; offset + 16 <= k; offset += 16)
++        obl_wasm_axiy16(a + offset, b + offset, low_table, high_table);
++    obl_axiy_ref(a + offset, b + offset, u, k - offset);
++}
++
++void obl_scal_wasm(u8 *a, u8 u, unsigned k)
++{
++    obl_axiy_wasm(a, a, u, k);
++}
+ 
+ /* Expand each packed GF(2) bit to either zero or u, then XOR it into the
+  * corresponding GF(256) byte. This mirrors the upstream SSSE3 and NEON
+  * kernels and handles 32 coefficients with two SIMD lanes. */
+-static void obl_axpyb32_wasm(u8 *a, u32 *b, u8 u, unsigned k)
+-{
++static inline void obl_wasm_axpyb32_word(u8 *a, const u32 *b,
++                                         v128_t scatter_lo, v128_t scatter_hi,
++                                         v128_t bit_mask, v128_t zero,
++                                         v128_t coefficient)
++{
++    const v128_t packed = wasm_v128_load32_splat(b);
++    const v128_t low = wasm_v128_and(
++        wasm_i8x16_ne(wasm_v128_and(wasm_i8x16_swizzle(packed, scatter_lo), bit_mask), zero),
++        coefficient);
++    const v128_t high = wasm_v128_and(
++        wasm_i8x16_ne(wasm_v128_and(wasm_i8x16_swizzle(packed, scatter_hi), bit_mask), zero),
++        coefficient);
++    wasm_v128_store(a, wasm_v128_xor(wasm_v128_load(a), low));
++    wasm_v128_store(a + 16, wasm_v128_xor(wasm_v128_load(a + 16), high));
++}
++
++void obl_axpyb32_wasm(u8 *a, u32 *b, u8 u, unsigned k)
++{
+     const v128_t scatter_lo = wasm_i8x16_const(0, 0, 0, 0, 0, 0, 0, 0,
+                                                1, 1, 1, 1, 1, 1, 1, 1);
+     const v128_t scatter_hi = wasm_i8x16_const(2, 2, 2, 2, 2, 2, 2, 2,
+@@ -513,24 +559,19 @@ static void obl_axpyb32_wasm(u8 *a, u32 *b, u8 u, unsigned k)
+                                              0x10, 0x20, 0x40, (int8_t)0x80);
+     const v128_t zero = wasm_i8x16_splat(0);
+     const v128_t coefficient = wasm_i8x16_splat(u);
+-    unsigned offset = 0;
+-    unsigned word = 0;
+-
+-    for (; offset + 32 <= k; offset += 32, word++) {
+-        const v128_t packed = wasm_v128_load32_splat(b + word);
+-        const v128_t low = wasm_v128_and(
+-            wasm_i8x16_ne(wasm_v128_and(wasm_i8x16_swizzle(packed, scatter_lo), bit_mask), zero),
+-            coefficient);
+-        const v128_t high = wasm_v128_and(
+-            wasm_i8x16_ne(wasm_v128_and(wasm_i8x16_swizzle(packed, scatter_hi), bit_mask), zero),
+-            coefficient);
+-        wasm_v128_store(a + offset,
+-                        wasm_v128_xor(wasm_v128_load(a + offset), low));
+-        wasm_v128_store(a + offset + 16,
+-                        wasm_v128_xor(wasm_v128_load(a + offset + 16), high));
+-    }
+-    obl_axpyb32_ref(a + offset, b + word, u, k - offset);
+-}
++    unsigned offset = 0;
++    unsigned word = 0;
++
++    for (; offset + 128 <= k; offset += 128, word += 4) {
++        obl_wasm_axpyb32_word(a + offset, b + word, scatter_lo, scatter_hi, bit_mask, zero, coefficient);
++        obl_wasm_axpyb32_word(a + offset + 32, b + word + 1, scatter_lo, scatter_hi, bit_mask, zero, coefficient);
++        obl_wasm_axpyb32_word(a + offset + 64, b + word + 2, scatter_lo, scatter_hi, bit_mask, zero, coefficient);
++        obl_wasm_axpyb32_word(a + offset + 96, b + word + 3, scatter_lo, scatter_hi, bit_mask, zero, coefficient);
++    }
++    for (; offset + 32 <= k; offset += 32, word++)
++        obl_wasm_axpyb32_word(a + offset, b + word, scatter_lo, scatter_hi, bit_mask, zero, coefficient);
++    obl_axpyb32_ref(a + offset, b + word, u, k - offset);
++}
+ #endif
+ 
+ #ifdef _MSC_VER
+diff --git a/deps/obl/oblas_lite.h b/deps/obl/oblas_lite.h
+index 6e881f9..2ce4a60 100644
+--- a/deps/obl/oblas_lite.h
++++ b/deps/obl/oblas_lite.h
+@@ -19,7 +19,14 @@ struct oblas_impl {
+     size_t align_size;
+ };
+ 
+-void oblas_get_impl(struct oblas_impl *impl);
++void oblas_get_impl(struct oblas_impl *impl);
++
++#if defined(__wasm_simd128__)
++void obl_axpy_wasm(uint8_t *a, uint8_t *b, uint8_t u, unsigned k);
++void obl_scal_wasm(uint8_t *a, uint8_t u, unsigned k);
++void obl_axiy_wasm(uint8_t *a, uint8_t *b, uint8_t u, unsigned k);
++void obl_axpyb32_wasm(uint8_t *a, uint32_t *b, uint8_t u, unsigned k);
++#endif
+ 
+ typedef uint8_t u8;
+ typedef uint16_t u16;
+diff --git a/lib/ops.c b/lib/ops.c
+index 90a03aa..ebda9e4 100644
+--- a/lib/ops.c
++++ b/lib/ops.c
+@@ -1,46 +1,52 @@
+-#include "nanorq_ops.h"
+-
+-static void ops_apply_schedule(uint8_t *D, uint32_t stride, schedule *S) {
+-  sched_op *ops = S->ops.a;
+-  void (*axpy)(uint8_t *, uint8_t *, uint8_t, uint32_t) = nanorq_oblas.axpy;
+-  void (*scal)(uint8_t *, uint8_t, uint32_t) = nanorq_oblas.scal;
++#include "nanorq_ops.h"
++
++#if defined(__wasm_simd128__)
++#define OPS_AXPY obl_axpy_wasm
++#define OPS_SCAL obl_scal_wasm
++#else
++#define OPS_AXPY nanorq_oblas.axpy
++#define OPS_SCAL nanorq_oblas.scal
++#endif
++
++static void ops_apply_schedule(uint8_t *D, uint32_t stride, schedule *S) {
++  sched_op *ops = S->ops.a;
+ 
+   /* forward ge */
+   for (u32 idx = 0; idx < S->cp[1]; idx++) {
+-    sched_op op = ops[idx];
+-    if (op.u)
+-      axpy(D + op.i * stride, D + op.j * stride, op.u, stride);
+-    else
+-      scal(D + op.i * stride, op.j, stride);
++    sched_op op = ops[idx];
++    if (op.u)
++      OPS_AXPY(D + op.i * stride, D + op.j * stride, op.u, stride);
++    else
++      OPS_SCAL(D + op.i * stride, op.j, stride);
+   }
+ 
+   /* undo phase 1 row additions */
+   if (S->cp[0] > 0) {
+     for (u32 idx = S->cp[0] - 1; idx < S->cp[0]; idx--) {
+-      sched_op op = ops[idx];
+-      if (op.u)
+-        axpy(D + op.i * stride, D + op.j * stride, op.u, stride);
+-      else
+-        scal(D + op.i * stride, op.j, stride);
++      sched_op op = ops[idx];
++      if (op.u)
++        OPS_AXPY(D + op.i * stride, D + op.j * stride, op.u, stride);
++      else
++        OPS_SCAL(D + op.i * stride, op.j, stride);
+     }
+   }
+ 
+   /* backsolve */
+   for (u32 idx = S->cp[1]; idx < S->ops.n; idx++) {
+-    sched_op op = ops[idx];
+-    if (op.u)
+-      axpy(D + op.i * stride, D + op.j * stride, op.u, stride);
+-    else
+-      scal(D + op.i * stride, op.j, stride);
++    sched_op op = ops[idx];
++    if (op.u)
++      OPS_AXPY(D + op.i * stride, D + op.j * stride, op.u, stride);
++    else
++      OPS_SCAL(D + op.i * stride, op.j, stride);
+   }
+ 
+   /* reapply phase 1 row additions */
+   for (u32 idx = 0; idx < S->cp[0]; idx++) {
+-    sched_op op = ops[idx];
+-    if (op.u)
+-      axpy(D + op.i * stride, D + op.j * stride, op.u, stride);
+-    else
+-      scal(D + op.i * stride, op.j, stride);
++    sched_op op = ops[idx];
++    if (op.u)
++      OPS_AXPY(D + op.i * stride, D + op.j * stride, op.u, stride);
++    else
++      OPS_SCAL(D + op.i * stride, op.j, stride);
+   }
+ }
+ 
+@@ -93,6 +99,6 @@ void ops_mix(nanorq_core *rq, uint8_t *D, uint32_t stride, u32 esi, u8 *ptr) {
+     ptr[i] = 0;
+   for (u32 it = 0; it < num; it++) {
+     u32 row = mix[it];
+-    nanorq_oblas.axpy(ptr, (D + row * stride), 1, stride);
++    OPS_AXPY(ptr, (D + row * stride), 1, stride);
+   }
+ }
+diff --git a/lib/precode.c b/lib/precode.c
+index 24dbbdd..52aaa8f 100644
+--- a/lib/precode.c
++++ b/lib/precode.c
+@@ -1,4 +1,14 @@
+-#include "precode.h"
++#include "precode.h"
++
++#if defined(__wasm_simd128__)
++#define PRECODE_AXPY obl_axpy_wasm
++#define PRECODE_SCAL obl_scal_wasm
++#define PRECODE_AXPYB32 obl_axpyb32_wasm
++#else
++#define PRECODE_AXPY nanorq_oblas.axpy
++#define PRECODE_SCAL nanorq_oblas.scal
++#define PRECODE_AXPYB32 nanorq_oblas.axpyb32
++#endif
+ 
+ #define hf_at(W, i, j)                                                         \
+   (uv_A((W)->F.type, (i)) ? uv_E((W)->UL, uv_A((W)->F.rowmap, (i)), (j))       \
+@@ -214,9 +224,9 @@ static void precode_matrix_fill_U(pc *W) {
+   }
+ }
+ 
+-static void hf_scal(pc *W, u32 i, u8 beta) {
+-  u8 *a = (u8 *)&uv_E(W->UL, uv_A(W->F.rowmap, i), 0);
+-  nanorq_oblas.scal(a, beta, W->UL.s);
++static void hf_scal(pc *W, u32 i, u8 beta) {
++  u8 *a = (u8 *)&uv_E(W->UL, uv_A(W->F.rowmap, i), 0);
++  PRECODE_SCAL(a, beta, W->UL.s);
+ }
+ 
+ static void hf_axpy(pc *W, u32 i, u32 j, u8 beta) {
+@@ -224,7 +234,7 @@ static void hf_axpy(pc *W, u32 i, u32 j, u8 beta) {
+     if (uv_A(W->F.type, i)) {
+       u8 *a = (u8 *)&uv_E(W->UL, uv_A(W->F.rowmap, i), 0);
+       u8 *b = (u8 *)&uv_E(W->UL, uv_A(W->F.rowmap, j), 0);
+-      nanorq_oblas.axpy(a, b, beta, W->UL.s);
++      PRECODE_AXPY(a, b, beta, W->UL.s);
+     } else {
+       bm_add(&W->U, i, j);
+     }
+@@ -233,7 +243,7 @@ static void hf_axpy(pc *W, u32 i, u32 j, u8 beta) {
+     if (uv_A(W->F.type, i)) {
+       u8 *a = (u8 *)&uv_E(W->UL, uv_A(W->F.rowmap, i), 0);
+       u32 *b = &uv_E(W->U, j, 0);
+-      nanorq_oblas.axpyb32(a, b, beta, W->UL.s);
++      PRECODE_AXPYB32(a, b, beta, W->UL.s);
+     } else {
+       assert(W->F.used < W->F.max);
+       u8 *tmp = &uv_E(W->UL, W->F.used, 0);
+@@ -243,7 +253,7 @@ static void hf_axpy(pc *W, u32 i, u32 j, u8 beta) {
+       W->F.used++;
+       u8 *a = (u8 *)&uv_E(W->UL, uv_A(W->F.rowmap, i), 0);
+       u8 *b = (u8 *)&uv_E(W->UL, uv_A(W->F.rowmap, j), 0);
+-      nanorq_oblas.axpy(a, b, beta, W->UL.s);
++      PRECODE_AXPY(a, b, beta, W->UL.s);
+     }
+   }
+ }

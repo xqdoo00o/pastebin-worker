@@ -1,0 +1,306 @@
+button,
+summary,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+a {
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+.receiver-home-link {
+  color: var(--color-default-600);
+}
+
+.receiver-shell {
+  width: min(100% - 1rem, 64rem);
+  margin: 0 auto;
+  padding: 0.5rem 0 max(1.5rem, env(safe-area-inset-bottom));
+}
+
+.mode-button {
+  cursor: pointer;
+}
+
+.mode-button.active,
+.mode-button:hover,
+.mode-button:focus-visible {
+  background: var(--color-primary-50);
+  color: var(--color-primary);
+  outline: none;
+}
+
+.file-picker {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.file-picker input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.hint {
+  color: var(--color-default-500);
+  font-size: 0.8125rem;
+}
+
+.status-line {
+  max-width: 38rem;
+  color: var(--color-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-line:empty {
+  display: none;
+}
+
+.status-line.error {
+  background: var(--color-danger-50);
+  color: var(--color-danger);
+}
+
+/* Received/missing piece summary for multi-part transfers. */
+.part-status {
+  display: flex;
+  width: 100%;
+  max-width: 38rem;
+  margin: 0.75rem auto 0;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.5rem;
+  background: var(--color-default-100);
+  color: var(--color-foreground);
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.part-status-label {
+  max-width: 100%;
+  text-align: center;
+}
+
+.part-status-actions {
+  max-width: 21rem;
+}
+
+.received-preview-empty-state {
+  display: flex;
+  width: 100%;
+  box-sizing: border-box;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1.25rem;
+  border-radius: 0.875rem;
+  background: var(--color-default-100);
+}
+
+.received-preview-empty-copy {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.received-preview-empty-copy strong {
+  color: var(--color-foreground);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.received-preview-empty-copy p {
+  margin: 0;
+  color: var(--color-default-600);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.received-preview-empty-action {
+  white-space: nowrap;
+}
+
+.received-preview-empty-error {
+  color: var(--color-danger);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.preview-zone {
+  position: relative;
+  display: flex;
+  width: min(100%, 45rem);
+  flex-direction: column;
+  align-items: center;
+}
+
+.preview {
+  position: relative;
+  width: min(100%, 45rem);
+  aspect-ratio: 4 / 3;
+  max-height: calc(100dvh - 10rem);
+  overflow: hidden;
+  border: 1px solid var(--color-default-300);
+  background: #000;
+}
+
+/* APNG frames are decoded off-screen; keep only a compact progress surface
+ * instead of reserving a camera-sized black viewport for a hidden image. */
+.preview.apng-preview {
+  height: auto;
+  min-height: 3.75rem;
+  aspect-ratio: auto;
+  overflow: visible;
+  border: 0;
+  background: transparent;
+}
+
+.preview.apng-preview .transfer-hud {
+  position: static;
+  padding: 0.75rem;
+  border: 1px solid var(--color-default-300);
+  background: var(--color-content1);
+}
+
+.preview.apng-preview .progress-status {
+  color: var(--color-default-600);
+  text-shadow: none;
+}
+
+.preview.apng-preview .progress-status strong {
+  color: var(--color-foreground);
+}
+
+.preview.apng-preview .progress {
+  border-color: var(--color-default-300);
+  background: var(--color-default-100);
+}
+
+.preview video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.transfer-hud {
+  position: absolute;
+  z-index: 2;
+  inset: auto 0 0;
+  padding: 3.5rem 0.875rem 0.875rem;
+  background: linear-gradient(transparent, rgb(0 0 0 / 88%) 60%);
+  pointer-events: none;
+}
+
+.progress-status {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+  color: #d4d4d8;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 1px 3px #000;
+}
+
+.progress-status strong {
+  color: #fff;
+}
+
+.progress-status span {
+  text-align: right;
+}
+
+.progress {
+  width: 100%;
+  height: 0.625rem;
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 18%);
+  border-radius: 9999px;
+  background: rgb(0 0 0 / 72%);
+}
+
+.progress > div {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: var(--color-primary);
+  transition: width 250ms;
+}
+
+.progress > div.error {
+  background: var(--color-danger);
+}
+
+details.settings summary {
+  cursor: pointer;
+  color: var(--color-default-600);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+details.settings .row {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+details.settings .camera-picker {
+  grid-column: 1 / -1;
+}
+
+.settings-actual {
+  overflow-wrap: anywhere;
+}
+
+.received-failure-title {
+  color: var(--color-danger);
+  font-size: 1.125rem;
+  font-weight: 600;
+}
+
+.received-preview-actions > a.primary-button {
+  color: var(--color-primary-foreground);
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+@media (max-width: 640px) {
+  .receiver-topbar {
+    margin-block: 0.75rem;
+  }
+
+  .status-line {
+    width: 100%;
+    max-width: none;
+  }
+
+  details.settings .row {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-height: 620px) and (orientation: landscape) {
+  .receiver-topbar {
+    display: none;
+  }
+
+  .preview {
+    width: 100%;
+    height: auto;
+    max-width: 100%;
+  }
+}

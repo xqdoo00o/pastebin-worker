@@ -1,5 +1,5 @@
 export const CHAR_GEN = "ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678"
-export const NAME_REGEX = /^[a-zA-Z0-9+_\-[\]*$@,;]{3,}$/
+
 export const PASTE_NAME_LEN = 6
 export const PRIVATE_PASTE_NAME_LEN = 24
 export const DEFAULT_PASSWD_LEN = 24
@@ -10,7 +10,9 @@ export const PASSWD_SEP = ":"
 export const BINARY_SNIFF_BYTES = 1024
 export const MAX_AUTO_FETCH_BYTES = 256 * 1024
 export const MAX_P2P_AUTO_PREVIEW_BYTES = 1024 * 1024
+export const OPTICAL_RECEIVER_PATH = "/qr-receiver"
 export const P2P_RTC_DISCONNECT_GRACE_MS = 3 * 1000
+export const P2P_DIRECT_PROBE_TIMEOUT_MS = 4 * 1000
 export const P2P_SIGNAL_RECONNECT_GRACE_MS = 30 * 1000
 export const P2P_SIGNAL_RECONNECT_WINDOW_MS = 30 * 1000
 // The receiver must keep retrying beyond the server-side signaling grace period.
@@ -19,6 +21,8 @@ export const P2P_SIGNAL_BACKGROUND_REFRESH_MS = 60 * 1000
 export const P2P_HEARTBEAT_INTERVAL_MS = 30 * 1000
 export const P2P_HEARTBEAT_TIMEOUT_MS = 90 * 1000
 export const DIRECT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+export const STREAMING_COMPRESSION_CHUNK_BYTES = 4 * 1024 * 1024
+export const STREAMING_FILE_READ_CHUNK_BYTES = 4 * 1024 * 1024
 export const ZIP_MEMORY_THRESHOLD_BYTES = 64 * 1024 * 1024
 export const OPFS_LARGE_FILE_THRESHOLD_BYTES = 64 * 1024 * 1024
 export const OPFS_REQUIRED_SPACE_MULTIPLIER = 1.2

@@ -1,11 +1,13 @@
 import type { PublicEnv } from "../../../shared/interfaces.js"
 import { P2P_SIGNAL_BACKGROUND_REFRESH_MS, P2P_SIGNAL_RECONNECT_WINDOW_MS } from "../../../shared/constants.js"
 import { parseP2PSignalMessage, type SignalMessage } from "./protocol.js"
+import { asError } from "../errors.js"
 
 const reconnectBaseDelayMs = 1000
 const reconnectMaxDelayMs = 10_000
 const roomAvailabilityProbeTimeoutMs = 10_000
 export const reconnectWindowMs = P2P_SIGNAL_RECONNECT_WINDOW_MS
+type ReconnectWindow = number | (() => number)
 
 function reconnectDelayMs(attempt: number): number {
   return Math.min(reconnectMaxDelayMs, reconnectBaseDelayMs * 2 ** Math.min(attempt, 4))
@@ -13,21 +15,23 @@ function reconnectDelayMs(attempt: number): number {
 
 export class P2PReconnectPolicy {
   private attempts = 0
-  private deadlineAt?: number
+  private startedAt?: number
 
-  constructor(private readonly windowMs = reconnectWindowMs) {}
+  constructor(private readonly windowMs: ReconnectWindow = reconnectWindowMs) {}
 
   nextDelay(now = Date.now()): number | null {
-    this.deadlineAt ??= now + this.windowMs
+    this.startedAt ??= now
+    const windowMs = typeof this.windowMs === "function" ? this.windowMs() : this.windowMs
+    const deadlineAt = this.startedAt + windowMs
     const delay = reconnectDelayMs(this.attempts)
-    if (now + delay > this.deadlineAt) return null
+    if (now + delay > deadlineAt) return null
     this.attempts += 1
     return delay
   }
 
   reset(): void {
     this.attempts = 0
-    this.deadlineAt = undefined
+    this.startedAt = undefined
   }
 }
 
@@ -45,7 +49,7 @@ export function wsUrl(
   return url.toString()
 }
 
-export async function probeP2PRoomAvailability(
+async function probeP2PRoomAvailability(
   config: PublicEnv,
   name: string,
 ): Promise<"available" | "unavailable" | "unknown"> {
@@ -63,6 +67,34 @@ export async function probeP2PRoomAvailability(
   }
 }
 
+interface P2PRoomRetryProbeOptions {
+  shouldRun(): boolean
+  onUnavailable(): void | Promise<void>
+  onRetry(): void
+}
+
+/** Coalesces reconnect-exhaustion probes so sender and receiver cannot launch
+ * overlapping HEAD requests while the network is unstable. */
+export function createP2PRoomRetryProbe(
+  config: PublicEnv,
+  name: string,
+  options: P2PRoomRetryProbeOptions,
+): () => void {
+  let pending: Promise<void> | undefined
+  return () => {
+    if (pending || !options.shouldRun()) return
+    pending = (async () => {
+      if ((await probeP2PRoomAvailability(config, name)) === "unavailable") {
+        await options.onUnavailable()
+      } else if (options.shouldRun()) {
+        options.onRetry()
+      }
+    })().finally(() => {
+      pending = undefined
+    })
+  }
+}
+
 function sendSignal(ws: WebSocket, message: SignalMessage): boolean {
   if (ws.readyState !== WebSocket.OPEN) return false
   ws.send(JSON.stringify(message))
@@ -74,13 +106,14 @@ export interface P2PSignalingTransport {
   connect: () => void
   send: (message: SignalMessage) => boolean
   resetReconnect: () => void
+  reconsiderReconnect: () => void
   restartReconnect: () => void
   close: () => void
 }
 
 interface P2PSignalingTransportOptions {
   url: string | (() => string)
-  reconnectWindowMs?: number
+  reconnectWindowMs?: ReconnectWindow
   shouldReconnect: () => boolean
   onOpen: (isReconnect: boolean) => void
   onMessage: (message: SignalMessage, isCurrent: () => boolean) => Promise<void>
@@ -165,7 +198,7 @@ export function createP2PSignalingTransport(options: P2PSignalingTransportOption
       try {
         message = parseP2PSignalMessage(event.data)
       } catch (error) {
-        options.onError(error instanceof Error ? error : new Error(String(error)))
+        options.onError(asError(error))
         return
       }
       if (!message) return
@@ -177,7 +210,7 @@ export function createP2PSignalingTransport(options: P2PSignalingTransportOption
       messageQueue = messageQueue
         .then(() => options.onMessage(message, isCurrent))
         .catch((error: unknown) => {
-          if (isCurrent()) options.onError(error instanceof Error ? error : new Error(String(error)))
+          if (isCurrent()) options.onError(asError(error))
         })
     }
   }
@@ -192,6 +225,12 @@ export function createP2PSignalingTransport(options: P2PSignalingTransportOption
       options.onClose()
     }
     connect(true)
+  }
+
+  const reconsiderReconnect = () => {
+    if (isClosed || !hasStarted || !options.shouldReconnect() || socket || reconnectTimer === undefined) return
+    clearReconnectTimer()
+    scheduleReconnect()
   }
 
   const onVisibilityChange = () => {
@@ -260,6 +299,7 @@ export function createP2PSignalingTransport(options: P2PSignalingTransportOption
     connect: start,
     send,
     resetReconnect: () => reconnectPolicy.reset(),
+    reconsiderReconnect,
     restartReconnect,
     close,
   }

@@ -7,12 +7,14 @@ export function getMaxExpirationReadable(config: PublicEnv): string {
   return parseExpirationReadable(config.MAX_EXPIRATION)!
 }
 
-export { ErrorWithTitle } from "./errors.js"
+export function verifySizeLimit(size: number, max: number): [boolean, string] {
+  if (size <= max) return [true, ""]
+  return [false, `File too large (${formatSize(size)} > ${formatSize(max)})`]
+}
 
 export function verifyFileSize(size: number, config: PublicEnv): [boolean, string] {
   const max = parseSize(config.R2_MAX_ALLOWED)
-  if (max === null || size <= max) return [true, ""]
-  return [false, `File too large (${formatSize(size)} > ${formatSize(max)})`]
+  return max === null ? [true, ""] : verifySizeLimit(size, max)
 }
 
 export function formatSize(size: number): string {

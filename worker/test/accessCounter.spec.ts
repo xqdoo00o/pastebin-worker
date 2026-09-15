@@ -14,11 +14,12 @@ afterEach(() => {
 it("increase access counter", async () => {
   const ctx = createExecutionContext()
   const content = genRandomBlob(1024)
-  const name = "abc"
-  const url = (await upload(ctx, { c: content, n: name })).url
+  const response = await upload(ctx, { c: content })
+  const url = response.url
+  const name = new URL(url).pathname.split("/").filter(Boolean).pop()!
 
   async function getCounter() {
-    const paste = await env.PB.getWithMetadata<PasteMetadata>("~" + name)
+    const paste = await env.PB.getWithMetadata<PasteMetadata>(name)
     return paste?.metadata?.accessCounter
   }
 

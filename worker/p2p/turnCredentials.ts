@@ -1,4 +1,5 @@
 import type { P2PIceServer } from "../../shared/interfaces.js"
+import { bytesToBase64 } from "../../shared/encoding.js"
 import { isP2PIceServer } from "../../shared/p2pSignal.js"
 import { jsonResponse, WorkerError } from "../common.js"
 import { checkTurnCredentials } from "../turnHealth.js"
@@ -32,10 +33,6 @@ interface P2PTurnCredentials {
 
 function turnCacheStub(env: { P2P_ROOM: DurableObjectNamespace }): DurableObjectStub {
   return env.P2P_ROOM.get(env.P2P_ROOM.idFromName("__turn_credentials_cache"))
-}
-
-function bytesToBase64(bytes: ArrayBuffer): string {
-  return btoa(String.fromCharCode(...new Uint8Array(bytes)))
 }
 
 function parseTurnUrls(raw: unknown): string[] {
@@ -93,7 +90,7 @@ async function hmacSha1Base64(secret: string, value: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-1" }, false, [
     "sign",
   ])
-  return bytesToBase64(await crypto.subtle.sign("HMAC", key, encoder.encode(value)))
+  return bytesToBase64(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(value))))
 }
 
 async function sha256Hex(value: string): Promise<string> {

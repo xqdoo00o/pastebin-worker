@@ -1,24 +1,12 @@
-import { renderToReadableStream } from "react-dom/server.edge"
 import React from "react"
 import { DisplayPasteView } from "../../frontend/pages/DisplayPasteView.js"
 import type { PasteMetadata } from "../storage/storage.js"
 import { hasReadLimit, metaResponseFromMetadata } from "../storage/storage.js"
 import type { SerializedPasteData } from "../../shared/interfaces.js"
-import { escapeHtml } from "../common.js"
 import manifest from "../../dist/frontend/.vite/ssr-manifest.json"
-import { detectUtf8 } from "../../shared/encoding.js"
-import { getAssetPaths, renderCssLinks, DARK_MODE_SCRIPT, MAX_SSR_FILE_SIZE, publicEnv } from "../ssrUtils.js"
-import { filenameForTitle } from "../../shared/filename.js"
-import { itemCountLabel } from "../../shared/format.js"
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer)
-  let binary = ""
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte)
-  }
-  return btoa(binary)
-}
+import { bytesToBase64, detectUtf8 } from "../../shared/encoding.js"
+import { MAX_SSR_FILE_SIZE, publicEnv, renderReactDocument, renderStaticReact } from "../ssrUtils.js"
+import { filenameForTitle, itemCountLabel } from "../../shared/format.js"
 
 export function canRenderDisplayPage(metadata: PasteMetadata): boolean {
   return !hasReadLimit(metadata) && !metadata.encryptionScheme && metadata.sizeBytes <= MAX_SSR_FILE_SIZE
@@ -32,6 +20,7 @@ export async function renderDisplayPage(
   urlLang: string | undefined,
   paste: ArrayBuffer | ReadableStream<Uint8Array>,
   metadata: PasteMetadata,
+  contentType: string,
 ): Promise<string | null> {
   if (!canRenderDisplayPage(metadata)) {
     return null
@@ -42,12 +31,13 @@ export async function renderDisplayPage(
   const encoding = detectUtf8(new Uint8Array(content))
   const isBinary = encoding === null
 
-  const contentBase64 = arrayBufferToBase64(content)
+  const contentBase64 = bytesToBase64(new Uint8Array(content))
 
   const metaResponse = metaResponseFromMetadata(metadata)
 
   const serializedData: SerializedPasteData = {
     content: contentBase64,
+    contentType,
     metadata: metaResponse,
     name,
     isBinary,
@@ -55,7 +45,7 @@ export async function renderDisplayPage(
   }
 
   const inferredFilename = urlFilename || (urlExt && name + urlExt) || metadata.filename || name
-  const pasteFile = new File([content], inferredFilename)
+  const pasteFile = new File([content], inferredFilename, { type: contentType })
   const displayName = metadata.filenames?.length
     ? itemCountLabel(metadata.filenames.length)
     : filenameForTitle(metadata.filename)
@@ -69,53 +59,44 @@ export async function renderDisplayPage(
     React.StrictMode,
     null,
     React.createElement(DisplayPasteView, {
-      pasteFile,
-      pasteContentBuffer: new Uint8Array(content),
-      pasteLang: urlLang || metadata.highlightLanguage,
-      isFileBinary: isBinary,
-      guessedEncoding: encoding,
-      isDecrypted: "not encrypted",
       forceShowBinary: false,
-      setForceShowBinary: () => {
-        // SSR: no-op
-      },
-      isLoading: false,
-      isDownloading: false,
       name,
       ext: urlExt,
       filename: urlFilename,
-      metaFilename: metadata.filename,
-      originalFiles: metadata.filenames,
       config,
+      paste: {
+        file: pasteFile,
+        contentBuffer: new Uint8Array(content),
+        lang: urlLang || metadata.highlightLanguage,
+        isFileBinary: isBinary,
+        guessedEncoding: encoding,
+        isDecrypted: "not encrypted",
+        isLoading: false,
+        isDownloading: false,
+        metaFilename: metadata.filename,
+        originalFiles: metadata.filenames,
+      },
+      actions: {
+        setForceShowBinary: () => {
+          // SSR: no-op
+        },
+      },
     }),
   )
 
-  const stream = await renderToReadableStream(reactElement)
-  const html = await new Response(stream).text()
+  const html = await renderStaticReact(reactElement)
 
-  const { jsFile, cssPaths } = getAssetPaths(manifest, "display.html")
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<link rel="icon" href="/favicon.ico" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>${escapeHtml(env.INDEX_PAGE_TITLE)} / ${escapeHtml(titleName)}</title>
-${renderCssLinks(cssPaths)}
-<script>
-${DARK_MODE_SCRIPT}
-</script>
-</head>
-<body>
-<div id="root">${html}</div>
-<script id="__PASTE_DATA__" type="application/json">${JSON.stringify(serializedData)
+  const pasteData = JSON.stringify(serializedData)
     .replace(/</g, "\\u003c")
     .replace(/>/g, "\\u003e")
     .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029")}</script>
-<script>window.__PASTE_DATA__=JSON.parse(document.getElementById('__PASTE_DATA__').textContent)</script>
-<script type="module" src="/${jsFile}"></script>
-</body>
-</html>`
+    .replace(/\u2029/g, "\\u2029")
+  return renderReactDocument({
+    manifest,
+    entryKey: "display.html",
+    title: `${env.INDEX_PAGE_TITLE} / ${titleName}`,
+    rootHtml: html,
+    afterRootHtml: `<script id="__PASTE_DATA__" type="application/json">${pasteData}</script>
+<script>window.__PASTE_DATA__=JSON.parse(document.getElementById('__PASTE_DATA__').textContent)</script>`,
+  })
 }

@@ -1,9 +1,12 @@
+import { DIRECT_UPLOAD_MAX_BYTES } from "../../shared/constants.js"
+
 export { CHUNKED_ENCRYPTION_SCHEME } from "../../shared/constants.js"
-export const ENCRYPTION_CHUNK_SIZE = 5 * 1024 * 1024
-export const ENCRYPTION_HEADER_SIZE = 32
+/** Serialized size of every non-final encrypted chunk and its matching MPU part. */
+export const ENCRYPTION_PART_SIZE = DIRECT_UPLOAD_MAX_BYTES
+export const ENCRYPTION_HEADER_SIZE = 24
 export const ENCRYPTION_TAG_SIZE = 16
 
-const HEADER_MAGIC = new TextEncoder().encode("PBENC001")
+const HEADER_MAGIC = new TextEncoder().encode("PBE2")
 const NONCE_PREFIX_SIZE = 8
 
 export interface ChunkedEncryptionHeader {
@@ -17,13 +20,18 @@ function assertPlaintextSize(size: number): void {
   if (encryptionChunkCount(size) > 0x1_0000_0000) throw new Error("Encrypted file has too many chunks")
 }
 
-export function firstEncryptionChunkSize(): number {
-  return ENCRYPTION_CHUNK_SIZE
+export function firstEncryptionPlaintextSize(): number {
+  return ENCRYPTION_PART_SIZE - ENCRYPTION_HEADER_SIZE - ENCRYPTION_TAG_SIZE
+}
+
+export function followingEncryptionPlaintextSize(): number {
+  return ENCRYPTION_PART_SIZE - ENCRYPTION_TAG_SIZE
 }
 
 export function encryptionChunkCount(plaintextSize: number): number {
   assertPlaintextSizeWithoutChunkCount(plaintextSize)
-  return Math.max(1, Math.ceil(plaintextSize / ENCRYPTION_CHUNK_SIZE))
+  const remaining = Math.max(0, plaintextSize - firstEncryptionPlaintextSize())
+  return 1 + Math.ceil(remaining / followingEncryptionPlaintextSize())
 }
 
 function assertPlaintextSizeWithoutChunkCount(size: number): void {
@@ -36,8 +44,11 @@ export function encryptionChunkBounds(plaintextSize: number, index: number): { s
   if (!Number.isInteger(index) || index < 0 || index >= count)
     throw new Error(`Invalid encryption chunk index ${index}`)
 
-  const start = index * ENCRYPTION_CHUNK_SIZE
-  return { start, end: Math.min(plaintextSize, start + ENCRYPTION_CHUNK_SIZE) }
+  const firstSize = firstEncryptionPlaintextSize()
+  if (index === 0) return { start: 0, end: Math.min(plaintextSize, firstSize) }
+  const followingSize = followingEncryptionPlaintextSize()
+  const start = firstSize + (index - 1) * followingSize
+  return { start, end: Math.min(plaintextSize, start + followingSize) }
 }
 
 export function encryptedFileSize(plaintextSize: number): number {
@@ -50,12 +61,11 @@ export function createEncryptionHeader(plaintextSize: number): ChunkedEncryption
   const bytes = new Uint8Array(ENCRYPTION_HEADER_SIZE)
   bytes.set(HEADER_MAGIC, 0)
   const view = new DataView(bytes.buffer)
-  view.setUint32(8, ENCRYPTION_CHUNK_SIZE, false)
-  view.setUint32(12, ENCRYPTION_TAG_SIZE, false)
-  view.setBigUint64(16, BigInt(plaintextSize), false)
+  view.setUint32(4, ENCRYPTION_PART_SIZE, false)
+  view.setBigUint64(8, BigInt(plaintextSize), false)
   const noncePrefix = crypto.getRandomValues(new Uint8Array(NONCE_PREFIX_SIZE))
-  bytes.set(noncePrefix, 24)
-  return { bytes, plaintextSize, noncePrefix: bytes.subarray(24, 24 + NONCE_PREFIX_SIZE) }
+  bytes.set(noncePrefix, 16)
+  return { bytes, plaintextSize, noncePrefix: bytes.subarray(16, 16 + NONCE_PREFIX_SIZE) }
 }
 
 export function parseEncryptionHeader(bytes: Uint8Array): ChunkedEncryptionHeader {
@@ -65,10 +75,8 @@ export function parseEncryptionHeader(bytes: Uint8Array): ChunkedEncryptionHeade
   }
 
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  if (view.getUint32(8, false) !== ENCRYPTION_CHUNK_SIZE || view.getUint32(12, false) !== ENCRYPTION_TAG_SIZE) {
-    throw new Error("Unsupported encrypted file parameters")
-  }
-  const size = view.getBigUint64(16, false)
+  if (view.getUint32(4, false) !== ENCRYPTION_PART_SIZE) throw new Error("Unsupported encrypted file parameters")
+  const size = view.getBigUint64(8, false)
   if (size > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Encrypted plaintext size is too large")
   const plaintextSize = Number(size)
   assertPlaintextSize(plaintextSize)
@@ -76,7 +84,7 @@ export function parseEncryptionHeader(bytes: Uint8Array): ChunkedEncryptionHeade
   return {
     bytes: copiedHeader,
     plaintextSize,
-    noncePrefix: copiedHeader.subarray(24, 24 + NONCE_PREFIX_SIZE),
+    noncePrefix: copiedHeader.subarray(16, 16 + NONCE_PREFIX_SIZE),
   }
 }
 

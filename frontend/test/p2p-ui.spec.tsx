@@ -4,10 +4,10 @@ import { userEvent } from "@testing-library/user-event"
 import { DisplayPaste } from "../pages/DisplayPaste.js"
 import { PasteBin } from "../pages/PasteBin.js"
 import { P2PTransferPanel } from "../components/P2PTransferPanel.js"
-import { prepareContent } from "../utils/content.js"
-import type { P2PSenderPeerInfo } from "../utils/p2pCommon.js"
-import { stubBrowerFunctions, unStubBrowerFunctions } from "./testUtils.js"
-import type { P2PFileMeta, P2PProgress, P2PReceiverSession } from "../utils/p2pCommon.js"
+import * as ContentUtils from "../utils/content.js"
+import type { P2PFileMeta, P2PProgress, P2PReceiverSession, P2PSenderPeerInfo } from "../utils/p2p/protocol.js"
+import type { PublicEnv } from "../../shared/interfaces.js"
+import { stubBrowserFunctions, unStubBrowserFunctions } from "./testUtils.js"
 import { MAX_P2P_AUTO_PREVIEW_BYTES } from "../../shared/constants.js"
 
 import "@testing-library/jest-dom/vitest"
@@ -37,6 +37,7 @@ interface MockReceiverSession extends P2PReceiverSession {
 
 const receiverSessions = vi.hoisted(() => [] as { callbacks: ReceiverCallbacks; session: MockReceiverSession }[])
 const createObjectURLMock = vi.fn<(object: Blob | MediaSource) => string>()
+const scrollToMock = vi.fn()
 
 const p2pMocks = vi.hoisted(() => ({
   updateRoomOptions: vi.fn(() =>
@@ -71,15 +72,19 @@ vi.mock("../utils/p2pReceiver.js", () => ({
   }),
 }))
 
-vi.mock("../utils/content.js", () => ({
-  prepareContent: vi.fn((editorState: { editContent: string; editFilename?: string }) =>
-    Promise.resolve({
-      content: new File([editorState.editContent], editorState.editFilename || "paste.txt", {
-        type: "text/plain",
+vi.mock("../utils/content.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof ContentUtils>()
+  return {
+    ...actual,
+    prepareContent: vi.fn((editorState: { editContent: string; editFilename?: string }) =>
+      Promise.resolve({
+        content: new File([editorState.editContent], editorState.editFilename || "paste.txt", {
+          type: "text/plain",
+        }),
       }),
-    }),
-  ),
-}))
+    ),
+  }
+})
 
 vi.mock("../utils/p2pSender.js", () => ({
   startP2PSender: vi.fn(() =>
@@ -105,20 +110,25 @@ const fileMeta: P2PFileMeta = {
   size: 1024,
   type: "application/zip",
   lastModified: 0,
+  senderBrowser: "Firefox 120",
   verifyTransfer: false,
 }
 
-async function renderP2PDisplay(): Promise<void> {
-  render(<DisplayPaste config={__WRANGLER_CONFIG__} />)
+const fileSummary = (name: string) => `${name} (1.00 KB)`
+
+async function renderP2PDisplay(config: PublicEnv = __WRANGLER_CONFIG__): Promise<void> {
+  render(<DisplayPaste config={config} />)
   await vi.waitFor(() => expect(receiverSessions).toHaveLength(1))
 }
 
 describe("DisplayPaste P2P receiver", () => {
   beforeEach(() => {
-    stubBrowerFunctions()
+    stubBrowserFunctions()
     vi.stubGlobal("location", new URL("https://example.com/p/abcd"))
     createObjectURLMock.mockReset()
     createObjectURLMock.mockReturnValue("blob:mock")
+    scrollToMock.mockReset()
+    vi.stubGlobal("scrollTo", scrollToMock)
     Object.defineProperty(URL, "createObjectURL", { value: createObjectURLMock, configurable: true })
     Object.defineProperty(URL, "revokeObjectURL", { value: vi.fn(), configurable: true })
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined)
@@ -127,23 +137,50 @@ describe("DisplayPaste P2P receiver", () => {
   afterEach(() => {
     cleanup()
     receiverSessions.length = 0
-    unStubBrowerFunctions()
+    unStubBrowserFunctions()
   })
 
   it("shows progress only after file details are received", async () => {
     await renderP2PDisplay()
 
+    expect(screen.getByText("P2P receiver")).toBeInTheDocument()
     expect(screen.queryByText("0%")).not.toBeInTheDocument()
     expect(screen.queryByText("Ready")).not.toBeInTheDocument()
 
     act(() => receiverSessions[0].callbacks.onMeta(fileMeta))
 
     const percentage = screen.getByText("0%")
-    expect(percentage).toHaveClass("left-1/2", "-translate-x-1/2")
+    expect(percentage).toHaveClass("left-1/2", "-translate-x-1/2", "text-foreground")
+    expect(percentage).not.toHaveClass("text-primary-foreground")
+    expect(percentage).not.toHaveClass("mix-blend-difference")
     expect(screen.getByText("Ready")).toHaveClass("rounded-full", "bg-default-200")
-    expect(screen.getByText(fileMeta.name)).toHaveClass("min-w-0", "truncate", "text-left")
-    expect(screen.getByText(fileMeta.name)).not.toHaveClass("flex-1")
+    expect(screen.getByText(fileSummary(fileMeta.name))).toBeInTheDocument()
+    expect(screen.getByText(fileMeta.senderBrowser)).toHaveClass("min-w-0", "truncate", "text-left")
+    expect(screen.getByText(fileMeta.senderBrowser)).not.toHaveClass("flex-1")
+    expect(screen.queryByText("P2P receiver")).not.toBeInTheDocument()
+    expect(screen.queryByText("P2P transfer")).not.toBeInTheDocument()
     expect(screen.getByText("0 KB/s").parentElement).toHaveClass("invisible")
+  })
+
+  it("shows the original file list after receiving multi-file metadata", async () => {
+    await renderP2PDisplay()
+
+    act(() =>
+      receiverSessions[0].callbacks.onMeta({
+        ...fileMeta,
+        name: "2-items.zip",
+        originalFiles: [
+          { name: "folder/a.txt", sizeBytes: 3 },
+          { name: "b.txt", sizeBytes: 4 },
+        ],
+      }),
+    )
+
+    expect(screen.getByText("2 items (1.00 KB)")).toBeInTheDocument()
+    expect(screen.getByText("folder")).toBeInTheDocument()
+    expect(screen.getByText("b.txt")).toBeInTheDocument()
+    expect(screen.getByText(fileMeta.senderBrowser)).toBeInTheDocument()
+    expect(screen.queryByText("P2P receiver")).not.toBeInTheDocument()
   })
 
   it("reuses the receiver session after the current transfer is terminated", async () => {
@@ -152,7 +189,7 @@ describe("DisplayPaste P2P receiver", () => {
     expect(receiverSessions).toHaveLength(1)
     act(() => receiverSessions[0].callbacks.onMeta(fileMeta))
 
-    await userEvent.click(await screen.findByRole("button", { name: "Receive file" }))
+    await userEvent.click(await screen.findByRole("button", { name: "Receive" }))
     expect(receiverSessions[0].session.requestDownload).toHaveBeenCalledTimes(1)
 
     act(() => receiverSessions[0].callbacks.onProgress({ doneBytes: 128, totalBytes: fileMeta.size }))
@@ -163,7 +200,7 @@ describe("DisplayPaste P2P receiver", () => {
     expect(receiverSessions[0].session.terminate).toHaveBeenCalledTimes(1)
     expect(receiverSessions[0].session.requestDownload).toHaveBeenCalledTimes(1)
 
-    await userEvent.click(await screen.findByRole("button", { name: "Receive file" }))
+    await userEvent.click(await screen.findByRole("button", { name: "Receive" }))
     expect(receiverSessions[0].session.requestDownload).toHaveBeenCalledTimes(2)
   })
 
@@ -180,7 +217,7 @@ describe("DisplayPaste P2P receiver", () => {
   it("shows an in-progress update in a second P2P transfer card", async () => {
     await renderP2PDisplay()
     act(() => receiverSessions[0].callbacks.onMeta(fileMeta))
-    await userEvent.click(screen.getByRole("button", { name: "Receive file" }))
+    await userEvent.click(screen.getByRole("button", { name: "Receive" }))
     act(() => receiverSessions[0].callbacks.onProgress({ doneBytes: 128, totalBytes: fileMeta.size }))
     act(() =>
       receiverSessions[0].callbacks.onUpdateAvailable?.({
@@ -190,14 +227,24 @@ describe("DisplayPaste P2P receiver", () => {
       }),
     )
 
-    expect(screen.getAllByText("P2P transfer")).toHaveLength(2)
-    expect(screen.getByText(fileMeta.name)).toBeInTheDocument()
-    expect(screen.getByText("updated.zip")).toBeInTheDocument()
+    expect(screen.queryByText("P2P transfer")).not.toBeInTheDocument()
+    expect(screen.getByText(fileSummary(fileMeta.name))).toBeInTheDocument()
+    expect(screen.getByText(fileSummary("updated.zip"))).toBeInTheDocument()
+    expect(screen.getByText("New version available")).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        "The sender updated this file. You can keep the current version or receive the latest one below.",
+      ),
+    ).toBeInTheDocument()
     expect(screen.queryByText(/Updated file available/)).not.toBeInTheDocument()
-    await userEvent.click(screen.getByRole("button", { name: "Receive latest version" }))
+
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss new version notice" }))
+    expect(screen.queryByText("New version available")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Receive" })).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole("button", { name: "Receive" }))
     expect(receiverSessions[0].session.acceptUpdate).toHaveBeenCalledTimes(1)
-    expect(screen.getAllByText("P2P transfer")).toHaveLength(2)
-    expect(screen.getByText(fileMeta.name)).toBeInTheDocument()
+    expect(screen.getByText(fileSummary(fileMeta.name))).toBeInTheDocument()
     expect(screen.getByText("Stopped")).toBeInTheDocument()
 
     act(() => {
@@ -208,9 +255,42 @@ describe("DisplayPaste P2P receiver", () => {
         name: "updated.zip",
       })
     })
-    expect(screen.getAllByText("P2P transfer")).toHaveLength(2)
-    expect(screen.getByText(fileMeta.name)).toBeInTheDocument()
-    expect(screen.getByText("updated.zip")).toBeInTheDocument()
+    expect(screen.getByText(fileSummary(fileMeta.name))).toBeInTheDocument()
+    expect(screen.getByText(fileSummary("updated.zip"))).toBeInTheDocument()
+  })
+
+  it("scrolls to the latest P2P version and dismisses its notice after six seconds", async () => {
+    try {
+      await renderP2PDisplay()
+      vi.useFakeTimers()
+      act(() => receiverSessions[0].callbacks.onMeta(fileMeta))
+      act(() =>
+        receiverSessions[0].callbacks.onUpdateAvailable?.({
+          ...fileMeta,
+          revision: "new-version",
+          name: "updated.zip",
+        }),
+      )
+
+      expect(scrollToMock).toHaveBeenCalledWith({
+        top: document.documentElement.scrollHeight,
+        behavior: "smooth",
+      })
+      expect(screen.getByText("New version available")).toBeInTheDocument()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5999)
+      })
+      expect(screen.getByText("New version available")).toBeInTheDocument()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1)
+      })
+      expect(screen.queryByText("New version available")).not.toBeInTheDocument()
+      expect(screen.getAllByRole("button", { name: "Receive" })).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("shows an update below a completed P2P transfer card", async () => {
@@ -230,11 +310,11 @@ describe("DisplayPaste P2P receiver", () => {
       }),
     )
 
-    expect(screen.getAllByText("P2P transfer")).toHaveLength(2)
-    expect(screen.getByText(fileMeta.name)).toBeInTheDocument()
-    expect(screen.getByText("updated.zip")).toBeInTheDocument()
+    expect(screen.queryByText("P2P transfer")).not.toBeInTheDocument()
+    expect(screen.getByText(fileSummary(fileMeta.name))).toBeInTheDocument()
+    expect(screen.getByText(fileSummary("updated.zip"))).toBeInTheDocument()
     expect(screen.queryByText(/Updated file available/)).not.toBeInTheDocument()
-    await userEvent.click(screen.getByRole("button", { name: "Receive latest version" }))
+    await userEvent.click(screen.getByRole("button", { name: "Receive" }))
     act(() => {
       receiverSessions[0].callbacks.onUpdateAvailable?.(undefined)
       receiverSessions[0].callbacks.onMeta({
@@ -244,9 +324,8 @@ describe("DisplayPaste P2P receiver", () => {
       })
     })
 
-    expect(screen.getAllByText("P2P transfer")).toHaveLength(2)
-    expect(screen.getByText(fileMeta.name)).toBeInTheDocument()
-    expect(screen.getByText("updated.zip")).toBeInTheDocument()
+    expect(screen.getByText(fileSummary(fileMeta.name))).toBeInTheDocument()
+    expect(screen.getByText(fileSummary("updated.zip"))).toBeInTheDocument()
     expect(screen.getByText("Done")).toBeInTheDocument()
   })
 
@@ -268,7 +347,7 @@ describe("DisplayPaste P2P receiver", () => {
 
     for (let index = 1; index < versions.length; index += 1) {
       act(() => receiverSessions[0].callbacks.onUpdateAvailable?.(versions[index]))
-      await userEvent.click(screen.getByRole("button", { name: "Receive latest version" }))
+      await userEvent.click(screen.getByRole("button", { name: "Receive" }))
       act(() => {
         receiverSessions[0].callbacks.onUpdateAvailable?.(undefined)
         receiverSessions[0].callbacks.onMeta(versions[index])
@@ -283,8 +362,8 @@ describe("DisplayPaste P2P receiver", () => {
       }
     }
 
-    expect(screen.getAllByText("P2P transfer")).toHaveLength(3)
-    for (const version of versions) expect(screen.getByText(version.name)).toBeInTheDocument()
+    expect(screen.queryByText("P2P transfer")).not.toBeInTheDocument()
+    for (const version of versions) expect(screen.getByText(fileSummary(version.name))).toBeInTheDocument()
     expect(screen.getAllByText("Done")).toHaveLength(2)
     const pageText = document.body.textContent || ""
     expect(pageText.indexOf(versions[0].name)).toBeLessThan(pageText.indexOf(versions[1].name))
@@ -360,8 +439,9 @@ describe("DisplayPaste P2P receiver", () => {
 
     expect(screen.getByText("File received and verified. Saving should start automatically.")).toBeInTheDocument()
     expect(await screen.findByText("Done")).toHaveClass("bg-success-100", "text-success")
-    expect(screen.getByRole("link", { name: "Save" })).toHaveAttribute("download", fileMeta.name)
-    expect(screen.getByText("Save file")).toBeInTheDocument()
+    const save = screen.getByText("Save").closest("a")
+    expect(save).toHaveAttribute("download", fileMeta.name)
+    expect(save?.parentElement).toHaveClass("received-preview-actions")
     expect(screen.queryByText("load anyway")).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Terminate" })).not.toBeInTheDocument()
@@ -424,8 +504,33 @@ describe("DisplayPaste P2P receiver", () => {
     const article = await screen.findByRole("article")
     expect(article.textContent).toStrictEqual(text)
     expect(screen.getByText(file.name)).toHaveAttribute("title", file.name)
-    expect(screen.getByText("json")).toBeInTheDocument()
-    expect(screen.queryByText("Save file")).not.toBeInTheDocument()
+    const language = screen.getByText("json")
+    expect(language).toBeInTheDocument()
+    expect(language.previousElementSibling).toHaveTextContent("·")
+    expect(screen.getByText("Verified")).toBeInTheDocument()
+    expect(screen.getByText("Save")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument()
+  })
+
+  it("does not infer syntax highlighting on the P2P receiver", async () => {
+    await renderP2PDisplay()
+
+    const text = "const answer = 42"
+    const file = new File([text], "answer.js", { type: "text/plain" })
+    act(() =>
+      receiverSessions[0].callbacks.onMeta({
+        ...fileMeta,
+        name: file.name,
+        size: file.size,
+        type: file.type,
+      }),
+    )
+    await act(async () => {
+      await receiverSessions[0].callbacks.onFile(file)
+    })
+
+    expect(await screen.findByRole("article")).toHaveTextContent(text)
+    expect(screen.queryByText("javascript")).not.toBeInTheDocument()
   })
 
   it("does not let an older file preview overwrite a newer P2P file", async () => {
@@ -495,6 +600,46 @@ describe("DisplayPaste P2P receiver", () => {
     expect(screen.queryByRole("article")).not.toBeInTheDocument()
   })
 
+  it("previews a small SVG as an image without reading it as text or auto-downloading", async () => {
+    await renderP2PDisplay()
+
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click")
+    const file = new File(['<svg xmlns="http://www.w3.org/2000/svg"><circle r="4" /></svg>'], "image.svg", {
+      type: "image/svg+xml",
+    })
+    const readWholeFile = vi.spyOn(file, "arrayBuffer")
+    act(() => receiverSessions[0].callbacks.onMeta({ ...fileMeta, name: file.name, size: file.size, type: file.type }))
+    await act(async () => {
+      await receiverSessions[0].callbacks.onFile(file)
+    })
+
+    expect(readWholeFile).not.toHaveBeenCalled()
+    expect(clickSpy).not.toHaveBeenCalled()
+    expect(screen.queryByRole("article")).not.toBeInTheDocument()
+    expect(await screen.findByRole("img", { name: file.name })).toHaveAttribute("src", "blob:mock")
+    expect(createObjectURLMock).toHaveBeenLastCalledWith(file)
+  })
+
+  it("does not inline-preview a P2P image whose MIME is disabled by configuration", async () => {
+    await renderP2PDisplay({
+      ...__WRANGLER_CONFIG__,
+      DISALLOWED_MIME_FOR_PASTE: [...__WRANGLER_CONFIG__.DISALLOWED_MIME_FOR_PASTE, "image/png"],
+    })
+
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click")
+    const file = new File([Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0)], "disabled.png", {
+      type: "image/png",
+    })
+    act(() => receiverSessions[0].callbacks.onMeta({ ...fileMeta, name: file.name, size: file.size, type: file.type }))
+    await act(async () => {
+      await receiverSessions[0].callbacks.onFile(file)
+    })
+
+    expect(clickSpy).toHaveBeenCalledOnce()
+    expect(screen.queryByRole("img", { name: file.name })).not.toBeInTheDocument()
+    expect(screen.queryByRole("article")).not.toBeInTheDocument()
+  })
+
   it("downloads a large file when its filename resolves to a non-text MIME", async () => {
     await renderP2PDisplay()
 
@@ -536,25 +681,43 @@ describe("DisplayPaste P2P receiver", () => {
   })
 
   it("renders an oversized P2P text file after load anyway is clicked", async () => {
-    await renderP2PDisplay()
+    const originalShare = Object.getOwnPropertyDescriptor(navigator, "share")
+    const originalCanShare = Object.getOwnPropertyDescriptor(navigator, "canShare")
+    const share = vi.fn((_data: ShareData) => Promise.resolve())
+    Object.defineProperty(navigator, "share", { configurable: true, value: share })
+    Object.defineProperty(navigator, "canShare", { configurable: true, value: () => true })
 
-    const file = new File(["a".repeat(MAX_P2P_AUTO_PREVIEW_BYTES + 1024)], "large.txt")
-    const readWholeFile = vi.spyOn(file, "arrayBuffer")
-    act(() => receiverSessions[0].callbacks.onMeta({ ...fileMeta, name: file.name, size: file.size, type: "" }))
-    await act(async () => {
-      await receiverSessions[0].callbacks.onFile(file)
-    })
+    try {
+      await renderP2PDisplay()
 
-    expect(readWholeFile).not.toHaveBeenCalled()
-    expect(screen.queryByRole("article")).not.toBeInTheDocument()
-    expect(screen.getByText("Save file")).toBeInTheDocument()
-    await userEvent.click(screen.getByText("load anyway"))
+      const file = new File(["a".repeat(MAX_P2P_AUTO_PREVIEW_BYTES + 1024)], "large.txt")
+      const readWholeFile = vi.spyOn(file, "arrayBuffer")
+      act(() => receiverSessions[0].callbacks.onMeta({ ...fileMeta, name: file.name, size: file.size, type: "" }))
+      await act(async () => {
+        await receiverSessions[0].callbacks.onFile(file)
+      })
 
-    const article = await screen.findByRole("article")
-    expect(readWholeFile).toHaveBeenCalledOnce()
-    expect(article.textContent?.length).toStrictEqual(file.size)
-    expect(createObjectURLMock).toHaveBeenLastCalledWith(file)
-    expect(screen.queryByText("Save file")).not.toBeInTheDocument()
+      expect(readWholeFile).not.toHaveBeenCalled()
+      expect(screen.queryByRole("article")).not.toBeInTheDocument()
+      expect(screen.getByText("Save")).toBeInTheDocument()
+      await userEvent.click(screen.getByText("load anyway"))
+
+      const article = await screen.findByRole("article")
+      expect(readWholeFile).toHaveBeenCalledOnce()
+      expect(article.textContent?.length).toStrictEqual(file.size)
+      expect(createObjectURLMock).toHaveBeenLastCalledWith(file)
+      expect(screen.getByText("Save")).toBeInTheDocument()
+
+      await userEvent.click(await screen.findByTitle("Share file"))
+      expect(share).toHaveBeenCalledOnce()
+      expect(share.mock.calls[0][0]).toMatchObject({ files: [file] })
+      expect(share.mock.calls[0][0].text).toBeUndefined()
+    } finally {
+      if (originalShare) Object.defineProperty(navigator, "share", originalShare)
+      else Reflect.deleteProperty(navigator, "share")
+      if (originalCanShare) Object.defineProperty(navigator, "canShare", originalCanShare)
+      else Reflect.deleteProperty(navigator, "canShare")
+    }
   })
 
   it("shows a verification failure result and lets the receiver retry", async () => {
@@ -575,7 +738,7 @@ describe("DisplayPaste P2P receiver", () => {
     expect(
       screen.getByText("Transfer verification failed after 3 repair attempts. Receive the file again to retry."),
     ).toBeInTheDocument()
-    expect(screen.getByRole("button", { name: "Receive file" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Receive" })).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Terminate" })).not.toBeInTheDocument()
   })
@@ -630,10 +793,7 @@ describe("P2PTransferPanel", () => {
     expect(indicator.parentElement?.parentElement).toHaveTextContent("P2P Transfer")
 
     await userEvent.hover(indicator)
-    expect(
-      await screen.findByText("TURN fallback available. Used only when a direct P2P connection cannot be established."),
-    ).toBeInTheDocument()
-    expect(screen.getByText("turn:turn.example.com:3478?transport=udp")).toBeInTheDocument()
+    expect(await screen.findByText("turn:turn.example.com:3478?transport=udp")).toBeInTheDocument()
     expect(screen.getByText("turns:turn.example.com:5349?transport=tcp")).toBeInTheDocument()
     expect(screen.getByText("turn:backup.example.com:3478?transport=tcp")).toBeInTheDocument()
     expect(screen.getByText("stun:stun.example.com:3478")).toBeInTheDocument()
@@ -663,26 +823,6 @@ describe("P2PTransferPanel", () => {
     expect(route).toHaveAttribute("title", "Relayed through TURN")
     expect(screen.queryByText("Relay")).not.toBeInTheDocument()
     expect(route.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).not.toStrictEqual(0)
-  })
-
-  it("shows signaling status in the blue notice and keeps the page warning in the Pair URL tooltip", async () => {
-    render(
-      <P2PTransferPanel
-        isLoading={false}
-        response={senderResponse}
-        status="P2P signaling reconnected. Waiting for receivers..."
-      />,
-    )
-
-    expect(screen.getByText("P2P signaling reconnected. Waiting for receivers...")).toHaveClass(
-      "bg-primary-50",
-      "text-primary",
-    )
-    const infoButton = screen.getByRole("button", { name: "More information" })
-    await userEvent.hover(infoButton)
-    expect(
-      await screen.findByText(/Keep this page open and your screen unlocked\. The file is not uploaded/),
-    ).toBeInTheDocument()
   })
 
   it("keeps active and completed transfers under their original file and appends the updated file below", () => {
@@ -765,7 +905,7 @@ describe("P2PTransferPanel", () => {
       />,
     )
 
-    expect(screen.getByText("new.bin")).toBeInTheDocument()
+    expect(screen.getByText("new.bin").parentElement).toHaveClass("text-foreground")
     expect(screen.queryByText("old.bin")).not.toBeInTheDocument()
   })
 
@@ -795,7 +935,7 @@ describe("P2PTransferPanel", () => {
 
     expect(screen.getByText("Firefox 130")).toBeInTheDocument()
     expect(screen.getByText("Waiting to resume")).toBeInTheDocument()
-    expect(screen.getByText("50%")).toBeInTheDocument()
+    expect(screen.getByText("50%")).toHaveClass("text-primary-foreground")
   })
 
   it("shows the receiver browser during initial pairing without a transfer progress bar", () => {
@@ -945,7 +1085,7 @@ describe("P2PTransferPanel", () => {
 
 describe("PasteBin P2P update", () => {
   beforeEach(() => {
-    stubBrowerFunctions()
+    stubBrowserFunctions()
     vi.stubGlobal("location", new URL("https://example.com/"))
   })
 
@@ -954,11 +1094,11 @@ describe("PasteBin P2P update", () => {
     p2pMocks.updateFile.mockClear()
     p2pMocks.updateRoomOptions.mockClear()
     p2pMocks.close.mockClear()
-    unStubBrowerFunctions()
+    unStubBrowserFunctions()
   })
 
   it("updates the active P2P session while keeping the pair URL", async () => {
-    render(<PasteBin config={{ ...__WRANGLER_CONFIG__, DEFAULT_P2P_TRANSFER: true }} />)
+    render(<PasteBin config={{ ...__WRANGLER_CONFIG__, DEFAULT_TRANSFER_METHOD: "p2p", DEFAULT_TAB: "edit" }} />)
     const editor = screen.getByRole("textbox", { name: "Paste editor" })
     await userEvent.type(editor, "first version")
     await userEvent.click(screen.getByRole("button", { name: "Start P2P" }))
@@ -985,8 +1125,26 @@ describe("PasteBin P2P update", () => {
     await vi.waitFor(() => expect(screen.getByRole("button", { name: "Update P2P" })).toBeDisabled())
   })
 
+  it("keeps an active P2P session while another transfer mode is previewed", async () => {
+    render(<PasteBin config={{ ...__WRANGLER_CONFIG__, DEFAULT_TRANSFER_METHOD: "p2p", DEFAULT_TAB: "edit" }} />)
+    await userEvent.type(screen.getByRole("textbox", { name: "Paste editor" }), "shared content")
+    await userEvent.click(screen.getByRole("button", { name: "Start P2P" }))
+    await screen.findByRole("textbox", { name: "Pair URL" })
+
+    await userEvent.click(screen.getByRole("radio", { name: "Upload" }))
+    expect(screen.getByRole("button", { name: "Start" })).toBeInTheDocument()
+    expect(screen.queryByRole("textbox", { name: "Pair URL" })).not.toBeInTheDocument()
+    expect(p2pMocks.close).not.toHaveBeenCalled()
+
+    await userEvent.click(screen.getByRole("radio", { name: "P2P" }))
+    expect(screen.getByRole("textbox", { name: "Pair URL" })).toHaveValue("https://example.com/p/room")
+    expect(screen.getByRole("button", { name: "Update P2P" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "Stop P2P" })).toBeInTheDocument()
+    expect(p2pMocks.close).not.toHaveBeenCalled()
+  })
+
   it("closes the sender on pagehide except when entering the back-forward cache", async () => {
-    render(<PasteBin config={{ ...__WRANGLER_CONFIG__, DEFAULT_P2P_TRANSFER: true }} />)
+    render(<PasteBin config={{ ...__WRANGLER_CONFIG__, DEFAULT_TRANSFER_METHOD: "p2p", DEFAULT_TAB: "edit" }} />)
     await userEvent.type(screen.getByRole("textbox", { name: "Paste editor" }), "shared content")
     await userEvent.click(screen.getByRole("button", { name: "Start P2P" }))
     await screen.findByRole("button", { name: "Stop P2P" })
@@ -1000,7 +1158,7 @@ describe("PasteBin P2P update", () => {
 
   it("aborts in-progress sender preparation when leaving the page", async () => {
     let preparationSignal: AbortSignal | undefined
-    vi.mocked(prepareContent).mockImplementationOnce((_editorState, options) => {
+    vi.mocked(ContentUtils.prepareContent).mockImplementationOnce((_editorState, options) => {
       preparationSignal = options?.signal
       return new Promise((_resolve, reject) => {
         preparationSignal?.addEventListener(
@@ -1011,7 +1169,7 @@ describe("PasteBin P2P update", () => {
       })
     })
 
-    render(<PasteBin config={{ ...__WRANGLER_CONFIG__, DEFAULT_P2P_TRANSFER: true }} />)
+    render(<PasteBin config={{ ...__WRANGLER_CONFIG__, DEFAULT_TRANSFER_METHOD: "p2p", DEFAULT_TAB: "edit" }} />)
     await userEvent.type(screen.getByRole("textbox", { name: "Paste editor" }), "shared content")
     await userEvent.click(screen.getByRole("button", { name: "Start P2P" }))
     await vi.waitFor(() => expect(preparationSignal).toBeDefined())
@@ -1025,7 +1183,7 @@ describe("PasteBin P2P update", () => {
   })
 
   it("updates room limits without publishing a new file version", async () => {
-    render(<PasteBin config={{ ...__WRANGLER_CONFIG__, DEFAULT_P2P_TRANSFER: true }} />)
+    render(<PasteBin config={{ ...__WRANGLER_CONFIG__, DEFAULT_TRANSFER_METHOD: "p2p", DEFAULT_TAB: "edit" }} />)
     await userEvent.type(screen.getByRole("textbox", { name: "Paste editor" }), "shared content")
     await userEvent.click(screen.getByRole("button", { name: "Start P2P" }))
     expect(await screen.findByRole("button", { name: "Update P2P" })).toBeDisabled()

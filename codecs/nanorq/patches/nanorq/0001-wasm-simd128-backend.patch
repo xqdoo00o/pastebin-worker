@@ -1,0 +1,128 @@
+diff --git a/deps/obl/oblas_lite.c b/deps/obl/oblas_lite.c
+index d82795e..7cbd06d 100644
+--- a/deps/obl/oblas_lite.c
++++ b/deps/obl/oblas_lite.c
+@@ -8,6 +8,10 @@
+ #endif
+ #include <string.h>
+ 
++#if defined(__wasm_simd128__)
++#include <wasm_simd128.h>
++#endif
++
+ #if defined(OBLAS_ARCH_X86)
+ #include <immintrin.h>
+ #include <tmmintrin.h>
+@@ -438,6 +442,97 @@ static void obl_scal_ref_wrapper(u8 *a, u8 u, unsigned k)
+     obl_axiy_ref(a, a, u, k);
+ }
+ 
++#if defined(__wasm_simd128__)
++/* WebAssembly SIMD implementation of the same nibble-table GF(256)
++ * multiplication used by the upstream SSSE3 and NEON paths. */
++static inline v128_t obl_wasm_mul(v128_t value, u8 u)
++{
++    const v128_t low_table = wasm_v128_load(GF2_8_SHUF_LO + ((unsigned)u * 16));
++    const v128_t high_table = wasm_v128_load(GF2_8_SHUF_HI + ((unsigned)u * 16));
++    const v128_t mask = wasm_i8x16_splat(0x0f);
++    const v128_t low = wasm_v128_and(value, mask);
++    const v128_t high = wasm_v128_and(wasm_u8x16_shr(value, 4), mask);
++    return wasm_v128_xor(wasm_i8x16_swizzle(low_table, low),
++                         wasm_i8x16_swizzle(high_table, high));
++}
++
++static void obl_axpy_wasm(u8 *restrict a, u8 *restrict b, u8 u, unsigned k)
++{
++    unsigned offset = 0;
++    if (u == 1) {
++        for (; offset + 16 <= k; offset += 16) {
++            wasm_v128_store(a + offset,
++                            wasm_v128_xor(wasm_v128_load(a + offset),
++                                          wasm_v128_load(b + offset)));
++        }
++    } else {
++        for (; offset + 16 <= k; offset += 16) {
++            const v128_t product = obl_wasm_mul(wasm_v128_load(b + offset), u);
++            wasm_v128_store(a + offset,
++                            wasm_v128_xor(wasm_v128_load(a + offset), product));
++        }
++    }
++    obl_axpy_ref(a + offset, b + offset, u, k - offset);
++}
++
++static void obl_axiy_wasm(u8 *a, u8 *b, u8 u, unsigned k)
++{
++    unsigned offset = 0;
++    if (u == 0) {
++        memset(a, 0, k);
++        return;
++    }
++    if (u == 1) {
++        if (a != b)
++            memcpy(a, b, k);
++        return;
++    }
++    for (; offset + 16 <= k; offset += 16)
++        wasm_v128_store(a + offset,
++                        obl_wasm_mul(wasm_v128_load(b + offset), u));
++    obl_axiy_ref(a + offset, b + offset, u, k - offset);
++}
++
++static void obl_scal_wasm(u8 *a, u8 u, unsigned k)
++{
++    obl_axiy_wasm(a, a, u, k);
++}
++
++/* Expand each packed GF(2) bit to either zero or u, then XOR it into the
++ * corresponding GF(256) byte. This mirrors the upstream SSSE3 and NEON
++ * kernels and handles 32 coefficients with two SIMD lanes. */
++static void obl_axpyb32_wasm(u8 *a, u32 *b, u8 u, unsigned k)
++{
++    const v128_t scatter_lo = wasm_i8x16_const(0, 0, 0, 0, 0, 0, 0, 0,
++                                               1, 1, 1, 1, 1, 1, 1, 1);
++    const v128_t scatter_hi = wasm_i8x16_const(2, 2, 2, 2, 2, 2, 2, 2,
++                                               3, 3, 3, 3, 3, 3, 3, 3);
++    const v128_t bit_mask = wasm_i8x16_const(0x01, 0x02, 0x04, 0x08,
++                                             0x10, 0x20, 0x40, (int8_t)0x80,
++                                             0x01, 0x02, 0x04, 0x08,
++                                             0x10, 0x20, 0x40, (int8_t)0x80);
++    const v128_t zero = wasm_i8x16_splat(0);
++    const v128_t coefficient = wasm_i8x16_splat(u);
++    unsigned offset = 0;
++    unsigned word = 0;
++
++    for (; offset + 32 <= k; offset += 32, word++) {
++        const v128_t packed = wasm_v128_load32_splat(b + word);
++        const v128_t low = wasm_v128_and(
++            wasm_i8x16_ne(wasm_v128_and(wasm_i8x16_swizzle(packed, scatter_lo), bit_mask), zero),
++            coefficient);
++        const v128_t high = wasm_v128_and(
++            wasm_i8x16_ne(wasm_v128_and(wasm_i8x16_swizzle(packed, scatter_hi), bit_mask), zero),
++            coefficient);
++        wasm_v128_store(a + offset,
++                        wasm_v128_xor(wasm_v128_load(a + offset), low));
++        wasm_v128_store(a + offset + 16,
++                        wasm_v128_xor(wasm_v128_load(a + offset + 16), high));
++    }
++    obl_axpyb32_ref(a + offset, b + word, u, k - offset);
++}
++#endif
++
+ #ifdef _MSC_VER
+ #pragma warning(push)
+ #pragma warning(disable: 4113)
+@@ -468,7 +563,13 @@ void oblas_get_impl(struct oblas_impl *impl)
+     impl->axpyb32 = obl_axpyb32_ref;
+     impl->align_size = sizeof(void *);
+ 
+-#if defined(OBLAS_ARCH_X86)
++#if defined(__wasm_simd128__)
++    impl->axpy = obl_axpy_wasm;
++    impl->scal = obl_scal_wasm;
++    impl->axiy = obl_axiy_wasm;
++    impl->axpyb32 = obl_axpyb32_wasm;
++    impl->align_size = 16;
++#elif defined(OBLAS_ARCH_X86)
+     int has_avx512 = __builtin_cpu_supports("avx512f") &&
+                      __builtin_cpu_supports("avx512bw") &&
+                      __builtin_cpu_supports("avx512dq") &&

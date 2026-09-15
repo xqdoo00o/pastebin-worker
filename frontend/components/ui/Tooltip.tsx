@@ -15,6 +15,8 @@ export interface TooltipProps {
   contentClassName?: string
 }
 
+const VIEWPORT_EDGE_PADDING = 8
+
 export function Tooltip({ content, children, placement = "auto", contentClassName }: TooltipProps) {
   const [show, setShow] = useState(false)
   const [position, setPosition] = useState<"top" | "bottom">("top")
@@ -40,10 +42,15 @@ export function Tooltip({ content, children, placement = "auto", contentClassNam
       // Check horizontal position
       const centerX = containerRect.left + containerRect.width / 2
       const tooltipHalfWidth = tooltipRect.width / 2
+      const rootRect = document.documentElement.getBoundingClientRect()
+      const viewportLeft = Math.max(0, rootRect.left) + VIEWPORT_EDGE_PADDING
+      const viewportRight =
+        (rootRect.right > rootRect.left ? Math.min(window.innerWidth, rootRect.right) : window.innerWidth) -
+        VIEWPORT_EDGE_PADDING
 
-      if (centerX - tooltipHalfWidth < 0) {
+      if (centerX - tooltipHalfWidth < viewportLeft) {
         setAlign("left")
-      } else if (centerX + tooltipHalfWidth > window.innerWidth) {
+      } else if (centerX + tooltipHalfWidth > viewportRight) {
         setAlign("right")
       } else {
         setAlign("center")

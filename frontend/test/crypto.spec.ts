@@ -1,7 +1,16 @@
 import { afterEach, describe, it, expect, vi } from "vitest"
 import { ChunkCryptoSession, encrypt, decrypt, genKey, encodeKey, decodeKey } from "../utils/encryption.js"
 import type { EncryptionScheme } from "../../shared/constants.js"
-import { createEncryptionHeader, encryptedFileSize, firstEncryptionChunkSize } from "../utils/encryptionCore.js"
+import {
+  createEncryptionHeader,
+  encryptedFileSize,
+  ENCRYPTION_HEADER_SIZE,
+  ENCRYPTION_PART_SIZE,
+  ENCRYPTION_TAG_SIZE,
+  firstEncryptionPlaintextSize,
+  followingEncryptionPlaintextSize,
+  parseEncryptionHeader,
+} from "../utils/encryptionCore.js"
 
 function randArray(len: number): Uint8Array {
   const arr = new Uint8Array(len)
@@ -17,6 +26,7 @@ function genRandStr(length: number): string {
 
 class MockCryptoWorker {
   static instances: MockCryptoWorker[] = []
+  static constructionError: Error | undefined
   static initializeError: Error | undefined
 
   onmessage: ((event: MessageEvent) => void) | null = null
@@ -27,6 +37,7 @@ class MockCryptoWorker {
   transformError: Error | undefined
 
   constructor() {
+    if (MockCryptoWorker.constructionError) throw MockCryptoWorker.constructionError
     MockCryptoWorker.instances.push(this)
   }
 
@@ -42,6 +53,10 @@ class MockCryptoWorker {
     return event
   }
 
+  emitReady(): void {
+    this.onmessage?.({ data: { type: "ready" } } as MessageEvent)
+  }
+
   emitMessageError(): void {
     this.onmessageerror?.(new MessageEvent("messageerror"))
   }
@@ -49,11 +64,29 @@ class MockCryptoWorker {
 
 afterEach(() => {
   MockCryptoWorker.instances = []
+  MockCryptoWorker.constructionError = undefined
   MockCryptoWorker.initializeError = undefined
   vi.unstubAllGlobals()
 })
 
 describe("encrypt with AES-GCM", () => {
+  it("uses the 24-byte PBE2 header and MPU-aligned encrypted chunks", async () => {
+    const plaintextSize = firstEncryptionPlaintextSize() + followingEncryptionPlaintextSize() + 1
+    const header = createEncryptionHeader(plaintextSize)
+    const view = new DataView(header.bytes.buffer, header.bytes.byteOffset, header.bytes.byteLength)
+
+    expect(header.bytes.byteLength).toStrictEqual(24)
+    expect(new TextDecoder().decode(header.bytes.subarray(0, 4))).toStrictEqual("PBE2")
+    expect(view.getUint32(4, false)).toStrictEqual(ENCRYPTION_PART_SIZE)
+    expect(view.getBigUint64(8, false)).toStrictEqual(BigInt(plaintextSize))
+    expect(parseEncryptionHeader(header.bytes).plaintextSize).toStrictEqual(plaintextSize)
+
+    const key = await genKey("AES-GCM-CHUNKED")
+    const encrypted = await encrypt("AES-GCM-CHUNKED", key, new Uint8Array(plaintextSize))
+    expect(encrypted.byteLength).toStrictEqual(2 * ENCRYPTION_PART_SIZE + ENCRYPTION_TAG_SIZE + 1)
+    expect(ENCRYPTION_HEADER_SIZE).toStrictEqual(24)
+  })
+
   it("should decrypt to same message", async () => {
     const text = genRandStr(4096)
     const textBuffer = new TextEncoder().encode(text)
@@ -102,7 +135,7 @@ describe("encrypt with AES-GCM", () => {
   })
 
   it("encrypts and authenticates content spanning multiple 5 MiB chunks", async () => {
-    const plaintext = new Uint8Array(firstEncryptionChunkSize() + 257)
+    const plaintext = new Uint8Array(firstEncryptionPlaintextSize() + 257)
     const key = await genKey("AES-GCM-CHUNKED")
     const ciphertext = await encrypt("AES-GCM-CHUNKED", key, plaintext)
 
@@ -123,6 +156,7 @@ describe("ChunkCryptoSession worker lifecycle", () => {
     const key = await genKey("AES-GCM-CHUNKED")
     const session = new ChunkCryptoSession(key, createEncryptionHeader(4))
     const worker = MockCryptoWorker.instances[0]
+    worker.emitReady()
     const pending = session.encrypt(0, new ArrayBuffer(4))
 
     const event = worker.emitError("Encryption worker crashed")
@@ -140,6 +174,7 @@ describe("ChunkCryptoSession worker lifecycle", () => {
     const key = await genKey("AES-GCM-CHUNKED")
     const session = new ChunkCryptoSession(key, createEncryptionHeader(4))
     const worker = MockCryptoWorker.instances[0]
+    worker.emitReady()
     const pending = session.encrypt(0, new ArrayBuffer(4))
 
     worker.emitMessageError()
@@ -151,18 +186,32 @@ describe("ChunkCryptoSession worker lifecycle", () => {
     expect(worker.terminate).toHaveBeenCalledTimes(1)
   })
 
-  it("cleans up synchronous worker initialization and request failures", async () => {
+  it("falls back locally when worker construction or initialization fails", async () => {
     vi.stubGlobal("Worker", MockCryptoWorker)
     const key = await genKey("AES-GCM-CHUNKED")
     const header = createEncryptionHeader(4)
+
+    MockCryptoWorker.constructionError = new Error("Unable to construct worker")
+    const constructionFallback = new ChunkCryptoSession(key, header)
+    await expect(constructionFallback.encrypt(0, new ArrayBuffer(4))).resolves.toHaveProperty("byteLength", 20)
+    constructionFallback.close()
+
+    MockCryptoWorker.constructionError = undefined
     MockCryptoWorker.initializeError = new Error("Unable to initialize worker")
-
-    expect(() => new ChunkCryptoSession(key, header)).toThrow("Unable to initialize worker")
+    const initializationFallback = new ChunkCryptoSession(key, header)
+    await expect(initializationFallback.encrypt(0, new ArrayBuffer(4))).resolves.toHaveProperty("byteLength", 20)
     expect(MockCryptoWorker.instances[0].terminate).toHaveBeenCalledTimes(1)
+    initializationFallback.close()
+  })
 
-    MockCryptoWorker.initializeError = undefined
+  it("keeps synchronous worker request failures terminal after initialization", async () => {
+    vi.stubGlobal("Worker", MockCryptoWorker)
+    const key = await genKey("AES-GCM-CHUNKED")
+    const header = createEncryptionHeader(4)
+
     const session = new ChunkCryptoSession(key, header)
-    const worker = MockCryptoWorker.instances[1]
+    const worker = MockCryptoWorker.instances[0]
+    worker.emitReady()
     worker.transformError = new Error("Unable to post worker request")
 
     await expect(session.encrypt(0, new ArrayBuffer(4))).rejects.toThrow("Unable to post worker request")

@@ -43,6 +43,8 @@ export function Modal({ isOpen, onClose, children, ...rest }: ModalProps) {
 export function ModalContent({ children, className = "", ...rest }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
+      role="dialog"
+      aria-modal="true"
       className={`bg-content1 border border-divider rounded-xl shadow-xl max-w-md w-full mx-4 ${className}`}
       onClick={(e) => e.stopPropagation()}
       {...rest}

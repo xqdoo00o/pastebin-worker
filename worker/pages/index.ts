@@ -1,10 +1,8 @@
-import { renderToReadableStream } from "react-dom/server.edge"
 import React from "react"
-import { PasteBin } from "../../frontend/pages/PasteBin.js"
-import { escapeHtml } from "../common.js"
+import { PasteBinInitialView } from "../../frontend/pages/PasteBinInitialView.js"
 import manifest from "../../dist/frontend/.vite/ssr-manifest.json"
 import { PASSWD_SEP } from "../../shared/constants.js"
-import { getAssetPaths, renderCssLinks, DARK_MODE_SCRIPT, publicEnv } from "../ssrUtils.js"
+import { publicEnv, renderReactDocument, renderStaticReact } from "../ssrUtils.js"
 
 export async function renderIndexPage(env: Env, pathname: string): Promise<string | null> {
   // Admin URLs (containing password separator) skip SSR because they need client-side fetch
@@ -15,31 +13,14 @@ export async function renderIndexPage(env: Env, pathname: string): Promise<strin
   // Build React element
   const config = publicEnv(env)
 
-  const reactElement = React.createElement(React.StrictMode, null, React.createElement(PasteBin, { config }))
+  const reactElement = React.createElement(React.StrictMode, null, React.createElement(PasteBinInitialView, { config }))
 
-  // Render to HTML stream
-  const stream = await renderToReadableStream(reactElement)
-  const html = await new Response(stream).text()
+  const html = await renderStaticReact(reactElement)
 
-  // Get resource paths from manifest
-  const { jsFile, cssPaths } = getAssetPaths(manifest, "index.html")
-
-  // Generate complete HTML
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<link rel="icon" href="/favicon.ico" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>${escapeHtml(env.INDEX_PAGE_TITLE)}</title>
-${renderCssLinks(cssPaths)}
-<script>
-${DARK_MODE_SCRIPT}
-</script>
-</head>
-<body>
-<div id="root">${html}</div>
-<script type="module" src="/${jsFile}"></script>
-</body>
-</html>`
+  return renderReactDocument({
+    manifest,
+    entryKey: "index.html",
+    title: env.INDEX_PAGE_TITLE,
+    rootHtml: html,
+  })
 }

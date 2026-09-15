@@ -61,17 +61,6 @@ test("uploadMPU", async () => {
 
 describe("uploadMPU with variant parameters", () => {
   const content = genRandomBlob(1024 * 1024 * 10)
-  it("handles specified name", async () => {
-    const uploadResp = await uploadMPU(BASE_URL, 1024 * 1024 * 5, {
-      isUpdate: false,
-      content: new File([await content.arrayBuffer()], ""),
-      name: "foobarfoobar",
-      expire: "100",
-    })
-    expect(uploadResp.expirationSeconds).toStrictEqual(100)
-    expect(uploadResp.url.includes("/~foobarfoobar")).toStrictEqual(true)
-  })
-
   it("handles long paste name", async () => {
     const uploadResp = await uploadMPU(BASE_URL, 1024 * 1024 * 5, {
       isUpdate: false,

@@ -1,11 +1,10 @@
 import { verifyAuth } from "../pages/auth.js"
-import { decode, genRandStr, WorkerError, timingSafeEqual } from "../common.js"
+import { decode, genRandStr, jsonResponse, WorkerError, timingSafeEqual } from "../common.js"
 import {
   createPaste,
   allocateRandomPasteName,
   getPasteMetadata,
   metaResponseFromMetadata,
-  pasteNameAvailable,
   updatePaste,
 } from "../storage/storage.js"
 import {
@@ -18,7 +17,7 @@ import {
   TEXT_MIME_TYPE,
 } from "../../shared/constants.js"
 import { parsePath, parseSize, parseExpiration } from "../../shared/parsers.js"
-import { isOriginalFileInfo, parseReadLimit, verifyName, verifyPassword } from "../../shared/verify.js"
+import { isOriginalFileInfo, parseReadLimit, verifyPassword } from "../../shared/verify.js"
 import type { OriginalFileInfo, PasteResponse } from "../../shared/interfaces.js"
 import {
   handleMPUAbort,
@@ -119,7 +118,7 @@ export async function handlePostOrPut(
 ): Promise<Response> {
   if (!isPut) {
     // only POST requires auth, since PUT request already contains auth
-    const authResponse = verifyAuth(request, env)
+    const authResponse = await verifyAuth(request, env)
     if (authResponse !== null) {
       return authResponse
     }
@@ -157,7 +156,6 @@ export async function handlePostOrPut(
     throw new WorkerError(400, "cannot find content in formdata")
   }
   const { filename, content, contentAsString, contentLength } = parts.get("c")!
-  const nameFromForm = parts.get("n")?.contentAsString()
   const isPrivate = parts.has("p")
   const passwdFromForm = parts.get("s")?.contentAsString()
   const expireFromForm: string | undefined = parts.get("e")?.contentAsString()
@@ -186,19 +184,12 @@ export async function handlePostOrPut(
     if (!ok) throw new WorkerError(400, msg)
   }
 
-  // check if name is legal
-  if (nameFromForm !== undefined && isPut) {
-    throw new WorkerError(400, `Cannot set name for a PUT request`)
-  }
-  if (nameFromForm !== undefined) {
-    const [ok, msg] = verifyName(nameFromForm)
-    if (!ok) throw new WorkerError(400, msg)
-  }
-
   function makeResponse(created: PasteResponse, additionalHeaders: Record<string, string | undefined> = {}): Response {
-    return new Response(JSON.stringify(created, null, 2), {
-      headers: { "Content-Type": "application/json;charset=UTF-8", ...additionalHeaders },
-    })
+    const headers = new Headers()
+    for (const [name, value] of Object.entries(additionalHeaders)) {
+      if (value !== undefined) headers.set(name, value)
+    }
+    return jsonResponse(created, { headers }, 2)
   }
 
   function accessUrl(short: string): string {
@@ -270,11 +261,6 @@ export async function handlePostOrPut(
         pasteName = url.searchParams.get("name")!
       } else {
         throw new WorkerError(400, `no name for MPU complete`)
-      }
-    } else if (nameFromForm !== undefined) {
-      pasteName = "~" + nameFromForm
-      if (!(await pasteNameAvailable(env, pasteName))) {
-        throw new WorkerError(409, `name '${pasteName}' is already used`)
       }
     } else {
       pasteName = await allocateRandomPasteName(env, isPrivate ? PRIVATE_PASTE_NAME_LEN : PASTE_NAME_LEN)

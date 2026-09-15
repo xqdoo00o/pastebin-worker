@@ -27,9 +27,9 @@ MPU_THRESHOLD = 5 * 1024 * 1024  # switch to multipart upload above this size
 MPU_CHUNK_SIZE = 5 * 1024 * 1024  # R2 requires every part except the last to be >=5 MiB
 ENCRYPTION_SCHEME = "AES-GCM-CHUNKED"
 ENCRYPTION_HEADER = "X-PB-Encryption-Scheme"
-ENCRYPTION_MAGIC = b"PBENC001"
-ENCRYPTION_CHUNK_SIZE = 5 * 1024 * 1024
-ENCRYPTION_HEADER_SIZE = 32
+ENCRYPTION_MAGIC = b"PBE2"
+ENCRYPTION_PART_SIZE = MPU_CHUNK_SIZE
+ENCRYPTION_HEADER_SIZE = 24
 ENCRYPTION_TAG_SIZE = 16
 
 LEVEL_COLORS = {
@@ -157,12 +157,19 @@ def b64_variant_decode(s: str) -> bytes:
 
 
 def encryption_chunk_bounds(plaintext_size: int, index: int) -> tuple[int, int]:
-    start = index * ENCRYPTION_CHUNK_SIZE
-    return start, min(plaintext_size, start + ENCRYPTION_CHUNK_SIZE)
+    first_size = ENCRYPTION_PART_SIZE - ENCRYPTION_HEADER_SIZE - ENCRYPTION_TAG_SIZE
+    if index == 0:
+        return 0, min(plaintext_size, first_size)
+    following_size = ENCRYPTION_PART_SIZE - ENCRYPTION_TAG_SIZE
+    start = first_size + (index - 1) * following_size
+    return start, min(plaintext_size, start + following_size)
 
 
 def encryption_chunk_count(plaintext_size: int) -> int:
-    return max(1, math.ceil(plaintext_size / ENCRYPTION_CHUNK_SIZE))
+    first_size = ENCRYPTION_PART_SIZE - ENCRYPTION_HEADER_SIZE - ENCRYPTION_TAG_SIZE
+    following_size = ENCRYPTION_PART_SIZE - ENCRYPTION_TAG_SIZE
+    remaining = max(0, plaintext_size - first_size)
+    return 1 + math.ceil(remaining / following_size)
 
 
 def encrypt_body(body: bytes) -> tuple[str, bytes]:
@@ -170,10 +177,9 @@ def encrypt_body(body: bytes) -> tuple[str, bytes]:
     raw_key = os.urandom(32)
     nonce_prefix = os.urandom(8)
     header = struct.pack(
-        ">8sIIQ8s",
+        ">4sIQ8s",
         ENCRYPTION_MAGIC,
-        ENCRYPTION_CHUNK_SIZE,
-        ENCRYPTION_TAG_SIZE,
+        ENCRYPTION_PART_SIZE,
         len(body),
         nonce_prefix,
     )
@@ -205,14 +211,8 @@ def decrypt_body(scheme: str, encoded_key: str, blob: bytes) -> bytes:
         die("ciphertext is too short to contain a chunked encryption header")
 
     header = blob[:ENCRYPTION_HEADER_SIZE]
-    magic, chunk_size, tag_size, plaintext_size, nonce_prefix = struct.unpack(
-        ">8sIIQ8s", header
-    )
-    if (
-        magic != ENCRYPTION_MAGIC
-        or chunk_size != ENCRYPTION_CHUNK_SIZE
-        or tag_size != ENCRYPTION_TAG_SIZE
-    ):
+    magic, part_size, plaintext_size, nonce_prefix = struct.unpack(">4sIQ8s", header)
+    if magic != ENCRYPTION_MAGIC or part_size != ENCRYPTION_PART_SIZE:
         die("unsupported or invalid chunked encryption header")
     expected_size = (
         ENCRYPTION_HEADER_SIZE
@@ -454,7 +454,6 @@ def upload_mpu(
     body: bytes,
     fields: dict,
     is_update: bool,
-    name: Optional[str],
     passwd: Optional[str],
     is_private: bool,
     expire: Optional[str],
@@ -465,7 +464,7 @@ def upload_mpu(
 ) -> None:
     """Multipart upload for files larger than MPU_THRESHOLD.
 
-    For post:   POST /mpu/create?n=&p=&e=
+    For post:   POST /mpu/create?p=&e=
     For update: POST /mpu/create-update?name=&password=&e=
     Then PUT /mpu/resume?key=&uploadId=&partNumber= for each 5 MiB chunk.
     Finally POST /mpu/complete?name=&key=&uploadId= with `c=<json parts list>`.
@@ -479,8 +478,6 @@ def upload_mpu(
     else:
         create_url = f"{domain}/mpu/create"
         create_params = {}
-        if name:
-            create_params["n"] = name.lstrip("~")
         if is_private:
             create_params["p"] = "1"
     if expire:
@@ -647,8 +644,6 @@ def parse_name_passwd(arg: str) -> tuple[str, Optional[str]]:
 
 
 def cmd_post(args: argparse.Namespace, domain: str) -> None:
-    if args.private and args.name:
-        die("cannot set both 'private' and 'name'")
     if args.file and args.file_pos:
         die("cannot specify FILE both as positional argument and via '-f'")
 
@@ -673,7 +668,6 @@ def cmd_post(args: argparse.Namespace, domain: str) -> None:
             body,
             mpu_fields,
             is_update=False,
-            name=args.name,
             passwd=None,
             is_private=bool(args.private),
             expire=args.expire,
@@ -687,8 +681,6 @@ def cmd_post(args: argparse.Namespace, domain: str) -> None:
     fields: dict = {}
     if args.expire:
         fields["e"] = args.expire
-    if args.name:
-        fields["n"] = args.name
     if args.passwd:
         fields["s"] = args.passwd
     if args.private:
@@ -936,7 +928,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_post.add_argument("-c", "--content", help="inline content of the paste")
     p_post.add_argument("-e", "--expire", help="expiration time (e.g. 60, 1h, 7d)")
-    p_post.add_argument("-n", "--name", help="custom name (prefix with ~)")
     p_post.add_argument("-s", "--passwd", help="password")
     p_post.add_argument(
         "-p", "--private", action="store_true", help="use longer random name"
@@ -948,7 +939,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-E",
         "--encrypt",
         action="store_true",
-        help="client-side encrypt in authenticated 5 MiB AES-GCM chunks (requires 'cryptography')",
+        help="client-side encrypt in authenticated, MPU-aligned AES-GCM chunks (requires 'cryptography')",
     )
     p_post.add_argument(
         "-F",
@@ -983,7 +974,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-E",
         "--encrypt",
         action="store_true",
-        help="client-side encrypt in authenticated 5 MiB AES-GCM chunks (requires 'cryptography')",
+        help="client-side encrypt in authenticated, MPU-aligned AES-GCM chunks (requires 'cryptography')",
     )
     p_update.add_argument(
         "-F",

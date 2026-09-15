@@ -1,24 +1,24 @@
 import { WorkerError } from "./common.js"
 import { ParseError } from "../shared/parsers.js"
 
-import { handleOptions, corsWrapResponse } from "./handlers/handleCors.js"
+import { ALLOW_HEADER, handleOptions, corsWrapResponse } from "./handlers/handleCors.js"
 import { handlePostOrPut } from "./handlers/handleWrite.js"
 import { handleGet } from "./handlers/handleRead.js"
 import { handleDelete } from "./handlers/handleDelete.js"
 import { cleanExpiredInR2 } from "./storage/storage.js"
-import { P2PRoom, handleP2PCreate, handleP2PUpdate, handleP2PWebSocket } from "./p2p.js"
+import { P2PRoom, handleP2PRequest } from "./p2p.js"
 import { PasteReadCounter } from "./readCounter.js"
 
 export { P2PRoom, PasteReadCounter }
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return await handleRequest(request, env, ctx)
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return handleRequest(request, env, ctx)
   },
 
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async scheduled(controller: ScheduledController, env, ctx) {
+  scheduled(controller: ScheduledController, env, ctx): Promise<void> {
     ctx.waitUntil(cleanExpiredInR2(env, controller))
+    return Promise.resolve()
   },
 } satisfies ExportedHandler<Env>
 
@@ -58,33 +58,25 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 async function handleNormalRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   // Keep the normal paste hot path free from P2P URL parsing and async calls.
   if (request.url.includes("/p2p/")) {
-    const p2pCreateResp = await handleP2PCreate(request, env)
-    if (p2pCreateResp !== null) return p2pCreateResp
-
-    const p2pUpdateResp = await handleP2PUpdate(request, env)
-    if (p2pUpdateResp !== null) return p2pUpdateResp
-
-    const p2pWsResp = await handleP2PWebSocket(request, env)
-    if (p2pWsResp !== null) return p2pWsResp
+    const p2pResponse = await handleP2PRequest(request, env)
+    if (p2pResponse !== null) return p2pResponse
   }
 
-  // TODO: support HEAD method
-  if (request.method === "POST") {
-    return await handlePostOrPut(request, env, ctx, false)
-  } else if (request.method === "GET") {
-    return await handleGet(request, env, ctx, false)
-  } else if (request.method === "HEAD") {
-    return await handleGet(request, env, ctx, true)
-  } else if (request.method === "DELETE") {
-    return await handleDelete(request, env, ctx)
-  } else if (request.method === "PUT") {
-    return await handlePostOrPut(request, env, ctx, true)
-  } else {
-    return new Response(`method ${request.method} not allowed`, {
-      status: 405,
-      headers: {
-        Allow: "GET, HEAD, PUT, POST, DELETE, OPTION",
-      },
-    })
+  switch (request.method) {
+    case "POST":
+      return handlePostOrPut(request, env, ctx, false)
+    case "GET":
+      return handleGet(request, env, ctx, false)
+    case "HEAD":
+      return handleGet(request, env, ctx, true)
+    case "DELETE":
+      return handleDelete(request, env, ctx)
+    case "PUT":
+      return handlePostOrPut(request, env, ctx, true)
+    default:
+      return new Response(`method ${request.method} not allowed`, {
+        status: 405,
+        headers: { Allow: ALLOW_HEADER },
+      })
   }
 }

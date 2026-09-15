@@ -12,7 +12,7 @@ export function InfoTooltip({ label, children, compact = false }: InfoTooltipPro
   return (
     <Tooltip
       content={
-        <div className={compact ? "max-w-[18rem] px-1 py-1 text-small" : "max-w-[20rem] px-1 py-2 text-small"}>
+        <div className={compact ? "max-w-[18rem] px-1 py-1 text-sm" : "max-w-[20rem] px-1 py-2 text-sm"}>
           {children}
         </div>
       }

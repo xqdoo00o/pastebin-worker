@@ -4,8 +4,9 @@ import filterXSS from "xss"
 import type { IFilterXSSOptions } from "xss"
 
 import { escapeHtml } from "../common.js"
+import { lineNumberText } from "../../shared/format.js"
 import manifest from "../../dist/frontend/.vite/ssr-manifest.json"
-import { getAssetPaths, renderCssLinks } from "../ssrUtils.js"
+import { getAssetPaths, renderCssLinks, renderModulePreloadLinks } from "../ssrUtils.js"
 
 // Marked emits whatever HTML the markdown asked for, including raw <script>,
 // event handlers, javascript: URLs, etc. Run its output through xss with an
@@ -181,32 +182,6 @@ function renderToc(toc: TocEntry[]): string {
   return `<nav class="toc" aria-label="Table of contents">${html}</nav>`
 }
 
-const sidebarStyles = `
-  body { margin: 0; }
-  .page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2rem; max-width: 1200px; margin: 2rem auto; padding: 0 1rem; box-sizing: border-box; }
-  .page > article { min-width: 0; }
-  @media (min-width: 1024px) { .page.has-toc { grid-template-columns: 240px minmax(0, 1fr); } }
-  .toc { font-size: 0.9em; line-height: 1.5; }
-  @media (min-width: 1024px) { .toc { position: sticky; top: 1rem; align-self: start; max-height: calc(100vh - 2rem); overflow-y: auto; } }
-  .toc ol { list-style: none; padding-left: 1em; margin: 0; }
-  .toc > ol { padding-left: 0; }
-  .toc li { margin: 0; }
-  .toc a { display: block; padding: 0.2rem 0 0.2rem 0.5rem; color: #57606a; text-decoration: none; border-left: 2px solid transparent; }
-  .toc a:hover { color: #0969da; }
-  .toc a.active { color: #0969da; border-left-color: #0969da; background: rgba(9, 105, 218, 0.06); }
-  .markdown-body :is(h1, h2, h3, h4, h5, h6) .header-anchor { opacity: 0; margin-left: -0.8em; padding-right: 0.2em; color: #57606a; text-decoration: none; font-weight: normal; }
-  .markdown-body :is(h1, h2, h3, h4, h5, h6):hover .header-anchor,
-  .markdown-body .header-anchor:focus { opacity: 1; }
-  /* Fenced code block layout. The line-number gutter is rendered server-side
-     and uses CSS counters, so it's visible immediately (no JS / no CLS) and
-     stays put once highlight.js swaps the code's children. */
-  .markdown-body .code-block { display: grid; grid-template-columns: auto minmax(0, 1fr); margin: 1em 0; border: 1px solid #d0d7de; border-radius: 6px; background: #f6f8fa; overflow: hidden; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 85%; line-height: 1.45; }
-  .markdown-body .code-block > pre { grid-column: 2; margin: 0; padding: 12px 16px; overflow-x: auto; background: transparent; font: inherit; border: 0; border-radius: 0; }
-  .markdown-body .code-block > pre > code { background: transparent; padding: 0; font: inherit; border-radius: 0; }
-  .markdown-body .code-block > .line-number-rows { grid-column: 1; padding: 12px 8px 12px 12px; border-right: 1px solid #d0d7de; color: #6e7681; user-select: none; counter-reset: linenumber; }
-  .line-number-rows > span::before { content: counter(linenumber); counter-increment: linenumber; display: block; text-align: right; min-width: 1.5em; }
-`
-
 const scrollSpyScript = `
 (() => {
   const links = new Map();
@@ -332,7 +307,7 @@ export function makeMarkdown(content: string): string {
         // exactly one back, so the line count matches what's rendered.
         const body = text.replace(/\n+$/, "") + "\n"
         const lineCount = body.match(/\n/g)?.length ?? 1
-        const gutter = `<span></span>`.repeat(lineCount)
+        const gutter = lineNumberText(lineCount)
         const lang0 = /^\S*/.exec(lang || "")?.[0] || ""
         const classAttr = lang0 ? ` class="language-${escapeHtml(lang0)}"` : ""
         return (
@@ -351,7 +326,7 @@ export function makeMarkdown(content: string): string {
 
   const tocHtml = renderToc(metadata.toc)
   const hasToc = tocHtml.length > 0
-  const { jsFile, cssPaths } = getAssetPaths(manifest, "pages/render/markdown.ts")
+  const { jsFile, jsPreloadPaths, cssPaths } = getAssetPaths(manifest, "pages/render/markdown.ts")
 
   return `<!DOCTYPE html>
 <html lang='en' class='light'>
@@ -362,7 +337,7 @@ export function makeMarkdown(content: string): string {
   ${metadata.description.length > 0 ? `<meta name='description' content='${metadata.description}'>` : ""}
   <link rel='stylesheet' href='https://pages.github.com/assets/css/style.css'>
   ${renderCssLinks(cssPaths)}
-  <style>${sidebarStyles}</style>
+  ${renderModulePreloadLinks(jsPreloadPaths)}
   <script id="MathJax-script" async
           src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js">
   </script>
@@ -371,11 +346,12 @@ export function makeMarkdown(content: string): string {
 <body>
 <div class='page${hasToc ? " has-toc" : ""}'>
 ${tocHtml}
-<article class='px-3 markdown-body'>
+<article class='markdown-body'>
 ${convertedHtml}
 </article>
 </div>
   ${hasToc ? `<script>${scrollSpyScript}</script>` : ""}
+</body>
 </html>
 `
 }

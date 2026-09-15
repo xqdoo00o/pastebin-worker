@@ -13,26 +13,6 @@ afterEach(() => {
 })
 
 describe("MPU error paths", () => {
-  it("handleMPUCreate rejects names not matching NAME_REGEX", async () => {
-    // too short (regex requires {3,})
-    const r1 = await workerFetch(ctx, new Request(`${BASE_URL}/mpu/create?n=ab`, { method: "POST" }))
-    expect(r1.status).toStrictEqual(400)
-    expect(await r1.text()).toContain("illegal paste name")
-
-    // contains a character outside the allowed set
-    const r2 = await workerFetch(ctx, new Request(`${BASE_URL}/mpu/create?n=ab!cd`, { method: "POST" }))
-    expect(r2.status).toStrictEqual(400)
-  })
-
-  it("handleMPUCreate returns 409 when name is already taken", async () => {
-    const name = "mpuname"
-    await upload(ctx, { c: new Blob(["seed"]), n: name })
-
-    const resp = await workerFetch(ctx, new Request(`${BASE_URL}/mpu/create?n=${name}`, { method: "POST" }))
-    expect(resp.status).toStrictEqual(409)
-    expect(await resp.text()).toContain("already used")
-  })
-
   it("handleMPUCreateUpdate requires both name and password", async () => {
     const r1 = await workerFetch(ctx, new Request(`${BASE_URL}/mpu/create-update?name=foo`, { method: "POST" }))
     expect(r1.status).toStrictEqual(400)

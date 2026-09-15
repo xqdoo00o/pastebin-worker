@@ -75,16 +75,6 @@ describe("write error paths — content/format validation", () => {
 })
 
 describe("write error paths — name and password validation", () => {
-  it("POST with name not matching NAME_REGEX returns 400", async () => {
-    await uploadExpectStatus(ctx, { c: new Blob(["x"]), n: "ab!cd" }, 400)
-  })
-
-  it("POST with already-used name returns 409", async () => {
-    const name = "takenname"
-    await upload(ctx, { c: new Blob(["first"]), n: name })
-    await uploadExpectStatus(ctx, { c: new Blob(["second"]), n: name }, 409)
-  })
-
   it("POST with too-short password returns 400", async () => {
     await uploadExpectStatus(ctx, { c: new Blob(["x"]), s: "short" }, 400)
   })
@@ -106,14 +96,6 @@ describe("write error paths — PUT specifics", () => {
   it("PUT exceeding 5 MiB returns 413", async () => {
     const seeded = await upload(ctx, { c: new Blob(["x"]) })
     await uploadExpectStatus(ctx, { c: new Blob([new Uint8Array(DIRECT_UPLOAD_MAX_BYTES + 1)]) }, 413, {
-      method: "PUT",
-      url: seeded.manageUrl,
-    })
-  })
-
-  it("PUT with `n` field returns 400 (cannot rename)", async () => {
-    const seeded = await upload(ctx, { c: new Blob(["x"]) })
-    await uploadExpectStatus(ctx, { c: new Blob(["y"]), n: "newname" }, 400, {
       method: "PUT",
       url: seeded.manageUrl,
     })

@@ -1,0 +1,21 @@
+diff --git a/core/src/GlobalHistogramBinarizer.cpp b/core/src/GlobalHistogramBinarizer.cpp
+index 2f0c8b9..efaa185 100644
+--- a/core/src/GlobalHistogramBinarizer.cpp
++++ b/core/src/GlobalHistogramBinarizer.cpp
+@@ -197,10 +197,12 @@ GlobalHistogramBinarizer::getBlackMatrix() const
+ 	Histogram localBuckets = {};
+ 	{
++		const int pixelStride = _buffer.pixStride();
++		const int channelOffset = GreenIndex(_buffer.format());
+ 		for (int y = 1; y < 5; y++) {
+ 			int row = height() * y / 5;
+-			const uint8_t* luminances = _buffer.data(0, row);
++			const uint8_t* luminance = _buffer.data(width() / 5, row) + channelOffset;
+ 			int right = (width() * 4) / 5;
+-			for (int x = width() / 5; x < right; x++)
+-				localBuckets[luminances[x] >> LUMINANCE_SHIFT]++;
++			for (int x = width() / 5; x < right; x++, luminance += pixelStride)
++				localBuckets[*luminance >> LUMINANCE_SHIFT]++;
+ 		}
+ 	}
+ 

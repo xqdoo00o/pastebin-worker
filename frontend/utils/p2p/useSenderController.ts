@@ -1,45 +1,7 @@
 import { useCallback, useMemo, useReducer, useRef } from "react"
 import type { P2PCreateResponse, P2PIceServer } from "../../../shared/interfaces.js"
-import type { PasteEditState } from "../../components/PasteInputPanel.js"
-import type { PasteSetting } from "../pasteSetting.js"
+import type { UpdateSnapshot } from "../content.js"
 import type { P2PSenderFileInfo, P2PSenderPeerInfo, P2PSenderSession } from "./protocol.js"
-
-export interface P2PUpdateSnapshot {
-  editorState: PasteEditState
-  expiration: string
-  maxTransfers: string
-  verifyTransfer: boolean
-}
-
-export function isSameP2PContent(left: PasteEditState, right: PasteEditState): boolean {
-  if (left.editKind !== right.editKind) return false
-  if (left.editKind === "edit") {
-    return left.editContent === right.editContent && left.editFilename === right.editFilename
-  }
-  return left.files.length === right.files.length && left.files.every((file, index) => file === right.files[index])
-}
-
-export function createP2PUpdateSnapshot(editorState: PasteEditState, setting: PasteSetting): P2PUpdateSnapshot {
-  return {
-    editorState: { ...editorState, files: [...editorState.files] },
-    expiration: setting.expiration,
-    maxTransfers: setting.readLimit,
-    verifyTransfer: setting.verifyP2P,
-  }
-}
-
-export function isSameP2PUpdate(
-  snapshot: P2PUpdateSnapshot,
-  editorState: PasteEditState,
-  setting: PasteSetting,
-): boolean {
-  return (
-    isSameP2PContent(snapshot.editorState, editorState) &&
-    snapshot.expiration === setting.expiration &&
-    snapshot.maxTransfers === setting.readLimit &&
-    snapshot.verifyTransfer === setting.verifyP2P
-  )
-}
 
 interface SenderControllerState {
   response?: P2PCreateResponse
@@ -47,7 +9,7 @@ interface SenderControllerState {
   peers: P2PSenderPeerInfo[]
   iceServers?: P2PIceServer[]
   currentFile?: P2PSenderFileInfo
-  lastUpdate: P2PUpdateSnapshot | null
+  lastUpdate: UpdateSnapshot | null
 }
 
 const initialState: SenderControllerState = {
@@ -64,10 +26,10 @@ type SenderControllerAction =
       type: "connected"
       response: P2PCreateResponse
       currentFile: P2PSenderFileInfo
-      lastUpdate: P2PUpdateSnapshot
+      lastUpdate: UpdateSnapshot
     }
   | { type: "current-file"; currentFile: P2PSenderFileInfo }
-  | { type: "last-update"; lastUpdate: P2PUpdateSnapshot }
+  | { type: "last-update"; lastUpdate: UpdateSnapshot }
   | { type: "room-updated"; expireAt: string; expirationSeconds: number }
 
 function reducer(state: SenderControllerState, action: SenderControllerAction): SenderControllerState {
@@ -123,7 +85,7 @@ export function useP2PSenderController(onError: (error: Error) => void) {
     session?.close()
   }, [])
 
-  const attach = useCallback((session: P2PSenderSession, lastUpdate: P2PUpdateSnapshot) => {
+  const attach = useCallback((session: P2PSenderSession, lastUpdate: UpdateSnapshot) => {
     sessionRef.current = session
     dispatch({
       type: "connected",
@@ -152,7 +114,7 @@ export function useP2PSenderController(onError: (error: Error) => void) {
     attach,
     isCurrent: (session: P2PSenderSession) => sessionRef.current === session,
     setCurrentFile: (currentFile: P2PSenderFileInfo) => dispatch({ type: "current-file", currentFile }),
-    setLastUpdate: (lastUpdate: P2PUpdateSnapshot) => dispatch({ type: "last-update", lastUpdate }),
+    setLastUpdate: (lastUpdate: UpdateSnapshot) => dispatch({ type: "last-update", lastUpdate }),
     updateRoom: (expireAt: string, expirationSeconds: number) =>
       dispatch({ type: "room-updated", expireAt, expirationSeconds }),
   }

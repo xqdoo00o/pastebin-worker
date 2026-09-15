@@ -1,15 +1,21 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { readFileSync } from "node:fs"
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { startP2PReceiver } from "../utils/p2pReceiver.js"
-import { startP2PSender } from "../utils/p2pSender.js"
-import type { P2PFileMeta, P2PProgress, P2PSenderPeerInfo } from "../utils/p2pCommon.js"
-import type { P2PCreateResponse, PublicEnv } from "../../shared/interfaces.js"
-import { sha1Hex, verificationBlockSize } from "../utils/p2pCommon.js"
+import { startP2PSender as startP2PSenderWithOptions, type StartP2PSenderOptions } from "../utils/p2pSender.js"
+import type { P2PFileMeta, P2PProgress, P2PSenderPeerInfo, P2PVerificationManifest } from "../utils/p2p/protocol.js"
+import type { P2PCreateResponse, P2PIceServer, PublicEnv } from "../../shared/interfaces.js"
+import { P2P_DIRECT_PROBE_TIMEOUT_MS } from "../../shared/constants.js"
+import { verificationBlockSize } from "../utils/p2p/protocol.js"
+import { xxh3Hex } from "../utils/p2p/verification.js"
+import { initializeXXHash } from "../wasm/xxhash-runtime.js"
 import {
   readP2PResumeCheckpoint,
-  readP2PSessionPeerId,
+  readP2PSessionPeer,
   removeP2PResumeCheckpoint,
   writeP2PResumeCheckpoint,
 } from "../utils/p2pReceiveStore.js"
+
+beforeAll(() => initializeXXHash(readFileSync("frontend/wasm/xxhash/xxhash_simd.wasm")))
 
 class MockDataChannel extends EventTarget {
   readonly label = "file"
@@ -35,7 +41,12 @@ class MockDataChannel extends EventTarget {
   }
 
   receive(message: object) {
-    this.receiveData(JSON.stringify(message))
+    const data = message as { type?: string; meta?: Record<string, unknown> }
+    const normalized =
+      (data.type === "meta" || data.type === "file-update") && data.meta && data.meta.senderBrowser === undefined
+        ? { ...data, meta: { ...data.meta, senderBrowser: "Test browser" } }
+        : message
+    this.receiveData(JSON.stringify(normalized))
   }
 
   receiveData(data: unknown) {
@@ -49,6 +60,7 @@ class MockPeerConnection {
   readonly dataChannel = new MockDataChannel()
   connectionState: RTCPeerConnectionState = "new"
   remoteDescription: RTCSessionDescription | null = null
+  selectedCandidateType?: RTCIceCandidateType
   onicecandidate: ((this: RTCPeerConnection, ev: RTCPeerConnectionIceEvent) => unknown) | null = null
   onconnectionstatechange: ((this: RTCPeerConnection, ev: Event) => unknown) | null = null
   ondatachannel: ((this: RTCPeerConnection, ev: RTCDataChannelEvent) => unknown) | null = null
@@ -80,6 +92,34 @@ class MockPeerConnection {
 
   addIceCandidate() {
     return Promise.resolve()
+  }
+
+  getStats(): Promise<RTCStatsReport> {
+    const stats = new Map<string, object>()
+    if (this.selectedCandidateType) {
+      stats.set("transport", { id: "transport", type: "transport", timestamp: 0, selectedCandidatePairId: "pair" })
+      stats.set("pair", {
+        id: "pair",
+        type: "candidate-pair",
+        timestamp: 0,
+        selected: true,
+        localCandidateId: "local",
+        remoteCandidateId: "remote",
+      })
+      stats.set("local", {
+        id: "local",
+        type: "local-candidate",
+        timestamp: 0,
+        candidateType: this.selectedCandidateType,
+      })
+      stats.set("remote", {
+        id: "remote",
+        type: "remote-candidate",
+        timestamp: 0,
+        candidateType: "host",
+      })
+    }
+    return Promise.resolve(stats as unknown as RTCStatsReport)
   }
 
   close() {
@@ -272,8 +312,89 @@ const roomResponse: P2PCreateResponse = {
   expirationSeconds: 60,
 }
 
+const relayIceServers = [
+  {
+    urls: ["stun:stun.example.com:3478", "turn:turn.example.com:3478?transport=tcp"],
+    username: "p2p",
+    credential: "secret",
+  },
+] satisfies P2PIceServer[]
+
+function startP2PSender(
+  file: File,
+  senderConfig: PublicEnv,
+  expire: string,
+  maxTransfers: string,
+  verifyTransfer: boolean,
+  callbacks: StartP2PSenderOptions["callbacks"],
+  signal?: AbortSignal,
+  highlightLanguage?: string,
+  fileCleanup?: StartP2PSenderOptions["fileCleanup"],
+  options: Pick<StartP2PSenderOptions, "isPrivate" | "originalFiles"> = {},
+) {
+  return startP2PSenderWithOptions({
+    file,
+    config: senderConfig,
+    expire,
+    maxTransfers,
+    verifyTransfer,
+    callbacks,
+    signal,
+    highlightLanguage,
+    fileCleanup,
+    ...options,
+  })
+}
+
 async function flushTasks() {
   await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+async function openIncomingDataChannel(
+  socket: MockWebSocket,
+  peerId = "sender",
+  sdp = "offer",
+): Promise<{ peer: MockPeerConnection; channel: MockDataChannel }> {
+  const peerIndex = MockPeerConnection.instances.length
+  socket.receive({ type: "offer", peerId, sdp: { type: "offer", sdp } })
+  await vi.waitFor(() => expect(MockPeerConnection.instances.length).toBeGreaterThan(peerIndex))
+  const peer = MockPeerConnection.instances[peerIndex]
+  const channel = peer.dataChannel
+  peer.receiveDataChannel(channel)
+  channel.open()
+  return { peer, channel }
+}
+
+async function startConnectedRelaySender(
+  options: {
+    connectionId?: string
+    onPeersChange?: (peers: P2PSenderPeerInfo[]) => void
+  } = {},
+) {
+  const onPeersChange = options.onPeersChange ?? vi.fn<(peers: P2PSenderPeerInfo[]) => void>()
+  const session = await startP2PSender(new File(["data"], "file.bin"), config, "1h", "1", false, {
+    onStatus: vi.fn(),
+    onPeersChange,
+    onError: vi.fn((error) => {
+      throw error
+    }),
+  })
+  const socket = MockWebSocket.instances[0]
+  socket.receive({
+    type: "ready",
+    role: "sender",
+    iceServers: relayIceServers,
+    peers: {
+      sender: true,
+      receivers: [{ peerId: "receiver-1", ...(options.connectionId ? { connectionId: options.connectionId } : {}) }],
+    },
+  })
+  await vi.advanceTimersByTimeAsync(0)
+  const relayPeer = MockPeerConnection.instances[0]
+  relayPeer.selectedCandidateType = "relay"
+  relayPeer.dataChannel.open()
+  await vi.advanceTimersByTimeAsync(0)
+  return { session, socket, relayPeer, onPeersChange }
 }
 
 describe("P2P transfer lifecycle", () => {
@@ -349,6 +470,208 @@ describe("P2P transfer lifecycle", () => {
     session.close()
   })
 
+  it("re-gathers ICE after signaling reconnects when the current route uses TURN", async () => {
+    vi.useFakeTimers()
+    try {
+      const onPeersChange = vi.fn<(peers: P2PSenderPeerInfo[]) => void>()
+      const connectionId = "00000000-0000-4000-8000-000000000081"
+      const {
+        session,
+        socket: firstSocket,
+        relayPeer,
+      } = await startConnectedRelaySender({
+        connectionId,
+        onPeersChange,
+      })
+
+      firstSocket.onclose?.call(firstSocket as unknown as WebSocket, new CloseEvent("close"))
+      await vi.advanceTimersByTimeAsync(1_000)
+      const reconnectedSocket = MockWebSocket.instances[1]
+      reconnectedSocket.onopen?.call(reconnectedSocket as unknown as WebSocket, new Event("open"))
+      reconnectedSocket.receive({
+        type: "ready",
+        role: "sender",
+        iceServers: relayIceServers,
+        peers: {
+          sender: true,
+          receivers: [{ peerId: "receiver-1", connectionId }],
+        },
+      })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(MockPeerConnection.instances).toHaveLength(2)
+      expect(relayPeer.connectionState).toStrictEqual("closed")
+      expect(onPeersChange.mock.calls[onPeersChange.mock.calls.length - 1]?.[0]?.[0]).toMatchObject({
+        connectionRoute: "relay",
+        connectionPhase: "reconnecting",
+      })
+
+      const directPeer = MockPeerConnection.instances[1]
+      expect(directPeer.configuration).toStrictEqual({
+        iceServers: [{ ...relayIceServers[0], urls: ["stun:stun.example.com:3478"] }],
+      })
+      expect(
+        reconnectedSocket.sent
+          .map((raw): unknown => JSON.parse(raw) as unknown)
+          .find(
+            (message): message is { type: string; directOnly?: boolean } =>
+              typeof message === "object" && message !== null && "type" in message && message.type === "offer",
+          ),
+      ).toMatchObject({ type: "offer", directOnly: true })
+      directPeer.selectedCandidateType = "host"
+      directPeer.dataChannel.open()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(onPeersChange.mock.calls[onPeersChange.mock.calls.length - 1]?.[0]?.[0]).toMatchObject({
+        connectionRoute: "direct",
+        connectionPhase: "connected",
+      })
+      await vi.advanceTimersByTimeAsync(P2P_DIRECT_PROBE_TIMEOUT_MS)
+      expect(MockPeerConnection.instances).toHaveLength(2)
+      session.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("falls back to complete TURN-capable ICE after the direct-only recovery probe times out", async () => {
+    vi.useFakeTimers()
+    try {
+      const { session, relayPeer } = await startConnectedRelaySender()
+
+      relayPeer.connectionState = "failed"
+      relayPeer.onconnectionstatechange?.call(relayPeer as unknown as RTCPeerConnection, new Event("statechange"))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(MockPeerConnection.instances).toHaveLength(2)
+      expect(MockPeerConnection.instances[1].configuration).toStrictEqual({
+        iceServers: [{ ...relayIceServers[0], urls: ["stun:stun.example.com:3478"] }],
+      })
+
+      await vi.advanceTimersByTimeAsync(P2P_DIRECT_PROBE_TIMEOUT_MS - 1)
+      expect(MockPeerConnection.instances).toHaveLength(2)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(MockPeerConnection.instances).toHaveLength(3)
+      expect(MockPeerConnection.instances[2].configuration).toStrictEqual({ iceServers: relayIceServers })
+      session.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("probes a direct route when a receiver changes signaling endpoints while TURN remains usable", async () => {
+    vi.useFakeTimers()
+    try {
+      const { session, socket } = await startConnectedRelaySender({
+        connectionId: "00000000-0000-4000-8000-000000000081",
+      })
+
+      socket.receive({
+        type: "peer-joined",
+        role: "receiver",
+        peerId: "receiver-1",
+        connectionId: "00000000-0000-4000-8000-000000000082",
+      })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(MockPeerConnection.instances).toHaveLength(2)
+      expect(MockPeerConnection.instances[1].configuration).toStrictEqual({
+        iceServers: [{ ...relayIceServers[0], urls: ["stun:stun.example.com:3478"] }],
+      })
+      session.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("persists a failed recovery token across refresh and explicitly retries pairing", async () => {
+    vi.useFakeTimers()
+    try {
+      const callbacks = {
+        onStatus: vi.fn(),
+        onMeta: vi.fn(),
+        onProgress: vi.fn(),
+        onPausedChange: vi.fn(),
+        onFile: vi.fn(),
+        onError: vi.fn((error: Error) => {
+          throw error
+        }),
+      }
+      const firstSession = startP2PReceiver("room", config, callbacks)
+      const firstSocket = MockWebSocket.instances[0]
+      const retryToken = "00000000-0000-4000-8000-000000000091"
+      firstSocket.receive({ type: "peer-reconnect-failed", peerId: "receiver", retryToken })
+      await vi.advanceTimersByTimeAsync(0)
+      firstSession.close()
+      expect(firstSocket.sent).toContain(JSON.stringify({ type: "receiver-leave", resumable: false }))
+
+      const refreshedSession = startP2PReceiver("room", config, callbacks)
+      const refreshedSocket = MockWebSocket.instances[1]
+      refreshedSocket.receive({ type: "ready", role: "receiver", peers: { sender: true, receivers: [] } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(refreshedSocket.sent.map((message): unknown => JSON.parse(message) as unknown)).toContainEqual({
+        type: "peer-reconnect-request",
+        retryToken,
+      })
+      refreshedSession.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("keeps the last confirmed receiver route visible until rebuilt ICE selects a replacement", async () => {
+    const onConnectionRouteChange = vi.fn()
+    const iceServers = [
+      {
+        urls: ["stun:stun.example.com:3478", "turn:turn.example.com:3478?transport=tcp"],
+        username: "p2p",
+        credential: "secret",
+      },
+    ]
+    const session = startP2PReceiver("room", config, {
+      onStatus: vi.fn(),
+      onConnectionRouteChange,
+      onMeta: vi.fn(),
+      onProgress: vi.fn(),
+      onPausedChange: vi.fn(),
+      onFile: vi.fn(),
+      onError: vi.fn((error) => {
+        throw error
+      }),
+    })
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: "ready", role: "receiver", iceServers, peers: { sender: true, receivers: [] } })
+    await flushTasks()
+    socket.receive({ type: "offer", peerId: "sender", sdp: { type: "offer", sdp: "relay-offer" } })
+    await flushTasks()
+    const relayPeer = MockPeerConnection.instances[0]
+    relayPeer.selectedCandidateType = "relay"
+    relayPeer.receiveDataChannel()
+    relayPeer.dataChannel.open()
+    await flushTasks()
+    expect(onConnectionRouteChange).toHaveBeenLastCalledWith("relay")
+
+    socket.receive({
+      type: "offer",
+      peerId: "sender",
+      sdp: { type: "offer", sdp: "direct-offer" },
+      directOnly: true,
+    })
+    await flushTasks()
+    expect(onConnectionRouteChange).not.toHaveBeenCalledWith(undefined)
+    expect(onConnectionRouteChange).toHaveBeenLastCalledWith("relay")
+
+    const directPeer = MockPeerConnection.instances[1]
+    expect(directPeer.configuration).toStrictEqual({
+      iceServers: [{ ...iceServers[0], urls: ["stun:stun.example.com:3478"] }],
+    })
+    directPeer.selectedCandidateType = "host"
+    directPeer.receiveDataChannel()
+    directPeer.dataChannel.open()
+    await flushTasks()
+    expect(onConnectionRouteChange).toHaveBeenLastCalledWith("direct")
+    session.close()
+  })
+
   it("reuses a tab-scoped receiver ID across a refresh without requiring a checkpoint", () => {
     const callbacks = {
       onStatus: vi.fn(),
@@ -381,6 +704,7 @@ describe("P2P transfer lifecycle", () => {
       size: 20,
       type: "application/octet-stream",
       lastModified: 1,
+      senderBrowser: "Test browser",
       verifyTransfer: false,
     }
     expect(
@@ -456,6 +780,7 @@ describe("P2P transfer lifecycle", () => {
       size: 20,
       type: "application/octet-stream",
       lastModified: 1,
+      senderBrowser: "Test browser",
       verifyTransfer: false,
     }
     expect(
@@ -551,7 +876,7 @@ describe("P2P transfer lifecycle", () => {
     })
 
     await vi.waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
-    const firstPeerId = readP2PSessionPeerId("room")
+    const firstPeerId = readP2PSessionPeer("room")?.peerId
     const ws = MockWebSocket.instances[0]
     ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
@@ -577,7 +902,7 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
 
-    expect(readP2PSessionPeerId("room")).not.toStrictEqual(firstPeerId)
+    expect(readP2PSessionPeer("room")?.peerId).not.toStrictEqual(firstPeerId)
     await vi.waitFor(() => expect(secondStatus).toHaveBeenCalledWith("This P2P room is already open in another tab."))
     expect(MockWebSocket.instances).toHaveLength(1)
     expect(requestLock.mock.calls.map(([lockName]) => lockName)).toStrictEqual([
@@ -615,11 +940,7 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "sender", sdp: { type: "offer", sdp: "offer" } })
-    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
-    const channel = MockPeerConnection.instances[0].dataChannel
-    MockPeerConnection.instances[0].receiveDataChannel(channel)
-    channel.open()
+    const { channel } = await openIncomingDataChannel(ws)
     const size = 2 * 1024 * 1024 + 1
     channel.receive({
       type: "meta",
@@ -629,6 +950,7 @@ describe("P2P transfer lifecycle", () => {
         size,
         type: "application/octet-stream",
         lastModified: 1,
+        senderBrowser: "Test browser",
         verifyTransfer: false,
       },
     })
@@ -670,12 +992,7 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "sender", sdp: { type: "offer", sdp: "offer" } })
-    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
-    const peer = MockPeerConnection.instances[0]
-    const channel = peer.dataChannel
-    peer.receiveDataChannel(channel)
-    channel.open()
+    const { peer, channel } = await openIncomingDataChannel(ws)
     channel.receive({
       type: "meta",
       meta: {
@@ -746,12 +1063,7 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "sender", sdp: { type: "offer", sdp: "offer" } })
-    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
-    const firstPeer = MockPeerConnection.instances[0]
-    const firstChannel = firstPeer.dataChannel
-    firstPeer.receiveDataChannel(firstChannel)
-    firstChannel.open()
+    const { peer: firstPeer, channel: firstChannel } = await openIncomingDataChannel(ws)
     firstChannel.receive({
       type: "meta",
       meta: {
@@ -835,12 +1147,7 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "sender", sdp: { type: "offer", sdp: "offer" } })
-    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
-    const peer = MockPeerConnection.instances[0]
-    const channel = peer.dataChannel
-    peer.receiveDataChannel(channel)
-    channel.open()
+    const { channel } = await openIncomingDataChannel(ws)
     channel.receive({
       type: "meta",
       meta: {
@@ -1038,26 +1345,42 @@ describe("P2P transfer lifecycle", () => {
     await flushTasks()
     const initialMeta = dc.sent
       .filter((part): part is string => typeof part === "string")
-      .map((part) => JSON.parse(part) as { type?: string; meta?: { revision?: string } })
+      .map((part) => JSON.parse(part) as { type?: string; meta?: { revision?: string; senderBrowser?: string } })
       .find((message) => message.type === "meta")
     expect(session.currentFile.revision).toStrictEqual(initialMeta?.meta?.revision)
+    expect(initialMeta?.meta?.senderBrowser).toBeTypeOf("string")
 
     dc.receive({ type: "download", offset: 0 })
     await vi.waitFor(() => expect(oldReaders[0]?.pendingReads).toBe(1))
 
-    const updatedFileInfo = session.updateFile(controlledFile("new.bin", newReaders), false, "json")
+    const originalFiles = [{ name: "source/new.bin", sizeBytes: 3 }]
+    const updatedFileInfo = session.updateFile(
+      controlledFile("new.bin", newReaders),
+      false,
+      "json",
+      undefined,
+      originalFiles,
+    )
     const update = dc.sent
       .filter((part): part is string => typeof part === "string")
       .map(
         (part) =>
           JSON.parse(part) as {
             type?: string
-            meta?: { name?: string; revision?: string; highlightLanguage?: string }
+            meta?: {
+              name?: string
+              revision?: string
+              senderBrowser?: string
+              originalFiles?: { name: string; sizeBytes: number }[]
+              highlightLanguage?: string
+            }
           },
       )
       .find((message) => message.type === "file-update")
     expect(update?.meta?.name).toStrictEqual("new.bin")
     expect(update?.meta?.revision).toBeTypeOf("string")
+    expect(update?.meta?.senderBrowser).toStrictEqual(initialMeta?.meta?.senderBrowser)
+    expect(update?.meta?.originalFiles).toStrictEqual(originalFiles)
     expect(update?.meta?.highlightLanguage).toStrictEqual("json")
     expect(updatedFileInfo).toStrictEqual({ revision: update?.meta?.revision, name: "new.bin", order: 1 })
     let latestPeers = onPeersChange.mock.calls[onPeersChange.mock.calls.length - 1]?.[0] || []
@@ -1159,11 +1482,7 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
-    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
-    const channel = MockPeerConnection.instances[0].dataChannel
-    MockPeerConnection.instances[0].receiveDataChannel(channel)
-    channel.open()
+    const { channel } = await openIncomingDataChannel(ws, "receiver-1")
     channel.receive({
       type: "meta",
       meta: { revision: "old", name: "old.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
@@ -1214,11 +1533,7 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
-    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
-    const channel = MockPeerConnection.instances[0].dataChannel
-    MockPeerConnection.instances[0].receiveDataChannel(channel)
-    channel.open()
+    const { channel } = await openIncomingDataChannel(ws, "receiver-1")
     channel.receive({
       type: "meta",
       meta: { revision: "old", name: "old.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
@@ -1312,11 +1627,7 @@ describe("P2P transfer lifecycle", () => {
     })
 
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
-    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
-    const channel = MockPeerConnection.instances[0].dataChannel
-    MockPeerConnection.instances[0].receiveDataChannel(channel)
-    channel.open()
+    const { channel } = await openIncomingDataChannel(ws, "receiver-1")
 
     channel.receiveData(new Uint8Array([9, 9, 9, 9]).buffer)
     channel.receive({
@@ -1331,6 +1642,49 @@ describe("P2P transfer lifecycle", () => {
 
     const received = onFile.mock.calls[0][0]
     expect(Array.from(new Uint8Array(await received.arrayBuffer()))).toStrictEqual([1, 2, 3, 4])
+    session.close()
+  })
+
+  it("keeps a completed file and stops signaling when the reconnect session expires", async () => {
+    const onStatus = vi.fn<(status: string) => void>()
+    const onFile = vi.fn<(file: File) => void>()
+    const session = startP2PReceiver("room", config, {
+      onStatus,
+      onMeta: vi.fn(),
+      onProgress: vi.fn(),
+      onPausedChange: vi.fn(),
+      onFile,
+      onError: vi.fn((error) => {
+        throw error
+      }),
+    })
+
+    const ws = MockWebSocket.instances[0]
+    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
+    const peer = MockPeerConnection.instances[0]
+    const channel = peer.dataChannel
+    peer.receiveDataChannel(channel)
+    channel.open()
+    channel.receive({
+      type: "meta",
+      meta: { revision: "complete", name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+    })
+    await flushTasks()
+    session.requestDownload()
+    channel.receiveData(Uint8Array.of(1, 2, 3, 4).buffer)
+    channel.receive({ type: "done" })
+    await vi.waitFor(() => expect(onFile).toHaveBeenCalledOnce())
+
+    ws.receive({ type: "receiver-reconnect-expired" })
+    await vi.waitFor(() =>
+      expect(onStatus).toHaveBeenLastCalledWith(
+        "Transfer complete. The signaling reconnect window expired; the file remains available.",
+      ),
+    )
+    expect(ws.readyState).toStrictEqual(3)
+    expect(peer.connectionState).toStrictEqual("closed")
+    expect(onFile).toHaveBeenCalledOnce()
     session.close()
   })
 
@@ -1677,7 +2031,7 @@ describe("P2P transfer lifecycle", () => {
 
     const received = new Uint8Array(await onFile.mock.calls[0][0].arrayBuffer())
     expect(received.byteLength).toStrictEqual(source.byteLength)
-    expect(await sha1Hex([received.buffer])).toStrictEqual(await sha1Hex([source.buffer]))
+    expect(await xxh3Hex([received.buffer])).toStrictEqual(await xxh3Hex([source.buffer]))
     session.close()
   })
 
@@ -1854,8 +2208,8 @@ describe("P2P transfer lifecycle", () => {
     bytes.fill(0x5a, 0, verificationBlockSize)
     bytes.fill(0xa5, verificationBlockSize)
     const expectedHashes = await Promise.all([
-      sha1Hex([bytes.buffer.slice(0, verificationBlockSize)]),
-      sha1Hex([bytes.buffer.slice(verificationBlockSize)]),
+      xxh3Hex([bytes.buffer.slice(0, verificationBlockSize)]),
+      xxh3Hex([bytes.buffer.slice(verificationBlockSize)]),
     ])
     const arrayBuffer = vi.fn((part: Uint8Array<ArrayBuffer>) =>
       Promise.resolve(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength)),
@@ -1924,6 +2278,194 @@ describe("P2P transfer lifecycle", () => {
     expect(slice).toHaveBeenCalledOnce()
     expect(slice).toHaveBeenCalledWith(0)
     expect(arrayBuffer).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+    session.close()
+  })
+
+  it("reports a file deleted while the normal P2P stream is reading it", async () => {
+    const readFailure = new DOMException("The file could not be read", "NotReadableError")
+    const file = {
+      name: "deleted-during-p2p.bin",
+      size: 4,
+      type: "application/octet-stream",
+      lastModified: 0,
+      slice: () => ({
+        stream: () =>
+          new ReadableStream<Uint8Array<ArrayBuffer>>({
+            start(controller) {
+              controller.error(readFailure)
+            },
+          }),
+      }),
+    } as unknown as File
+    const onError = vi.fn<(error: Error) => void>()
+    const session = await startP2PSender(file, config, "1h", "1", false, {
+      onStatus: vi.fn(),
+      onPeersChange: vi.fn(),
+      onError,
+    })
+    const ws = MockWebSocket.instances[0]
+    ws.receive({
+      type: "ready",
+      role: "sender",
+      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+    })
+    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
+    const channel = MockPeerConnection.instances[0].dataChannel
+    channel.open()
+    ws.receive({ type: "receiver-pair-result", peerId: "receiver-1", accepted: true })
+    await flushTasks()
+
+    channel.receive({ type: "download", offset: 0 })
+
+    const expectedMessage =
+      'Could not read "deleted-during-p2p.bin". It may have been moved, deleted, or changed since it was selected. ' +
+      "Select the file again and retry."
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce())
+    expect(onError.mock.calls[0][0]).toMatchObject({ name: "FileReadError", message: expectedMessage })
+    expect(channel.sent).toContain(JSON.stringify({ type: "error", message: expectedMessage }))
+    session.close()
+  })
+
+  it("reports a file deleted before P2P verification blocks are retransmitted", async () => {
+    const bytes = new TextEncoder().encode("data")
+    let unreadable = false
+    const file = {
+      name: "deleted-before-repair.bin",
+      size: bytes.byteLength,
+      type: "application/octet-stream",
+      lastModified: 0,
+      slice: (start = 0, end = bytes.byteLength) => {
+        const part = bytes.slice(start, end)
+        return {
+          stream: () =>
+            new ReadableStream<Uint8Array<ArrayBuffer>>({
+              start(controller) {
+                if (unreadable) {
+                  controller.error(new DOMException("The file could not be read", "NotReadableError"))
+                  return
+                }
+                controller.enqueue(part)
+                controller.close()
+              },
+            }),
+        }
+      },
+    } as unknown as File
+    const onError = vi.fn<(error: Error) => void>()
+    const session = await startP2PSender(file, config, "1h", "1", true, {
+      onStatus: vi.fn(),
+      onPeersChange: vi.fn(),
+      onError,
+    })
+    const ws = MockWebSocket.instances[0]
+    ws.receive({
+      type: "ready",
+      role: "sender",
+      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+    })
+    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
+    const channel = MockPeerConnection.instances[0].dataChannel
+    channel.open()
+    ws.receive({ type: "receiver-pair-result", peerId: "receiver-1", accepted: true })
+    await flushTasks()
+
+    const controlMessages = () =>
+      channel.sent
+        .filter((part): part is string => typeof part === "string")
+        .map((part) => JSON.parse(part) as { type: string; message?: string })
+    channel.receive({ type: "download", offset: 0 })
+    await vi.waitFor(() => expect(controlMessages().some((message) => message.type === "done")).toStrictEqual(true))
+
+    unreadable = true
+    channel.receive({ type: "repair-request", indices: [0] })
+
+    const expectedMessage =
+      'Could not read "deleted-before-repair.bin". It may have been moved, deleted, or changed since it was selected. ' +
+      "Select the file again and retry."
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce())
+    expect(onError.mock.calls[0][0]).toMatchObject({ name: "FileReadError", message: expectedMessage })
+    expect(controlMessages()).toContainEqual({ type: "error", message: expectedMessage })
+    expect(controlMessages().some((message) => message.type === "repair-end")).toStrictEqual(false)
+    session.close()
+  })
+
+  it("shares one streamed verification manifest between concurrent receivers", async () => {
+    const firstBytes = new Uint8Array(257).fill(0x5a)
+    const secondBytes = new Uint8Array(257).fill(0xa5)
+    const expectedHash = await xxh3Hex([firstBytes.buffer])
+    let firstController: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>> | undefined
+    let streamCount = 0
+    const verificationSlices: [number, number][] = []
+    const file = {
+      name: "shared-manifest.bin",
+      size: firstBytes.byteLength,
+      type: "application/octet-stream",
+      lastModified: 0,
+      slice: vi.fn((start: number, end?: number) => {
+        if (end !== undefined) {
+          verificationSlices.push([start, end])
+          return new Blob([firstBytes.slice(start, end)])
+        }
+        return {
+          stream: () =>
+            new ReadableStream<Uint8Array<ArrayBuffer>>({
+              start(controller) {
+                streamCount += 1
+                if (streamCount === 1) firstController = controller
+                else {
+                  controller.enqueue(secondBytes)
+                  controller.close()
+                }
+              },
+            }),
+        }
+      }),
+    } as unknown as File
+    const onError = vi.fn()
+    const session = await startP2PSender(file, config, "1h", "2", true, {
+      onStatus: vi.fn(),
+      onPeersChange: vi.fn(),
+      onError,
+    })
+    const ws = MockWebSocket.instances[0]
+    ws.receive({
+      type: "ready",
+      role: "sender",
+      peers: { sender: true, receivers: [{ peerId: "receiver-1" }, { peerId: "receiver-2" }] },
+    })
+    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(2))
+    const [firstChannel, secondChannel] = MockPeerConnection.instances.map((peer) => peer.dataChannel)
+    firstChannel.open()
+    secondChannel.open()
+    ws.receive({ type: "receiver-pair-result", peerId: "receiver-1", accepted: true })
+    ws.receive({ type: "receiver-pair-result", peerId: "receiver-2", accepted: true })
+    await flushTasks()
+
+    firstChannel.receive({ type: "download", offset: 0 })
+    await vi.waitFor(() => expect(firstController).toBeDefined())
+    secondChannel.receive({ type: "download", offset: 0 })
+    await flushTasks()
+    expect(
+      secondChannel.sent
+        .filter((part): part is string => typeof part === "string")
+        .map((part) => JSON.parse(part) as { type?: string })
+        .some((message) => message.type === "done"),
+    ).toStrictEqual(false)
+
+    firstController!.enqueue(firstBytes)
+    firstController!.close()
+    const manifestFrom = (channel: MockDataChannel) =>
+      channel.sent
+        .filter((part): part is string => typeof part === "string")
+        .map((part) => JSON.parse(part) as { verification?: P2PVerificationManifest })
+        .find((message) => message.verification)?.verification
+    await vi.waitFor(() => expect(manifestFrom(firstChannel)).toBeDefined())
+    await vi.waitFor(() => expect(manifestFrom(secondChannel)).toBeDefined())
+
+    expect(manifestFrom(firstChannel)?.hashes).toStrictEqual([expectedHash])
+    expect(manifestFrom(secondChannel)?.hashes).toStrictEqual([expectedHash])
+    expect(verificationSlices).toStrictEqual([])
     expect(onError).not.toHaveBeenCalled()
     session.close()
   })
@@ -2061,7 +2603,7 @@ describe("P2P transfer lifecycle", () => {
 
   it("assembles verification chunks before completing a received file", async () => {
     const bytes = new Uint8Array([1, 2, 3, 4])
-    const hash = await sha1Hex([bytes.buffer])
+    const hash = await xxh3Hex([bytes.buffer])
     const onFile = vi.fn<(file: File) => void>()
     const onError = vi.fn<(error: Error) => void>()
     const session = startP2PReceiver("room", config, {
@@ -2124,7 +2666,7 @@ describe("P2P transfer lifecycle", () => {
     await flushTasks()
     session.requestDownload()
     channel.receive({ type: "verification-start", blockSize: verificationBlockSize, hashCount: 1 })
-    channel.receive({ type: "verification-chunk", startIndex: 1, hashes: ["a".repeat(40)] })
+    channel.receive({ type: "verification-chunk", startIndex: 1, hashes: ["a".repeat(16)] })
 
     await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(1))
     expect(onError.mock.calls[0][0].message).toContain("out of order")
@@ -2430,6 +2972,7 @@ describe("P2P transfer lifecycle", () => {
         size: 20,
         type: "application/octet-stream",
         lastModified: 1,
+        senderBrowser: "Test browser",
         verifyTransfer: false,
       },
       receivedBytes: 10,
