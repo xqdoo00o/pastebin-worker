@@ -92,7 +92,13 @@ export async function handleStaticPages(request: Request, env: Env): Promise<Res
     )
   }
 
-  if (path.startsWith("/assets/") || path === "/favicon.ico") {
+  if (
+    path.startsWith("/assets/") ||
+    path === "/favicon.ico" ||
+    path.startsWith("/pwa/") ||
+    path === "/manifest.webmanifest" ||
+    path === "/sw.js"
+  ) {
     const assetsUrl = url
     assetsUrl.pathname = path
     const response = await env.ASSETS.fetch(assetsUrl)
@@ -109,6 +115,10 @@ export async function handleStaticPages(request: Request, env: Env): Promise<Res
       headers.set("Cross-Origin-Embedder-Policy", CROSS_ORIGIN_ISOLATION_HEADERS["Cross-Origin-Embedder-Policy"])
     }
     for (const [name, value] of Object.entries(staticPageCacheHeader(env))) headers.set(name, value)
+    if (path === "/sw.js" || path === "/manifest.webmanifest") {
+      headers.set("Cache-Control", "no-cache")
+    }
+    if (path === "/sw.js") headers.set("Service-Worker-Allowed", "/")
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   }
 

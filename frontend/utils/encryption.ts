@@ -12,25 +12,14 @@ import {
 } from "./encryptionCore.js"
 import { CHUNKED_ENCRYPTION_SCHEME, type EncryptionScheme } from "../../shared/constants.js"
 import { base64UrlToBytes, bytesToBase64Url } from "../../shared/encoding.js"
+import type { EncryptionWorkerRequest, EncryptionWorkerResponse } from "./encryptionMessages.js"
 import { WorkerRequestMap } from "./workerRequests.js"
+import { disposeWorker, WorkerInitialization } from "./workerLifecycle.js"
 
 export { CHUNKED_ENCRYPTION_SCHEME, type EncryptionScheme } from "../../shared/constants.js"
 
 const cryptoWorkerThreshold = 1024 * 1024
 const cryptoWorkerInitializationTimeoutMs = 5_000
-
-interface WorkerReady {
-  type: "ready"
-}
-
-interface WorkerResult {
-  type: "result"
-  id: number
-  data?: ArrayBuffer
-  error?: string
-}
-
-type WorkerResponse = WorkerReady | WorkerResult
 
 function asWorkerError(error: unknown, fallback: string): Error {
   if (error instanceof Error) return error
@@ -54,44 +43,41 @@ export class ChunkCryptoSession {
       try {
         const worker = new Worker(new URL("./encryption.worker.ts", import.meta.url), { type: "module" })
         this.worker = worker
-        this.workerReady = new Promise((resolve) => {
-          let settled = false
-          const finish = (ready: boolean) => {
-            if (settled) return
-            settled = true
-            clearTimeout(timer)
-            this.cancelWorkerInitialization = undefined
-            if (!ready) this.stopWorker(worker)
-            resolve(ready)
+        const initialization = new WorkerInitialization<boolean>()
+        this.workerReady = initialization.promise
+        const finish = (ready: boolean) => {
+          if (!initialization.pending) return
+          this.cancelWorkerInitialization = undefined
+          if (!ready) this.stopWorker(worker)
+          initialization.resolve(ready)
+        }
+        this.cancelWorkerInitialization = () => finish(false)
+        worker.onmessage = (event: MessageEvent<EncryptionWorkerResponse>) => {
+          if (event.data?.type !== "ready") {
+            finish(false)
+            return
           }
-          this.cancelWorkerInitialization = () => finish(false)
-          worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
-            if (event.data?.type !== "ready") {
-              finish(false)
-              return
-            }
-            worker.onmessage = (event: MessageEvent<WorkerResponse>) => this.handleWorkerMessage(event.data)
-            worker.onerror = (event) => {
-              event.preventDefault()
-              this.failWorker(new Error(event.message || "Encryption worker failed"))
-            }
-            worker.onmessageerror = () => {
-              this.failWorker(new Error("Encryption worker returned an invalid message"))
-            }
-            finish(true)
-          }
+          worker.onmessage = (event: MessageEvent<EncryptionWorkerResponse>) => this.handleWorkerMessage(event.data)
           worker.onerror = (event) => {
             event.preventDefault()
-            finish(false)
+            this.failWorker(new Error(event.message || "Encryption worker failed"))
           }
-          worker.onmessageerror = () => finish(false)
-          const timer = setTimeout(() => finish(false), cryptoWorkerInitializationTimeoutMs)
-          try {
-            worker.postMessage({ type: "initialize", key, header })
-          } catch {
-            finish(false)
+          worker.onmessageerror = () => {
+            this.failWorker(new Error("Encryption worker returned an invalid message"))
           }
-        })
+          finish(true)
+        }
+        worker.onerror = (event) => {
+          event.preventDefault()
+          finish(false)
+        }
+        worker.onmessageerror = () => finish(false)
+        initialization.startTimeout(cryptoWorkerInitializationTimeoutMs, () => finish(false))
+        try {
+          worker.postMessage({ type: "initialize", key, header } satisfies EncryptionWorkerRequest)
+        } catch {
+          finish(false)
+        }
       } catch {
         this.stopWorker()
       }
@@ -126,12 +112,12 @@ export class ChunkCryptoSession {
     }
 
     return this.requests.request(
-      (id) => worker.postMessage({ type, id, index, data }, [data]),
+      (id) => worker.postMessage({ type, id, index, data } satisfies EncryptionWorkerRequest, [data]),
       (error) => this.failWorker(asWorkerError(error, "Encryption worker request failed")),
     )
   }
 
-  private handleWorkerMessage(result: WorkerResponse): void {
+  private handleWorkerMessage(result: EncryptionWorkerResponse): void {
     if (result?.type !== "result") {
       this.failWorker(new Error("Encryption worker returned an invalid message"))
       return
@@ -142,10 +128,7 @@ export class ChunkCryptoSession {
 
   private stopWorker(worker = this.worker): void {
     if (!worker) return
-    worker.onmessage = null
-    worker.onerror = null
-    worker.onmessageerror = null
-    worker.terminate()
+    disposeWorker(worker)
     if (this.worker === worker) this.worker = undefined
   }
 
@@ -211,23 +194,6 @@ export async function createChunkedEncryptionContext(plaintextSize: number): Pro
 export function createChunkedDecryptionSession(key: CryptoKey, headerBytes: Uint8Array): ChunkCryptoSession {
   const header = parseEncryptionHeader(headerBytes)
   return new ChunkCryptoSession(key, header, header.plaintextSize >= cryptoWorkerThreshold)
-}
-
-export async function encrypt(scheme: EncryptionScheme, key: CryptoKey, msg: Uint8Array): Promise<Uint8Array> {
-  verifyScheme(scheme)
-  const header = createEncryptionHeader(msg.byteLength)
-  const output = new Uint8Array(encryptedFileSize(msg.byteLength))
-  output.set(header.bytes, 0)
-  let outputOffset = ENCRYPTION_HEADER_SIZE
-  for (let index = 0; index < encryptionChunkCount(msg.byteLength); index += 1) {
-    const { start, end } = encryptionChunkBounds(msg.byteLength, index)
-    const encrypted = new Uint8Array(
-      await encryptChunk(key, header, index, msg.subarray(start, end) as Uint8Array<ArrayBuffer>),
-    )
-    output.set(encrypted, outputOffset)
-    outputOffset += encrypted.byteLength
-  }
-  return output
 }
 
 export async function decrypt(

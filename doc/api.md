@@ -16,8 +16,10 @@ creation requests and its web UI; public paste reads remain unauthenticated.
 ### `POST /`
 
 Create a paste from `multipart/form-data`. A normal request accepts at most
-5 MiB in each form part; use the [multipart-upload API](#multipart-upload-api)
-for larger content.
+5 MiB in each form part and 6 MiB for the entire request body, including
+metadata and multipart framing; use the [multipart-upload API](#multipart-upload-api)
+for larger content. The deployment's `{{R2_MAX_ALLOWED}}` limit also applies to
+direct content. Oversized bodies are rejected while being read.
 
 Form fields:
 
@@ -70,7 +72,7 @@ owner credential. Metadata fields that do not apply are omitted. `location` is
 `KV` or `R2`; storage selection is transparent to clients.
 
 Errors include `400` for invalid forms/options, `401` when deployment Basic
-Auth fails, `413` when a direct form part exceeds 5 MiB, and `503` when an
+Auth fails, `413` when a direct form part exceeds 5 MiB or the body exceeds 6 MiB, and `503` when an
 unused random name cannot be allocated.
 
 ### `GET /<name>[.<ext>]`
@@ -96,7 +98,8 @@ Response headers can include:
 
 - `Content-Disposition`, with an RFC 5987 `filename*` when a filename is known.
 - `Content-Length` and `Last-Modified`.
-- `ETag` for an opened R2 object.
+- `ETag` for unlimited pastes, on both GET and HEAD. New writes use a version
+  validator for both KV and R2 storage; metadata responses have a separate tag.
 - `X-PB-Highlight-Language` when `lang` metadata exists.
 - `X-PB-Encryption-Scheme` and `X-PB-Decrypted-Content-Type` for encrypted
   content. With no path/MIME override, ciphertext uses
@@ -104,17 +107,26 @@ Response headers can include:
 - `X-PB-Remaining-Reads` for a read-limited paste. It reports the count at the
   start of this successful read; the next read sees one fewer.
 
-A valid `If-Modified-Since` at or after the paste's last modification returns
-`304`. Invalid dates are ignored.
+For unlimited raw/metadata reads, a matching `If-None-Match` returns `304` and
+takes precedence over `If-Modified-Since`. Without it, an HTTP date strictly
+later than the last-modified second can return `304`; equality is conservatively
+treated as modified because multiple updates can occur in one second. Invalid
+dates are ignored. Rendered pages and read-limited pastes do not use these
+conditional responses.
 
 R2-backed pastes without a read limit accept a single byte range. Valid
 `Range: bytes=...` requests return `206` with `Accept-Ranges`, `Content-Range`,
 and `Content-Length`; unsatisfiable ranges return `416`. `If-Range` accepts the
-current strong ETag or an HTTP date. Multiple/malformed ranges, ranges for KV
+current strong ETag or an HTTP date strictly later than the last-modified second.
+Multiple/malformed ranges, ranges for KV
 pastes, and ranges for read-limited pastes are ignored and receive the full
 `200` response.
 
 `404` means the paste is absent, expired, or has exhausted its read limit.
+After the final allowed read, the counter immediately denies further access.
+Background cleanup removes only that version's immutable R2 object; the KV
+index/body expires at its existing TTL, and unreferenced R2 objects are reclaimed by
+the scheduled sweep. This prevents a delayed read from deleting a newer update.
 
 ### `HEAD /<name>[.<ext>]`
 
@@ -184,7 +196,7 @@ validate that the paste exists. Treat this URL as a secret.
 ### `PUT /<name>:<password>`
 
 Replace a paste. The request is `multipart/form-data`, requires `c`, and has
-the same 5 MiB direct-content limit as `POST /`. It accepts `e`, `s`, `reads`,
+the same direct-content limits as `POST /`. It accepts `e`, `s`, `reads`,
 `lang`, `encryption-scheme`, `filenames`, and `mimeType`; `p` has no effect.
 
 All supplied metadata describes the replacement. Omitting `s` retains the old
@@ -194,7 +206,7 @@ response has the same shape as `POST /`; always retain its `manageUrl` in case
 the password changed.
 
 Errors include `403` for a missing/wrong password, `404` for a missing paste,
-and `413` when the direct content exceeds 5 MiB.
+and `413` when the direct content exceeds 5 MiB or `{{R2_MAX_ALLOWED}}`.
 
 ### `DELETE /<name>:<password>`
 
@@ -209,25 +221,28 @@ multipart upload for content above 5 MiB. Each non-final data part is 5 MiB.
 The completed object may not exceed this deployment's `{{R2_MAX_ALLOWED}}`
 limit. `key` and `uploadId` together are sensitive upload credentials.
 
-### `POST /mpu/create[?p=1&e=<expire>]`
+### `POST /mpu/create[?p=1]`
 
 Allocate a random paste name and R2 multipart upload. `p` selects the
-24-character private name. `e` is used for abandoned-object cleanup; send the
-same expiration again on completion.
+24-character private name. The expiration is determined by the form sent on completion.
 
 ```json
 {
   "name": "BxWH2a",
-  "key": "BxWH2a",
+  "key": "pastes/BxWH2a/550e8400-e29b-41d4-a716-446655440000",
   "uploadId": "..."
 }
 ```
 
-### `POST /mpu/create-update?name=<name>&password=<password>[&e=<expire>]`
+### `POST /mpu/create-update?name=<name>&password=<password>`
 
 Authenticate an existing paste and start a replacement multipart upload.
 Returns the same object as `/mpu/create`. Errors are `403` for a wrong password
 and `404` for a missing paste.
+
+Treat `key` as opaque and pass it back unchanged (URL-encoded in query parameters).
+It is distinct from `name`: each upload gets an independent object so a rejected
+replacement cannot overwrite the currently published file.
 
 ### `PUT /mpu/resume?key=<key>&uploadId=<id>&partNumber=<n>`
 
@@ -250,9 +265,17 @@ form fields are the same metadata fields accepted by normal creation/update.
 The filename on `c` becomes the stored filename, so clients should use the
 original/prepared content filename rather than `parts.json`.
 
+Completion forms accept at most 1 MiB per part and 2 MiB for the entire body.
+The paste lifetime starts at completion. Cleanup checks its KV metadata and
+leaves newly written R2 objects alone for at least five minutes so the index
+can become visible.
+
 The response is the normal paste JSON and includes an R2 `ETag` header. An
-object above `{{R2_MAX_ALLOWED}}` returns `413` and is deleted best-effort.
-Invalid or stale multipart state returns `410`.
+object above `{{R2_MAX_ALLOWED}}` returns `413` and the new object is deleted
+best-effort; an existing paste remains intact. Unreferenced completed objects
+are reclaimed by the scheduled cleanup after the grace period.
+Invalid or stale multipart state returns `410`. A completion whose `key` does
+not identify the supplied paste `name` returns `400`.
 
 ### `POST /mpu/abort?key=<key>&uploadId=<id>`
 
@@ -267,7 +290,7 @@ or R2.
 
 ### `POST /p2p/create`
 
-Create a room. Prefer a JSON body:
+Create a room with a JSON body:
 
 ```json
 {
@@ -279,9 +302,8 @@ Create a room. Prefer a JSON body:
 
 `expire` defaults to the deployment's P2P default and may not exceed its P2P
 maximum. `maxTransfers` is a non-negative integer; `0` means unlimited.
-`isPrivate: true` selects a 24-character name. For compatibility, `expire` and
-`maxTransfers` may instead be query parameters; if either is present, the JSON
-body is ignored.
+`isPrivate: true` selects a 24-character name. Room options are read from the
+JSON body.
 
 ```json
 {
@@ -339,6 +361,11 @@ Signaling messages are JSON and carry readiness, peer presence, SDP offers and
 answers, ICE candidates, checkpoint/abandon state, room-option updates, and
 ping/pong heartbeats. The official browser client is the reference
 implementation; signaling alone does not carry file bytes.
+
+Offers, answers, and ICE candidates require a `negotiationId`. Receiver presence
+and disconnection messages carry a `connectionId`. Data-channel file metadata,
+download requests, progress, and completion acknowledgements carry a file
+`revision`; download requests also require a `receiveWindow` of 1–4 MiB.
 
 ## Web and documentation routes
 

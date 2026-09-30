@@ -358,6 +358,11 @@ class AdaptiveMonochromeCanvasRenderer implements MonochromeCanvasRenderer {
       depth: false,
       stencil: false,
       preserveDrawingBuffer: false,
+      // Refuse a context the browser would back with a software rasterizer
+      // (SwiftShader, WARP, llvmpipe). On a GPU-less machine, re-rasterizing
+      // the whole canvas every render costs more than the Canvas 2D dirty
+      // row-span path, so the fallback is the faster backend there.
+      failIfMajorPerformanceCaveat: true,
     })
     if (gl) {
       try {
@@ -367,6 +372,10 @@ class AdaptiveMonochromeCanvasRenderer implements MonochromeCanvasRenderer {
       } catch (cause) {
         console.warn("[optical] WebGL2 QR renderer unavailable; using Canvas 2D.", cause)
       }
+    } else {
+      console.warn(
+        "[optical] WebGL2 context refused (unsupported, or software rendering only); using Canvas 2D fallback.",
+      )
     }
     this.renderer = createCanvas2dRenderer(fallbackCanvas, options)
     console.info("[optical] QR renderer: Canvas 2D fallback")

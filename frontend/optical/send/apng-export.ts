@@ -1,6 +1,5 @@
 import { defaultQrScale, exportSymbolCount } from "../shared/fountain.js"
 import { gridDims, qrVersion, TRANSFER_QR_MARGIN } from "../shared/qr.js"
-import { OPTICAL_APNG_FORMAT_VERSION } from "../shared/apng-format.js"
 import { copyQrMonochrome, createMonochromeFrame } from "../shared/monochrome.js"
 import { OpticalQrFrameEncoder } from "../shared/qr-frame-encoder.js"
 import type { PackedOpticalFile } from "../shared/protocol.js"
@@ -9,6 +8,7 @@ import type { ApngExportOptions, ApngExportResult } from "../shared/worker-messa
 import { ApngEncoder } from "./apng.js"
 
 export type ApngProgress = (completed: number, total: number) => void
+export type ApngChunkWriter = (parts: Uint8Array<ArrayBuffer>[]) => Promise<void>
 
 function outputName(name: string, partIndex?: number): string {
   const safe = name.replace(/[\\/:*?"<>|]/g, "_").trim() || "qr-transfer"
@@ -30,6 +30,7 @@ export async function exportPreparedApng(
   fileName: string,
   options: ApngExportOptions,
   onProgress: ApngProgress,
+  writeChunks: ApngChunkWriter,
   isCancelled: () => boolean = () => false,
 ): Promise<ApngExportResult> {
   let encoder: OpticalQrFrameEncoder | undefined
@@ -55,12 +56,19 @@ export async function exportPreparedApng(
     const cell = firstQr.size + 2 * TRANSFER_QR_MARGIN
     const width = cell * qrScale * cols
     const height = cell * qrScale * rows
-    const apng = new ApngEncoder(width, height, frames, options.txFps, {
-      format: OPTICAL_APNG_FORMAT_VERSION,
-      scale: qrScale,
-      grid: options.gridCodes,
-      qr: qrVersion(firstQr),
-    })
+    const apng = new ApngEncoder(
+      width,
+      height,
+      frames,
+      options.txFps,
+      {
+        scale: qrScale,
+        grid: options.gridCodes,
+        qr: qrVersion(firstQr),
+      },
+      0,
+      writeChunks,
+    )
     const monochrome = createMonochromeFrame(width, height)
     let lastProgressAt = 0
 
@@ -88,8 +96,8 @@ export async function exportPreparedApng(
       }
     }
 
+    await apng.complete()
     return {
-      blob: apng.finish(),
       filename: outputName(fileName, options.partIndex),
       frames,
       symbols,

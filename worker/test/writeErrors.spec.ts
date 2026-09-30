@@ -41,6 +41,22 @@ describe("write error paths — content/format validation", () => {
     await uploadExpectStatus(ctx, { c: new Blob([new Uint8Array(DIRECT_UPLOAD_MAX_BYTES + 1)]) }, 413)
   })
 
+  it("enforces a configured size cap on direct POST and PUT", async () => {
+    const tightEnv = { ...env, R2_MAX_ALLOWED: "1K" }
+    const send = (url: string, method: "POST" | "PUT", size: number) => {
+      const form = new FormData()
+      form.set("c", new File([new Uint8Array(size)], "content.bin"))
+      return worker.fetch(new Request(url, { method, body: form }), tightEnv, ctx)
+    }
+
+    expect((await send(BASE_URL, "POST", 1024)).status).toBe(200)
+    expect((await send(BASE_URL, "POST", 1025)).status).toBe(413)
+
+    const existing = await upload(ctx, { c: "original" })
+    expect((await send(existing.manageUrl, "PUT", 1025)).status).toBe(413)
+    expect(await (await workerFetch(ctx, existing.url)).text()).toBe("original")
+  })
+
   it("POST accepts multipart body when final CRLF arrives as a separate chunk", async () => {
     const fd = new FormData()
     fd.set("c", new File(["x"], "split.txt"))
@@ -146,5 +162,34 @@ describe("write error paths — MPU complete name validation", () => {
     )
     expect(resp.status).toStrictEqual(400)
     expect(await resp.text()).toContain("no name for MPU complete")
+  })
+
+  it.each(["not json", "{}", "[]", '[{"partNumber":1}]', '[{"partNumber":1.5,"etag":"tag"}]'])(
+    "rejects malformed MPU parts as a client error: %s",
+    async (parts) => {
+      const fd = new FormData()
+      fd.set("c", parts)
+      const response = await workerFetch(
+        ctx,
+        new Request(`${BASE_URL}/mpu/complete?name=unused&key=pastes/unused/version&uploadId=u`, {
+          method: "POST",
+          body: fd,
+        }),
+      )
+      expect(response.status).toBe(400)
+      expect(await response.text()).toContain("invalid uploaded parts")
+    },
+  )
+
+  it("rejects name-based MPU keys before completing the upload", async () => {
+    const response = await workerFetch(
+      ctx,
+      new Request(`${BASE_URL}/mpu/complete?name=unused&key=unused&uploadId=u`, {
+        method: "POST",
+        body: completeFormData(),
+      }),
+    )
+    expect(response.status).toBe(400)
+    expect(await response.text()).toContain("is not consistent with the originally specified name")
   })
 })

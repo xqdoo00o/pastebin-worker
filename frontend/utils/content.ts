@@ -144,6 +144,7 @@ export async function prepareContent(
 ): Promise<PreparedContent> {
   signal?.throwIfAborted()
 
+  let files: File[]
   if (editorState.editKind === "edit") {
     if (editorState.editContent.length === 0) {
       throw new ErrorWithTitle(errorTitle, "Empty paste")
@@ -151,25 +152,21 @@ export async function prepareContent(
     const content = new File([editorState.editContent], editorState.editFilename || DEFAULT_EDIT_FILENAME, {
       type: TEXT_MIME_TYPE,
     })
-    if (!compressSingleFile) return { content }
-    const originalFiles: OriginalFileInfo[] = [{ name: content.name, sizeBytes: content.size }]
-    const { zipFiles } = await import("./archive.js")
-    const archive = await zipFiles([content], { signal, compression: archiveCompression })
-    return { content: archive.file, originalFiles, cleanup: archive.cleanup }
+    files = [content]
+  } else {
+    files = editorState.files
+    if (files.length === 0) throw new ErrorWithTitle(errorTitle, "No file selected")
+    for (const file of files) await assertFileReadable(file, errorTitle, signal)
   }
 
-  if (editorState.files.length === 0) {
-    throw new ErrorWithTitle(errorTitle, "No file selected")
-  }
-  for (const file of editorState.files) await assertFileReadable(file, errorTitle, signal)
+  const packaging = getContentPackagingInfo(files)
+  if ((editorState.editKind === "edit" || !packaging.hasMultipleFiles) && !compressSingleFile)
+    return { content: files[0] }
 
-  const packaging = getContentPackagingInfo(editorState.files)
-  if (!packaging.hasMultipleFiles && !compressSingleFile) return { content: editorState.files[0] }
-
-  const originalFiles = editorState.files.map((file) => ({ name: file.name, sizeBytes: file.size }))
+  const originalFiles = files.map((file) => ({ name: file.name, sizeBytes: file.size }))
   try {
     const { zipFiles } = await import("./archive.js")
-    const archive = await zipFiles(editorState.files, { signal, compression: archiveCompression })
+    const archive = await zipFiles(files, { signal, compression: archiveCompression })
     return { content: archive.file, originalFiles, cleanup: archive.cleanup }
   } catch (error) {
     if (isFileReadError(error)) throw new ErrorWithTitle(errorTitle, error.message)

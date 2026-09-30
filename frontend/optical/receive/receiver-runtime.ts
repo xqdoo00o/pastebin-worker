@@ -60,8 +60,11 @@ export class ReceiverSession<Mode extends string> {
     this.delivered = false
   }
 
-  complete(): void {
+  /** Stop capture but allow result processing until this attempt is superseded. */
+  complete(): () => boolean {
+    const generation = this.currentGeneration
     this.stopped = true
+    return () => this.currentGeneration === generation
   }
 
   markDelivered(): void {

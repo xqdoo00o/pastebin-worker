@@ -5,6 +5,7 @@ import { buildManagedOutput, type OutputChunkWriter } from "./managedOutput.js"
 import type { ManagedFile } from "./opfs.js"
 import { isPrecompressedFile } from "./precompressed.js"
 import { abortReason, asError } from "./errors.js"
+import { disposeWorker } from "./workerLifecycle.js"
 
 const estimatedArchiveEntryOverhead = 1024
 
@@ -63,10 +64,7 @@ async function streamZipFilesInWorker(
 
     const cleanup = () => {
       signal?.removeEventListener("abort", handleAbort)
-      worker.onmessage = null
-      worker.onerror = null
-      worker.onmessageerror = null
-      worker.terminate()
+      disposeWorker(worker)
     }
     const finish = (error?: Error) => {
       if (settled) return
@@ -122,6 +120,7 @@ async function streamZipFilesInWorker(
         if (compression === "zstd") {
           const { loadZstdEncoderWasmModule } = await import("../wasm/zstd-loader.js")
           const zstdEncoderWasmModule = await loadZstdEncoderWasmModule(estimateArchiveSize(files))
+          if (settled) return
           worker.postMessage({ type: "init", zstdEncoderWasmModule })
         }
         const request: ArchiveWorkerRequest = { type: "start", files, compression, useFflateWorker }

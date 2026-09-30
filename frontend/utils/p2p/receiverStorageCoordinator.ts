@@ -6,8 +6,17 @@ import {
   type P2PResumeCheckpoint,
 } from "../p2pReceiveStore.js"
 import type { ReceiverStorageSession } from "./receiverSession.js"
-import type { ReceivedStore } from "./receivedStorage.js"
 import type { SignalMessage } from "./protocol.js"
+
+export class P2PReceiveStorageError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause))
+    this.name = "P2PReceiveStorageError"
+    this.cause = cause
+  }
+
+  readonly cause: unknown
+}
 
 interface ReceiverStorageCoordinatorOptions {
   roomName: string
@@ -20,7 +29,7 @@ interface ReceiverStorageCoordinatorOptions {
 interface ReceiverCheckpointSnapshot {
   meta: P2PFileMeta
   receivedBytes: number
-  completedHashes: string[]
+  completedHashes: () => string[]
 }
 
 /** Serializes temporary-file operations and owns resume-checkpoint signaling. */
@@ -38,22 +47,6 @@ export class ReceiverStorageCoordinator {
 
   get checkpoint(): P2PResumeCheckpoint | undefined {
     return this.#checkpoint
-  }
-
-  get kind(): ReceivedStore["kind"] | undefined {
-    return this.options.storage.kind
-  }
-
-  get hasCurrent(): boolean {
-    return this.options.storage.hasCurrent
-  }
-
-  get id(): string {
-    return this.options.storage.id
-  }
-
-  canRestore(): boolean {
-    return this.options.storage.canRestore()
   }
 
   enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -78,11 +71,21 @@ export class ReceiverStorageCoordinator {
   }
 
   async initialize(meta: P2PFileMeta, forceMemory: boolean): Promise<void> {
-    if (!this.options.storage.hasCurrent) await this.options.storage.initialize(meta, forceMemory)
+    if (!this.options.storage.hasCurrent) {
+      try {
+        await this.options.storage.initialize(meta, forceMemory)
+      } catch (cause) {
+        throw new P2PReceiveStorageError(cause)
+      }
+    }
   }
 
   async append(position: number, chunk: ArrayBuffer): Promise<void> {
-    await this.options.storage.append(position, chunk)
+    try {
+      await this.options.storage.append(position, chunk)
+    } catch (cause) {
+      throw new P2PReceiveStorageError(cause)
+    }
   }
 
   async checkpointData({ meta, receivedBytes, completedHashes }: ReceiverCheckpointSnapshot, force = false) {
@@ -90,13 +93,15 @@ export class ReceiverStorageCoordinator {
       this.options.storage.kind !== "persistent" ||
       receivedBytes <= 0 ||
       receivedBytes >= meta.size ||
-      (!force &&
-        this.#lastCheckpointBytes > 0 &&
-        receivedBytes - this.#lastCheckpointBytes < p2pCheckpointIntervalBytes)
+      (!force && receivedBytes - this.#lastCheckpointBytes < p2pCheckpointIntervalBytes)
     ) {
       return
     }
-    await this.options.storage.checkpoint()
+    try {
+      await this.options.storage.checkpoint()
+    } catch (cause) {
+      throw new P2PReceiveStorageError(cause)
+    }
     const checkpoint: P2PResumeCheckpoint = {
       version: 1,
       roomName: this.options.roomName,
@@ -104,7 +109,7 @@ export class ReceiverStorageCoordinator {
       storageId: this.options.storage.id,
       meta,
       receivedBytes,
-      completedHashes,
+      completedHashes: completedHashes(),
       updatedAt: Date.now(),
     }
     if (!writeP2PResumeCheckpoint(checkpoint)) return
@@ -124,35 +129,35 @@ export class ReceiverStorageCoordinator {
   }
 
   async replaceBlock(index: number, parts: ArrayBuffer[]): Promise<void> {
-    await this.enqueue(() => this.options.storage.replaceBlock(index, parts))
+    await this.enqueue(async () => {
+      try {
+        await this.options.storage.replaceBlock(index, parts)
+      } catch (cause) {
+        throw new P2PReceiveStorageError(cause)
+      }
+    })
   }
 
   async file(meta: P2PFileMeta): Promise<File> {
-    return await this.enqueue(() => this.options.storage.file(meta))
-  }
-
-  verificationParts(index: number): readonly ArrayBuffer[] | undefined {
-    return this.options.storage.verificationParts(index)
-  }
-
-  archiveCurrent(): void {
-    this.options.storage.archiveCurrent()
-  }
-
-  rotateId(): void {
-    this.options.storage.rotateId()
+    return await this.enqueue(async () => {
+      try {
+        return await this.options.storage.file(meta)
+      } catch (cause) {
+        throw new P2PReceiveStorageError(cause)
+      }
+    })
   }
 
   async restore(receivedBytes: number, completedHashBytes: number): Promise<ArrayBuffer> {
     return await this.options.storage.restore(receivedBytes, completedHashBytes)
   }
 
-  clearCheckpoint(): void {
-    this.#clearCheckpoint()
+  verificationParts(index: number) {
+    return this.options.storage.verificationParts(index)
   }
 
-  queueDeletion(preserveCurrent: boolean): void {
-    this.options.storage.queueDeletion(preserveCurrent)
+  clearCheckpoint(): void {
+    this.#clearCheckpoint()
   }
 
   async preserveOrDispose(

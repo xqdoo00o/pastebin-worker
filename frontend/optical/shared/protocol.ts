@@ -87,12 +87,20 @@ export function smallestSufficientFrameSize(
 }
 
 export const MAX_FILE_BYTES = 64 * 1024 * 1024
+/** Sender part budget for each QR capacity. The smaller budgets leave room
+ * for DCF metadata while staying below the one-source-block symbol limit. */
+export function opticalPartPayloadSize(frameBytes: number): number {
+  if (frameBytes === 500) return 24 * 1024 * 1024
+  if (frameBytes === 1000) return 48 * 1024 * 1024
+  return MAX_FILE_BYTES
+}
+
 const FILE_HEADER_LEN = 17
 /** Largest partCount expressible in its four-bit field. */
 export const MAX_PART_COUNT = 0x0f
 
-/** Largest whole file a multi-part optical transfer can carry: the sender
- * splits anything above MAX_FILE_BYTES into at most MAX_PART_COUNT+1 pieces. */
+/** Whole-file ceiling. Smaller sender part budgets can reach the 16-piece
+ * limit before this ceiling; compression is applied before partitioning. */
 export const MAX_TRANSFER_BYTES = MAX_FILE_BYTES * (MAX_PART_COUNT + 1)
 
 /** Largest DCF container, including bounded name/type metadata. */

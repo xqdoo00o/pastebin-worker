@@ -35,6 +35,7 @@ describe("optical receiver result rendering", () => {
     const highlight = vi.fn(() => ({ value: '<span class="hljs-keyword">const</span> answer = 42' }))
     const hljs = {
       listLanguages: () => ["javascript"],
+      getLanguage: (name: string) => (name === "javascript" ? {} : undefined),
       highlight,
     } as unknown as HLJSApi
 
@@ -69,6 +70,7 @@ describe("optical receiver result rendering", () => {
     const highlight = vi.fn(() => ({ value: "unexpected" }))
     const hljs = {
       listLanguages: () => ["javascript"],
+      getLanguage: (name: string) => (name === "javascript" ? {} : undefined),
       highlight,
     } as unknown as HLJSApi
 

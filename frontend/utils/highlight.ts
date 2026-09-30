@@ -11,8 +11,10 @@ import { escapeHtml } from "../../shared/encoding.js"
 
 export type { HLJSApi }
 
+const MAX_HIGHLIGHT_CHARACTERS = 256 * 1024
+
 export function highlightHTML(hljs: HLJSApi | undefined, lang: string | undefined, content: string): string {
-  if (hljs && lang && hljs.listLanguages().includes(lang) && lang !== "plaintext") {
+  if (content.length <= MAX_HIGHLIGHT_CHARACTERS && hljs && lang && hljs.getLanguage(lang) && lang !== "plaintext") {
     return hljs.highlight(content, { language: lang }).value
   }
   return escapeHtml(content)

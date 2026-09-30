@@ -6,7 +6,8 @@ import "@testing-library/jest-dom/vitest"
 import { userEvent } from "@testing-library/user-event"
 import { setupServer } from "msw/node"
 import { http, HttpResponse } from "msw"
-import { encodeKey, encrypt, genKey } from "../utils/encryption.js"
+import { encodeKey, genKey } from "../utils/encryption.js"
+import { encryptForTest } from "./crypto-test.js"
 import { stubBrowserFunctions, unStubBrowserFunctions } from "./testUtils.js"
 import {
   BINARY_MIME_TYPE,
@@ -326,7 +327,7 @@ describe("DisplayPaste", () => {
     const scheme = "AES-GCM-CHUNKED"
     const key = await genKey(scheme)
     const fakeAudio = new Uint8Array([0xff, 0xfb, 0x90, 0x44])
-    const encryptedBytes = await encrypt(scheme, key, fakeAudio)
+    const encryptedBytes = await encryptForTest(key, fakeAudio)
     server.use(
       ...mockPaste("abcd", {
         body: encryptedBytes.buffer as ArrayBuffer,
@@ -351,7 +352,7 @@ describe("DisplayPaste", () => {
     const pngHeader = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])
     const scheme = "AES-GCM-CHUNKED"
     const key = await genKey(scheme)
-    const encryptedBytes = await encrypt(scheme, key, pngHeader)
+    const encryptedBytes = await encryptForTest(key, pngHeader)
     server.use(
       ...mockPaste("abcd", {
         body: encryptedBytes.buffer as ArrayBuffer,
@@ -376,7 +377,7 @@ describe("DisplayPaste", () => {
     const text = "encrypted hello"
     const scheme = "AES-GCM-CHUNKED"
     const key = await genKey(scheme)
-    const encryptedBytes = await encrypt(scheme, key, new TextEncoder().encode(text))
+    const encryptedBytes = await encryptForTest(key, new TextEncoder().encode(text))
     server.use(
       ...mockPaste("abcd", {
         body: encryptedBytes.buffer as ArrayBuffer,
@@ -766,7 +767,7 @@ describe("DisplayPaste", () => {
     const scheme = "AES-GCM-CHUNKED"
     const key = await genKey(scheme)
     const fakeVideo = new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70])
-    const encryptedBytes = await encrypt(scheme, key, fakeVideo)
+    const encryptedBytes = await encryptForTest(key, fakeVideo)
     server.use(
       ...mockPaste("abcd", {
         body: encryptedBytes.buffer as ArrayBuffer,
@@ -897,7 +898,7 @@ describe("DisplayPaste", () => {
     const scheme = "AES-GCM-CHUNKED"
     const key = await genKey(scheme)
     const zipBytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00])
-    const encryptedBytes = await encrypt(scheme, key, zipBytes)
+    const encryptedBytes = await encryptForTest(key, zipBytes)
     const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined)
     const createObjectUrlSpy = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:mock")
     server.use(
@@ -944,7 +945,7 @@ describe("DisplayPaste", () => {
   it("uses metadata filename for decrypted pending downloads when raw response has no filename", async () => {
     const scheme = "AES-GCM-CHUNKED"
     const key = await genKey(scheme)
-    const encryptedBytes = await encrypt(scheme, key, new TextEncoder().encode("secret text"))
+    const encryptedBytes = await encryptForTest(key, new TextEncoder().encode("secret text"))
     let downloadAnchor: HTMLAnchorElement | undefined
     const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined)
     server.use(

@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest"
 import {
+  FRAME_BYTES_OPTIONS,
+  frameBytesOptionsForEcc,
   loadOpticalReceiverSettings,
   loadOpticalSenderSettings,
   OPTICAL_RECEIVER_SETTINGS_KEY,
@@ -21,6 +23,7 @@ const receiverDefaults: OpticalReceiverSettings = {
   cameraId: "",
   captureWidth: 1280,
   captureFps: 60,
+  iso: 200,
   workers: 3,
 }
 
@@ -33,8 +36,16 @@ const receiverOptions = {
 beforeEach(() => localStorage.clear())
 
 describe("optical setting persistence", () => {
+  it("offers frame sizes up to each v48 ECC capacity", () => {
+    expect(FRAME_BYTES_OPTIONS).toEqual([500, 1000, 1450, 1850, 2331, 2953, 4143])
+    expect(frameBytesOptionsForEcc("L")).toContain(4143)
+    expect(frameBytesOptionsForEcc("M")).toContain(2953)
+    expect(frameBytesOptionsForEcc("Q")).toContain(2331)
+    expect(frameBytesOptionsForEcc("H")).toEqual([500, 1000, 1450])
+  })
+
   it("restores valid sender settings over Wrangler defaults", () => {
-    const saved: OpticalTransferSettings = { txFps: 24, frameBytes: 1465, ecc: "Q", gridCodes: 2 }
+    const saved: OpticalTransferSettings = { txFps: 24, frameBytes: 1450, ecc: "Q", gridCodes: 2 }
     saveOpticalSenderSettings(saved)
 
     expect(loadOpticalSenderSettings(senderDefaults)).toEqual(saved)
@@ -61,7 +72,7 @@ describe("optical setting persistence", () => {
       JSON.stringify({ version: 1, txFps: 30, frameBytes: 2953, ecc: "H", gridCodes: 4 }),
     )
 
-    expect(loadOpticalSenderSettings(senderDefaults)).toMatchObject({ frameBytes: 1000, ecc: "H" })
+    expect(loadOpticalSenderSettings(senderDefaults)).toMatchObject({ frameBytes: 1450, ecc: "H" })
   })
 
   it("restores receiver settings only when this page/device still offers them", () => {
@@ -69,6 +80,7 @@ describe("optical setting persistence", () => {
       cameraId: "rear-wide",
       captureWidth: 1920,
       captureFps: 30,
+      iso: 390,
       workers: 4,
     })
 
@@ -76,6 +88,7 @@ describe("optical setting persistence", () => {
       cameraId: "rear-wide",
       captureWidth: 1920,
       captureFps: 30,
+      iso: 390,
       workers: 4,
     })
 
@@ -84,9 +97,21 @@ describe("optical setting persistence", () => {
       cameraId: "rear-wide",
       captureWidth: receiverDefaults.captureWidth,
       captureFps: 30,
+      iso: 390,
       workers: receiverDefaults.workers,
     })
     expect(JSON.parse(localStorage.getItem(OPTICAL_RECEIVER_SETTINGS_KEY)!)).toMatchObject({ version: 1 })
+  })
+
+  it("keeps ISO as a device-independent preference and rejects invalid values", () => {
+    localStorage.setItem(
+      OPTICAL_RECEIVER_SETTINGS_KEY,
+      JSON.stringify({ version: 1, iso: 6400, isoRange: { min: 100, max: 200, step: 10 } }),
+    )
+    expect(loadOpticalReceiverSettings(receiverDefaults, receiverOptions).iso).toBe(6400)
+
+    localStorage.setItem(OPTICAL_RECEIVER_SETTINGS_KEY, JSON.stringify({ version: 1, iso: -1 }))
+    expect(loadOpticalReceiverSettings(receiverDefaults, receiverOptions).iso).toBe(receiverDefaults.iso)
   })
 
   it("ignores obsolete, corrupted, and unavailable storage without breaking startup", () => {

@@ -5,7 +5,7 @@ import {
   readP2PSessionPeer,
   writeP2PSessionPeer,
 } from "../p2pReceiveStore.js"
-import type { P2PFileMeta } from "./protocol.js"
+import type { P2PFileMeta, P2PTransferStatus } from "./protocol.js"
 import { P2PReceiveStorageFactory, type ReceivedStore } from "./receivedStorage.js"
 import { uuid } from "./transfer.js"
 
@@ -63,7 +63,7 @@ export class ReceiverStorageSession {
     return await this.#requiredCurrent().file(meta)
   }
 
-  verificationParts(index: number): readonly ArrayBuffer[] | undefined {
+  verificationParts(index: number): ReturnType<ReceivedStore["verificationParts"]> {
     return this.#current?.verificationParts(index)
   }
 
@@ -124,6 +124,25 @@ export class ReceiverTransferLifecycle {
     return this.#state
   }
 
+  status(reconnecting = false): P2PTransferStatus {
+    if (this.isComplete()) return "DONE"
+    if (this.isPaused()) return "PAUSED"
+    if (reconnecting) return "RECONNECTING"
+    switch (this.#state.kind) {
+      case "downloading":
+      case "pausing":
+        return "DOWNLOADING"
+      case "verifying":
+        return "VERIFYING"
+      case "repairing":
+        return "REPAIRING"
+      case "stopping":
+        return "WAITING"
+      default:
+        return "READY"
+    }
+  }
+
   transition(next: ReceiverTransferState): void {
     this.#state = next
   }
@@ -171,10 +190,7 @@ export function createReceiverSessionIdentity(roomName: string) {
     checkpoint,
     initialRecoveryRetryToken,
     peerId,
-    storage: new ReceiverStorageSession(
-      new P2PReceiveStorageFactory(peerId),
-      checkpoint?.storageId ?? (checkpoint ? peerId : uuid()),
-    ),
+    storage: new ReceiverStorageSession(new P2PReceiveStorageFactory(peerId), checkpoint?.storageId ?? uuid()),
   }
 }
 

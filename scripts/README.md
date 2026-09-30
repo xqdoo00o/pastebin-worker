@@ -10,6 +10,10 @@ This is a wrapper script to make it easier to use our pastebin.
 
 The `cryptography` package is only required when using client-side encryption (`post -E` / `update -E`, or fetching an encrypted paste with `get`). Plain pastes work without it.
 
+File uploads above 5 MiB are read and, when requested, encrypted one chunk at a time. Input from stdin is first spooled to a temporary file to determine its size; that file is removed when the command finishes.
+
+Downloads saved to a file stream into a temporary file in the destination directory and replace the destination atomically after success. Encrypted downloads authenticate every chunk before publishing the file or writing to stdout. Plain downloads to a pipe stream directly, so an interrupted download can leave partial pipe output. Terminal output is staged for the binary-content check. Memory stays bounded, and failed file downloads leave the existing destination untouched.
+
 **Installation**: download `pb` to your `PATH` and give it execution permission. For example:
 
 ```shell

@@ -2,6 +2,7 @@ import { loadXXHashWasmModule } from "../../wasm/xxhash-loader.js"
 import type { ExpectedOpticalTransfer, FountainWorkerOutput } from "../shared/fountain.js"
 import { loadNanoRQCodecModule } from "../shared/wasm-module.js"
 import { asError } from "../../utils/errors.js"
+import { disposeWorker, WorkerInitialization } from "../../utils/workerLifecycle.js"
 import type { PoolWorker } from "../shared/worker-pool.js"
 import { createFountainWorker } from "./worker-factory.js"
 
@@ -16,6 +17,7 @@ interface FountainWorkerClientOptions {
 export class FountainWorkerClient {
   private worker: Worker | undefined
   private ready: Promise<Worker> | undefined
+  private initialization: WorkerInitialization<Worker> | undefined
   private nextConnectionId = 1
   private submittedFrames = 0
   private processedFrames = 0
@@ -28,65 +30,58 @@ export class FountainWorkerClient {
   ensure(): Promise<Worker> {
     if (this.ready) return this.ready
 
-    let worker: Worker | undefined
-    let initialized = false
-    const pending = Promise.all([loadNanoRQCodecModule(), loadXXHashWasmModule()]).then(
-      ([wasmModule, xxhashWasmModule]) =>
-        new Promise<Worker>((resolve, reject) => {
-          worker = createFountainWorker()
-          this.worker = worker
-          let settled = false
-          const rejectInitialization = (error: Error) => {
-            if (settled) return
-            settled = true
-            clearTimeout(timeout)
-            reject(error)
-          }
-          const timeout = setTimeout(
-            () => rejectInitialization(new Error("Optical decoder worker initialization timed out")),
-            INIT_TIMEOUT_MS,
-          )
-          worker.onmessage = (event: MessageEvent<FountainWorkerOutput>) => {
-            const message = event.data
-            if (message.type === "ready") {
-              if (settled) return
-              settled = true
-              clearTimeout(timeout)
-              initialized = true
-              worker!.postMessage({ type: "expectTransfer", expected: this.expectedTransfer })
-              resolve(worker!)
-              return
-            }
-            if (!initialized && message.type === "error") {
-              rejectInitialization(new Error(message.message))
-              return
-            }
-            if (message.type === "processed") {
-              this.processedFrames += message.count
-              this.notifyDrain()
-              this.notifyFullDrain()
-              return
-            }
-            this.options.onMessage(message)
-          }
-          const fail = (message: string) => {
-            if (!initialized) rejectInitialization(new Error(message))
-            else if (!this.options.isDone()) this.options.onFatal(message)
-          }
-          worker.onerror = (event) => fail(`Optical decoder worker: ${event.message || "worker error"}`)
-          worker.onmessageerror = () => fail("Optical decoder worker returned an unreadable message")
-          try {
-            worker.postMessage({ type: "init", wasmModule, xxhashWasmModule })
-          } catch (error) {
-            rejectInitialization(asError(error))
-          }
-        }),
-    )
+    const initialization = new WorkerInitialization<Worker>()
+    this.initialization = initialization
+    const pending = initialization.promise
     this.ready = pending
+    void Promise.all([loadNanoRQCodecModule(), loadXXHashWasmModule()])
+      .then(([wasmModule, xxhashWasmModule]) => {
+        if (!initialization.pending || this.initialization !== initialization) return
+        const worker = createFountainWorker()
+        this.worker = worker
+        let initialized = false
+        initialization.startTimeout(INIT_TIMEOUT_MS, () =>
+          initialization.reject(new Error("Optical decoder worker initialization timed out")),
+        )
+        worker.onmessage = (event: MessageEvent<FountainWorkerOutput>) => {
+          if (this.worker !== worker || (!initialized && !initialization.pending)) return
+          const message = event.data
+          if (message.type === "ready") {
+            if (initialized) return
+            try {
+              worker.postMessage({ type: "expectTransfer", expected: this.expectedTransfer })
+              initialized = true
+              initialization.resolve(worker)
+            } catch (error) {
+              initialization.reject(asError(error))
+            }
+            return
+          }
+          if (!initialized && message.type === "error") {
+            initialization.reject(new Error(message.message))
+            return
+          }
+          if (message.type === "processed") {
+            this.processedFrames += message.count
+            this.notifyDrain()
+            this.notifyFullDrain()
+            return
+          }
+          this.options.onMessage(message)
+        }
+        const fail = (message: string) => {
+          if (this.worker !== worker) return
+          if (!initialized) initialization.reject(new Error(message))
+          else if (!this.options.isDone()) this.options.onFatal(message)
+        }
+        worker.onerror = (event) => fail(`Optical decoder worker: ${event.message || "worker error"}`)
+        worker.onmessageerror = () => fail("Optical decoder worker returned an unreadable message")
+        worker.postMessage({ type: "init", wasmModule, xxhashWasmModule })
+      })
+      .catch((error: unknown) => initialization.reject(asError(error)))
     void pending.catch(() => {
-      worker?.terminate()
-      if (this.worker === worker) this.worker = undefined
-      if (this.ready === pending) this.ready = undefined
+      if (this.initialization !== initialization) return
+      this.terminate()
     })
     return pending
   }
@@ -100,9 +95,7 @@ export class FountainWorkerClient {
     try {
       fountain.postMessage({ type: "connect", connectionId, port: channel.port1 }, [channel.port1])
       connected = true
-      worker.postMessage({ type: "init", wasmModule: opticalCodecModule, fountainPort: channel.port2 }, [
-        channel.port2,
-      ])
+      worker.postMessage({ type: "init", wasmModule: opticalCodecModule, fountainPort: channel.port2 }, [channel.port2])
     } catch (error) {
       if (connected) {
         try {
@@ -114,7 +107,7 @@ export class FountainWorkerClient {
         channel.port1.close()
         channel.port2.close()
       }
-      worker.terminate()
+      disposeWorker(worker)
       throw error
     }
 
@@ -151,7 +144,9 @@ export class FountainWorkerClient {
   }
 
   terminate(): void {
-    this.worker?.terminate()
+    this.initialization?.reject(new DOMException("Optical decoder initialization was cancelled", "AbortError"))
+    this.initialization = undefined
+    if (this.worker) disposeWorker(this.worker)
     this.worker = undefined
     this.ready = undefined
     this.submittedFrames = 0

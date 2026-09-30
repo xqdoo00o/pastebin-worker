@@ -6,7 +6,6 @@ import {
   PageContainer,
   PageShell,
   PageTopbar,
-  Tooltip,
   actionControlClassName,
   iconControlClassName,
 } from "../components/ui/index.js"
@@ -14,7 +13,7 @@ import { DarkModeToggle, useDarkModeSelection } from "../components/DarkModeTogg
 import { DownloadIcon, HomeIcon, RefreshIcon } from "../components/icons.js"
 import { CopyWidget } from "../components/CopyWidget.js"
 import { WebShareButton } from "../components/WebShareButton.js"
-import { QrCodeTooltip } from "../components/QrCodeTooltip.js"
+import { PageTopbarActions } from "../components/PageTopbarActions.js"
 import { highlightHTML, useHljsForLang } from "../utils/highlight.js"
 import { formatSize } from "../utils/utils.js"
 import type { OriginalFileInfo, PublicEnv } from "../../shared/interfaces.js"
@@ -28,6 +27,7 @@ import type {
 import { filenameForTitle, itemCountLabel } from "../../shared/format.js"
 import { countTextLines } from "../components/LineNumbers.js"
 import { mediaKindOfFile, mediaKindOfType, mediaPreviewBlob } from "../utils/filePreview.js"
+import { useObjectUrl } from "../utils/useObjectUrl.js"
 import type { PasteMediaInfo, PastePendingInfo } from "../utils/usePasteLoader.js"
 import {
   ActionRow,
@@ -64,6 +64,7 @@ function isZipBuffer(buffer: Uint8Array | undefined): boolean {
 interface PasteDisplayState {
   file?: File
   contentBuffer?: Uint8Array
+  text?: string
   lang?: string
   isFileBinary: boolean
   guessedEncoding: string | null
@@ -79,6 +80,7 @@ interface PasteDisplayState {
 interface P2PDisplayState {
   isMode?: boolean
   status?: string
+  transferStatus?: P2PTransferStatus
   connectionRoute?: P2PConnectionRoute
   meta?: P2PFileMeta
   updateMeta?: P2PFileMeta
@@ -87,7 +89,6 @@ interface P2PDisplayState {
   file?: File
   isPaused?: boolean
   isPausing?: boolean
-  isReconnecting?: boolean
   isAcceptingUpdate?: boolean
 }
 
@@ -238,15 +239,11 @@ function DisplayTopbar({
         </>
       }
       actions={
-        <>
-          <DarkModeToggle modeSelection={modeSelection} setModeSelection={setModeSelection} />
-          {displayUrl && (
-            <QrCodeTooltip value={displayUrl} placement="bottom" className={iconLinkClass} tooltip="Show QR code" />
-          )}
-          <Tooltip content="Share this page" placement="bottom">
-            <WebShareButton title={titleDisplayFilename || name} url={displayUrl} className={iconLinkClass} plain />
-          </Tooltip>
-        </>
+        <PageTopbarActions
+          title={titleDisplayFilename || name}
+          url={displayUrl}
+          themeToggle={<DarkModeToggle modeSelection={modeSelection} setModeSelection={setModeSelection} />}
+        />
       }
     />
   )
@@ -264,6 +261,7 @@ export function DisplayPasteView(props: DisplayPasteViewProps) {
     paste: {
       file: pasteFile,
       contentBuffer: pasteContentBuffer,
+      text: pasteText,
       lang: pasteLang,
       isFileBinary,
       guessedEncoding,
@@ -278,6 +276,7 @@ export function DisplayPasteView(props: DisplayPasteViewProps) {
     p2p: {
       isMode: isP2PMode,
       status: p2pStatus,
+      transferStatus: p2pTransferStatus = "READY",
       connectionRoute: p2pConnectionRoute,
       meta: p2pMeta,
       updateMeta: p2pUpdateMeta,
@@ -286,7 +285,6 @@ export function DisplayPasteView(props: DisplayPasteViewProps) {
       file: p2pFile,
       isPaused: isP2PPaused,
       isPausing: isP2PPausing,
-      isReconnecting: isP2PReconnecting,
       isAcceptingUpdate: isP2PAcceptingUpdate,
     } = {},
     actions: {
@@ -308,7 +306,6 @@ export function DisplayPasteView(props: DisplayPasteViewProps) {
   const [, modeSelection, setModeSelection] = useDarkModeSelection()
   const displayLang = pasteLang
   const hljs = useHljsForLang(displayLang)
-  const [downloadUrl, setDownloadUrl] = useState<string>("#")
   const [displayUrl, setDisplayUrl] = useState<string>("")
   const [isNativeDownloadDebounced, setNativeDownloadDebounced] = useState(false)
   const [dismissedP2PUpdateNotice, setDismissedP2PUpdateNotice] = useState<string>()
@@ -330,25 +327,17 @@ export function DisplayPasteView(props: DisplayPasteViewProps) {
     }
   }, [])
 
-  // Create and cleanup blob URL
   const downloadableFile = p2pFile || pasteFile
-
-  useEffect(() => {
-    if (downloadableFile && typeof window !== "undefined" && URL.createObjectURL) {
-      const url = URL.createObjectURL(mediaPreviewBlob(downloadableFile))
-      setDownloadUrl(url)
-      return () => {
-        if (URL.revokeObjectURL) URL.revokeObjectURL(url)
-      }
-    }
-  }, [downloadableFile])
+  const previewBlob = useMemo(() => downloadableFile && mediaPreviewBlob(downloadableFile), [downloadableFile])
+  const downloadUrl = useObjectUrl(previewBlob)
 
   const pasteMediaKind = pasteFile ? mediaKindOfFile(pasteFile) : null
   const mediaInfoKind = mediaInfo ? mediaKindOfType(mediaInfo.contentType) : null
   const showFileContent = pasteFile !== undefined && pasteMediaKind === null && (!isFileBinary || forceShowBinary)
   const pasteStringContent = useMemo(
-    () => (pasteContentBuffer ? new TextDecoder().decode(pasteContentBuffer) : undefined),
-    [pasteContentBuffer],
+    () =>
+      pasteText ?? (showFileContent && pasteContentBuffer ? new TextDecoder().decode(pasteContentBuffer) : undefined),
+    [pasteText, showFileContent, pasteContentBuffer],
   )
   const highlightedHTML = useMemo(() => {
     const html = pasteStringContent ? highlightHTML(hljs, displayLang, pasteStringContent) : ""
@@ -360,24 +349,10 @@ export function DisplayPasteView(props: DisplayPasteViewProps) {
   const isZipArchive = isZipBuffer(pasteContentBuffer)
   const isDownloadActionDisabled = isLoading || isDownloading
   const isP2PDownloading = p2pProgress !== undefined && !p2pFile
-  const isP2PRepairing = p2pStatus?.startsWith("Repairing") ?? false
   const showP2PPanel = isP2PMode && !(p2pFile && (showFileContent || pasteMediaKind !== null))
   const canSharePreviewContent = isP2PMode || (pasteFile !== undefined && (showFileContent || pasteMediaKind !== null))
   const showPrimaryContent =
     !isP2PMode || p2pTransferHistory.length === 0 || p2pMeta !== undefined || pasteFile !== undefined || isLoading
-  const p2pTransferStatus: P2PTransferStatus = p2pFile
-    ? "DONE"
-    : isP2PPaused
-      ? "PAUSED"
-      : isP2PReconnecting
-        ? "RECONNECTING"
-        : isP2PRepairing
-          ? "REPAIRING"
-          : p2pProgress
-            ? p2pProgress.doneBytes >= p2pProgress.totalBytes
-              ? "VERIFYING"
-              : "DOWNLOADING"
-            : "READY"
   const p2pUpdateNoticeKey = p2pUpdateMeta
     ? p2pUpdateMeta.revision ||
       [p2pUpdateMeta.name, p2pUpdateMeta.size, p2pUpdateMeta.lastModified, p2pUpdateMeta.type].join(":")
@@ -470,12 +445,7 @@ export function DisplayPasteView(props: DisplayPasteViewProps) {
   const placeholderReason = (() => {
     if (!pendingInfo) return ""
     const ct = pendingInfo.contentType
-    if (
-      !ct?.startsWith("text/") &&
-      !ct?.startsWith("image/") &&
-      !ct?.startsWith("audio/") &&
-      !ct?.startsWith("video/")
-    ) {
+    if (!ct?.startsWith("text/") && mediaKindOfType(ct ?? "") === null) {
       return `Not a renderable file${ct ? ` (${ct})` : ""}.`
     }
     if (pendingInfo.isReadLimited) {

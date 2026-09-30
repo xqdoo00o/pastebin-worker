@@ -18,7 +18,7 @@ import {
   type P2PSignalingTransport,
 } from "./p2p/signalingTransport.js"
 import { P2PWakeLock } from "./p2p/wakeLock.js"
-import { createSpeedTracker, measureSpeed, sendData, uuid } from "./p2p/transfer.js"
+import { createSpeedTracker, measureSpeed, progressUpdateIntervalMs, sendData, uuid } from "./p2p/transfer.js"
 import { SenderPeerPresentation } from "./p2p/senderPresentation.js"
 import {
   SenderFileVersionRegistry,
@@ -29,6 +29,8 @@ import {
   isPeerActive,
   isPeerComplete,
   isPeerPaused,
+  isPeerRepairing,
+  isPeerTransportUsable,
   senderFileInfo,
   transitionPeer,
   type EnsurePeerOptions,
@@ -129,13 +131,6 @@ export async function startP2PSender({
     return signalingTransport.send(message)
   }
 
-  const isPeerTransportUsable = (peer: SenderPeerState) =>
-    peer.isConnected &&
-    peer.dc.readyState === "open" &&
-    peer.pc.connectionState !== "closed" &&
-    peer.pc.connectionState !== "failed" &&
-    peer.pc.connectionState !== "disconnected"
-
   const canNegotiatePeer = (peer: SenderPeerState) => isSignalingReady && peer.isSignalingConnected
 
   const sendPeerMeta = (peer: SenderPeerState) => {
@@ -161,7 +156,6 @@ export async function startP2PSender({
   const presentation = new SenderPeerPresentation({
     callbacks,
     currentVersion: () => currentVersion,
-    isPeerTransportUsable,
     isSignalingReady: () => isSignalingReady,
     peers,
   })
@@ -497,25 +491,36 @@ export async function startP2PSender({
         return
       }
       if (message.type === "download") {
-        const version = message.revision ? versionRegistry.get(message.revision) : currentVersion
-        if (version) void peerTransfer.send(peer, version, message.offset)
+        const version = versionRegistry.get(message.revision)
+        if (version) void peerTransfer.send(peer, version, message.offset, message.receiveWindow)
         else sendData(peer.dc, { type: "error", message: "The requested file version is no longer available." })
       }
       if (message.type === "progress") {
-        const version = message.revision ? versionRegistry.get(message.revision) : peer.activeVersion || currentVersion
+        const version = versionRegistry.get(message.revision)
         if (!version) return
-        if (message.revision && message.revision !== version.revision) return
+        if (version === peer.activeVersion && message.flowBytes !== undefined) {
+          peer.sendWindow?.acknowledge(message.flowBytes)
+          if (isPeerRepairing(peer)) return
+        }
         switchPeerVersion(peer, version)
         const { file: activeFile, verifyTransfer: verifyActiveTransfer } = version
         const doneBytes = Math.min(Math.max(Math.floor(message.doneBytes || 0), 0), activeFile.size)
+        // Byte-based credit can arrive far more often than UI progress updates.
+        if (
+          message.flowBytes !== undefined &&
+          doneBytes < activeFile.size &&
+          peer.progressTracker &&
+          performance.now() - peer.progressTracker.lastMeasuredAt < progressUpdateIntervalMs
+        )
+          return
         peer.progressTracker ??= createSpeedTracker(doneBytes)
         peer.speedBytesPerSecond = measureSpeed(peer.progressTracker, doneBytes, doneBytes >= activeFile.size)
         peer.progress = { doneBytes, totalBytes: activeFile.size, speedBytesPerSecond: peer.speedBytesPerSecond }
         if (doneBytes >= activeFile.size && !verifyActiveTransfer) {
           peer.status = "Waiting for receiver to finish..."
-        } else if (doneBytes >= activeFile.size && verifyActiveTransfer) {
-          transitionPeer(peer, { kind: "verifying" })
         }
+        // The send operation enters verification only after publishing its
+        // manifest. A fast final-byte ACK must not interrupt that operation.
         emitPeers()
       }
       if (message.type === "repair-request") {
@@ -533,7 +538,7 @@ export async function startP2PSender({
         emitPeers()
       }
       if (message.type === "received") {
-        const version = message.revision ? versionRegistry.get(message.revision) : peer.activeVersion
+        const version = versionRegistry.get(message.revision)
         if (!version || version !== peer.activeVersion) return
         invalidateSenderPeerOperation(peer)
         transitionPeer(peer, { kind: "complete" })
@@ -591,8 +596,8 @@ export async function startP2PSender({
 
   const reconcileSignalingPeer = async (
     peerId: string,
-    userAgent?: string,
-    connectionId?: string,
+    userAgent: string | undefined,
+    connectionId: string,
     isCurrent: () => boolean = () => !isClosed,
     options: { probeRelayRoute?: boolean } = {},
   ) => {
@@ -604,7 +609,7 @@ export async function startP2PSender({
     }
 
     versionRegistry.cancelScheduledPeerRelease(peerId)
-    const signalingEndpointChanged = connectionId !== undefined && connectionId !== existing.signalingConnectionId
+    const signalingEndpointChanged = connectionId !== existing.signalingConnectionId
     existing.isSignalingConnected = true
     existing.signalingConnectionId = connectionId
     if (signalingEndpointChanged) recoveryCoordinator.resetPolicy(peerId)
@@ -753,21 +758,17 @@ export async function startP2PSender({
         emitPeers()
         emitReceiverStatus()
       }
-      if (message.type === "peer-joined" && message.role === "receiver" && message.peerId) {
+      if (message.type === "peer-joined") {
         if ("iceServers" in message) {
           iceServers = message.iceServers
           callbacks.onIceServersChange?.(iceServers)
         }
         await reconcileSignalingPeer(message.peerId, message.userAgent, message.connectionId, isCurrentSocket)
       }
-      if (message.type === "peer-signaling-disconnected" && message.role === "receiver" && message.peerId) {
+      if (message.type === "peer-signaling-disconnected" && message.role === "receiver") {
         const peer = peers.get(message.peerId)
         if (peer) {
-          if (
-            message.connectionId &&
-            peer.signalingConnectionId &&
-            message.connectionId !== peer.signalingConnectionId
-          ) {
+          if (message.connectionId !== peer.signalingConnectionId) {
             return
           }
           markPeerSignalingDisconnected(peer)
@@ -788,15 +789,14 @@ export async function startP2PSender({
       }
       if (message.type === "answer") {
         const peer = peers.get(message.peerId)
-        if (!peer || !isCurrentSocket() || (message.negotiationId && message.negotiationId !== peer.negotiationId))
-          return
+        if (!peer || !isCurrentSocket() || message.negotiationId !== peer.negotiationId) return
         await peer.pc.setRemoteDescription(message.sdp)
         if (!isCurrentSocket() || peers.get(message.peerId) !== peer) return
         await flushCandidates(peer, isCurrentSocket)
       }
       if (message.type === "candidate" && isCurrentSocket()) {
         const peer = peers.get(message.peerId)
-        if (peer && (!message.negotiationId || message.negotiationId === peer.negotiationId)) {
+        if (message.negotiationId === peer?.negotiationId) {
           await addCandidate(message.peerId, message.candidate)
         }
       }

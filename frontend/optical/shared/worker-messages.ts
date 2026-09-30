@@ -29,7 +29,6 @@ export interface ApngExportOptions {
 }
 
 export interface ApngExportResult {
-  blob: Blob
   filename: string
   frames: number
   symbols: number
@@ -46,6 +45,7 @@ export type SenderWorkerInput =
     }
   | { type: "prepare"; file: File; mediaType?: string }
   | { type: "prepareBytes"; name: string; mediaType: string; data: ArrayBuffer }
+  | { type: "partition"; requestId: number; partPayloadSize: number }
   | {
       type: "configure"
       session: number
@@ -58,7 +58,8 @@ export type SenderWorkerInput =
   | { type: "dispose" }
 
 export type SenderWorkerOutput =
-  | { type: "prepared"; file: PreparedOpticalFile }
+  | { type: "payloadReady" }
+  | { type: "prepared"; requestId: number; partPayloadSize: number; file: PreparedOpticalFile }
   | {
       type: "batch"
       session: number
@@ -67,23 +68,29 @@ export type SenderWorkerOutput =
       modules: number
       /** Which part produced this batch; the UI drops batches from a stale part. */
       part: number
+      /** Exact transmitted payload bytes in this part, excluding DCF metadata. */
+      partBytes: number
     }
   | { type: "preparedPart"; requestId: number; part: PackedOpticalFile }
+  | { type: "preparedPartError"; requestId: number; message: string }
   | { type: "disposed" }
-  | { type: "error"; message: string; session?: number }
+  | { type: "error"; message: string; session?: number; requestId?: number }
 
 /** One short-lived worker owns one export, keeping APNG encoding independent
  * from the long-lived worker that generates the live QR camera stream. */
-export type ApngWorkerInput = {
-  type: "export"
-  wasmModule: WebAssembly.Module
-  fileName: string
-  /** A copied selected part; its ArrayBuffer is transferred through the page. */
-  part: PackedOpticalFile
-} & ApngExportOptions
+export type ApngWorkerInput =
+  | ({
+      type: "export"
+      wasmModule: WebAssembly.Module
+      fileName: string
+      /** A copied selected part; its ArrayBuffer is transferred through the page. */
+      part: PackedOpticalFile
+    } & ApngExportOptions)
+  | { type: "chunksAck" }
 
 export type ApngWorkerOutput =
   | { type: "progress"; completed: number; total: number }
+  | { type: "chunks"; parts: Uint8Array<ArrayBuffer>[] }
   | ({ type: "done" } & ApngExportResult)
   | { type: "error"; message: string }
 

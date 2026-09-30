@@ -1,7 +1,13 @@
-import { copyFileSync, mkdirSync } from "node:fs"
 import { join } from "node:path"
 
-import { collapseEmscriptenVariantGlue, emscriptenCodecBuildContext, ensurePinnedGitCheckout } from "../build-utils.mjs"
+import {
+  emscriptenModuleFlags,
+  copyFileIfChanged,
+  createCodecBuildOutput,
+  collapseEmscriptenVariantGlue,
+  emscriptenCodecBuildContext,
+  ensurePinnedGitCheckout,
+} from "../build-utils.mjs"
 import { codecBuildState } from "../build-state.mjs"
 import { toolOverride } from "../emscripten/toolchain.mjs"
 
@@ -9,8 +15,8 @@ const { buildHash, codecRoot, outputRoot, stampPath, writeBuildHash } = codecBui
 const inputHash = buildHash()
 const xxhashRoot = join(codecRoot, "third_party", "xxHash")
 const xxhashRepository = "https://github.com/Cyan4973/xxHash.git"
-const xxhashRevision = "e626a72bc2321cd320e953a0ccf1584cad60f363"
-const git = process.env.XXHASH_GIT || toolOverride("GIT").value || "git"
+const xxhashRevision = "c87183a77d67f7d37e3d2d1b7eaac5e7c695e4f0"
+const git = toolOverride("GIT").value || "git"
 const { emcc, run, output } = emscriptenCodecBuildContext({ cwd: codecRoot })
 
 ensurePinnedGitCheckout({
@@ -24,7 +30,7 @@ ensurePinnedGitCheckout({
   label: "official xxHash",
 })
 
-mkdirSync(outputRoot, { recursive: true })
+const buildOutput = createCodecBuildOutput(codecRoot, outputRoot)
 const exports = [
   "_malloc",
   "_free",
@@ -46,23 +52,14 @@ function compileXXHash(simd) {
     "-flto",
     ...(simd ? ["-msimd128"] : ["-DXXH_VECTOR=XXH_SCALAR"]),
     "-DNDEBUG",
-    "-sWASM=1",
+    ...emscriptenModuleFlags({
+      exportName: "createXXHash",
+      maximumMemory: 2147483648,
+    }),
     "-sWASM_BIGINT=1",
-    "-sMODULARIZE=1",
-    "-sEXPORT_ES6=1",
-    "-sEXPORT_NAME=createXXHash",
-    "-sINCOMING_MODULE_JS_API=instantiateWasm",
-    "-sENVIRONMENT=web,worker",
-    "-sFILESYSTEM=0",
-    "-sASSERTIONS=0",
-    "-sMALLOC=emmalloc",
-    "-sALLOW_MEMORY_GROWTH=1",
-    "-sMAXIMUM_MEMORY=2147483648",
     `-sEXPORTED_FUNCTIONS=${JSON.stringify(exports)}`,
-    "-sEXPORTED_RUNTIME_METHODS=HEAPU8",
-    "--no-entry",
     "-o",
-    join(outputRoot, `xxhash_${capability}.js`),
+    join(buildOutput.directory, `xxhash_${capability}.js`),
   ])
 }
 
@@ -71,9 +68,10 @@ compileXXHash(false)
 
 // Both variants have the same imports and exports. Keep one stable JS factory;
 // callers inject the selected compiled WebAssembly.Module.
-collapseEmscriptenVariantGlue({ outputRoot, baseName: "xxhash" })
+collapseEmscriptenVariantGlue({ outputRoot: buildOutput.directory, baseName: "xxhash" })
+buildOutput.publish()
 
-copyFileSync(join(codecRoot, "src", "xxhash.d.ts"), join(outputRoot, "xxhash.d.ts"))
-copyFileSync(join(xxhashRoot, "LICENSE"), join(outputRoot, "LICENSE"))
+copyFileIfChanged(join(codecRoot, "src", "xxhash.d.ts"), join(outputRoot, "xxhash.d.ts"))
+copyFileIfChanged(join(xxhashRoot, "LICENSE"), join(outputRoot, "LICENSE"))
 writeBuildHash(inputHash)
 console.log(`Recorded xxHash build state in ${stampPath}`)

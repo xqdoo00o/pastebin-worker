@@ -1,6 +1,7 @@
 import { monochromeByteLength } from "../shared/monochrome.js"
 import { gridDims, TRANSFER_QR_MARGIN } from "../shared/qr.js"
 import type { SenderWorkerOutput } from "../shared/worker-messages.js"
+import { formatSize } from "../../utils/utils.js"
 import { createMonochromeCanvasRenderer, type MonochromeCanvasRenderer } from "./monochrome-canvas-renderer.js"
 
 const LOOKAHEAD = 3
@@ -54,6 +55,7 @@ export class OpticalPlaybackSession {
   private readonly recycledBuffers: ArrayBuffer[] = []
   private queueHead = 0
   private currentPart: number
+  private currentPartBytes: number | undefined
   private version: number | undefined
   private modules = 0
   private renderer: MonochromeCanvasRenderer | undefined
@@ -153,9 +155,13 @@ export class OpticalPlaybackSession {
     if (this.isFullscreen()) {
       budgetWidth = Math.max(1, this.stage.clientWidth || window.innerWidth)
       budgetHeight = Math.max(1, this.stage.clientHeight || window.innerHeight)
+      // The outer quiet zone may extend past the fullscreen viewport. Keep
+      // the quiet zones between cells in the dimensions used for fitting.
+      const visibleWidth = totalWidth - 2 * TRANSFER_QR_MARGIN
+      const visibleHeight = totalHeight - 2 * TRANSFER_QR_MARGIN
       const physicalScale = Math.max(
         1,
-        Math.floor(Math.min((budgetWidth * dpr) / totalWidth, (budgetHeight * dpr) / totalHeight) + Number.EPSILON),
+        Math.floor(Math.min((budgetWidth * dpr) / visibleWidth, (budgetHeight * dpr) / visibleHeight) + Number.EPSILON),
       )
       canvas.style.width = `${(totalWidth * physicalScale) / dpr}px`
       canvas.style.height = `${(totalHeight * physicalScale) / dpr}px`
@@ -196,6 +202,7 @@ export class OpticalPlaybackSession {
       return
     }
     this.requestPendingPart = undefined
+    this.currentPartBytes = message.partBytes
     try {
       if (this.partSwitchPending) {
         this.partSwitchPending = false
@@ -251,6 +258,7 @@ export class OpticalPlaybackSession {
       return false
     }
     this.currentPart = target
+    this.currentPartBytes = undefined
     this.discardQueued(this.queuedCount())
     for (const image of this.cells) {
       if (image) this.recycledBuffers.push(image.buffer)
@@ -273,7 +281,9 @@ export class OpticalPlaybackSession {
 
   private streamStatusText(): string {
     return this.partCount > 1
-      ? `Streaming ${this.fileName} · part ${this.currentPart + 1}/${this.partCount}.`
+      ? `Streaming ${this.fileName} · part ${this.currentPart + 1}/${this.partCount}${
+          this.currentPartBytes === undefined ? "" : ` · ${formatSize(this.currentPartBytes)}`
+        }.`
       : `Streaming ${this.fileName}.`
   }
 

@@ -1,0 +1,141 @@
+diff --git a/core/src/qrcode/QRVersion.h b/core/src/qrcode/QRVersion.h
+--- a/core/src/qrcode/QRVersion.h
++++ b/core/src/qrcode/QRVersion.h
+@@ -64,7 +64,7 @@
+ 
+ 		switch (type) {
+ 		case Type::Model1: return valid(version, 32) ? square(17 + 4 * version) : PointI{};
+-		case Type::Model2: return valid(version, 40) ? square(17 + 4 * version) : PointI{};
++		case Type::Model2: return (valid(version, 40) || version == 48) ? square(17 + 4 * version) : PointI{};
+ 		case Type::Micro: return valid(version, 4) ? square(9 + 2 * version) : PointI{};
+ 		case Type::rMQR: return valid(version, 32) ? RMQR_SIZES[version - 1] : PointI{};
+ 		}
+@@ -76,7 +76,7 @@
+ 	{
+ 		switch (type) {
+ 		case Type::Model1: return size.x == size.y && size.x >= 21 && size.x <= 145 && (size.x % 4 == 1);
+-		case Type::Model2: return size.x == size.y && size.x >= 21 && size.x <= 177 && (size.x % 4 == 1);
++		case Type::Model2: return size.x == size.y && ((size.x >= 21 && size.x <= 177 && (size.x % 4 == 1)) || size.x == 209);
+ 		case Type::Micro: return size.x == size.y && size.x >= 11 && size.x <= 17 && (size.x % 2 == 1);
+ 		case Type::rMQR:
+ 			return size.x != size.y && size.x & 1 && size.y & 1 && size.x >= 27 && size.x <= 139 && size.y >= 7 && size.y <= 17
+diff --git a/core/src/qrcode/QRVersion.cpp b/core/src/qrcode/QRVersion.cpp
+--- a/core/src/qrcode/QRVersion.cpp
++++ b/core/src/qrcode/QRVersion.cpp
+@@ -278,6 +278,16 @@
+ 			}},
+ 	};
+ 
++	// Transfer-only extension: continue the Model 2 geometry and BCH version
++	// field at v48. All four rows contain exactly 5196 total codewords.
++	static const Version transferV48 = {48, {6, 34, 62, 90, 118, 146, 174, 202}, {
++		30, 19, 118, 16, 119,
++		28, 4, 36, 76, 37,
++		27, 104, 22, 2, 23,
++		19, 123, 7, 74, 8,
++	}};
++	if (number == 48)
++		return &transferV48;
+ 	if (number < 1 || number > 40)
+ 		return nullptr;
+ 	return allVersions + number - 1;
+@@ -649,6 +659,17 @@
+ 			break;
+ 		++i;
+ 	}
++	// Include v48 in the same nearest-codeword decision. A damaged v48-like
++	// copy must not override an exact standard-version match in the other copy.
++	if (bestDifference != 0) {
++		for (unsigned bits : {versionBitsA, versionBitsB}) {
++			int difference = std::popcount(bits ^ 0x302ADu);
++			if (difference < bestDifference) {
++				bestDifference = difference;
++				bestVersion = 48;
++			}
++		}
++	}
+ 	// We can tolerate up to 3 bits of error since no two version info codewords will
+ 	// differ in less than 8 bits.
+ 	if (bestDifference <= 3)
+diff --git a/core/src/qrcode/QRDetector.cpp b/core/src/qrcode/QRDetector.cpp
+--- a/core/src/qrcode/QRDetector.cpp
++++ b/core/src/qrcode/QRDetector.cpp
+@@ -139,7 +139,7 @@
+ 		return {};
+ 
+ 	// Bin finder patterns into spatial bins to reduce the number of candidates to compare with geometry heuristics below.
+-	// For each finder pattern, we only compare it to patterns in bins that are not further away than the largest symbol (177 modules)
++	// For each finder pattern, compare bins no farther apart than the largest supported symbol (209 modules)
+ 	// can occupy.  We search from inside out and stop after we found a limited number of candidates which reduces the complexity from
+ 	// O(n^3) to O(n). E.g. a sample with 140 small QRCodes has 420 finder patterns, which results in 12 million candidates to process
+ 	// while with the binning, we only compare 20k candidates -> total runtime goes from 190ms to 9ms.
+@@ -159,7 +159,7 @@
+ 	for (int idx = 0; idx < Size(patterns); ++idx)
+ 		bins(bin(patterns[idx])).push_back(idx);
+ 
+-	constexpr double maxModuleCount = 177 * 1.5;
++	constexpr double maxModuleCount = 209 * 1.5;
+ 	// manually tuned to work with e.g. https://github.com/eventualbuddha/zedbar/blob/f0d9d9fa6158c108a21f7cde42c0339fb32dff69/examples/qr-code-140-grid02.jpg
+ 	constexpr size_t maxCandidates = 15;
+ 	auto candidates = std::vector<int>();
+@@ -256,7 +256,7 @@
+ 
+ 				// Estimate the module count and ignore this set if it can not result in a valid decoding
+ 				if (auto moduleCount = (distAB + distBC) / (2 * (a->size + b->size + c->size) / (3 * 7.f)) + 7;
+-					moduleCount < 21 * 0.9 || moduleCount > 177 * 1.5) { // moduleCount may be overestimated, see above
++					moduleCount < 21 * 0.9 || moduleCount > 209 * 1.5) { // moduleCount may be overestimated, see above
+ 					stats.rejModCount++;
+ 					continue;
+ 				}
+diff --git a/core/src/qrcode/QRBitMatrixParser.cpp b/core/src/qrcode/QRBitMatrixParser.cpp
+--- a/core/src/qrcode/QRBitMatrixParser.cpp
++++ b/core/src/qrcode/QRBitMatrixParser.cpp
+@@ -313,16 +313,17 @@
+ 	struct Layout {
+ 		int dimension = 0;
+ 		std::array<std::vector<uint16_t>, 2> offsets;
++		ByteArray masks; // Mask 3 is symmetric; both orientations share one byte per codeword.
+ 	};
+ 	static thread_local Layout cache;
+-	constexpr unsigned MASK_BIT = 0x8000;
+-	static_assert(177 * 177 < MASK_BIT);
++	static_assert(209 * 209 <= UINT16_MAX);
+ 	const int dimension = bitMatrix.height();
+ 	const size_t bitCount = size_t(version.totalCodewords()) * 8;
+ 	if (cache.dimension != dimension) {
+ 		Layout next;
+ 		for (auto& offsets : next.offsets)
+ 			offsets.reserve(bitCount);
++		next.masks.resize(version.totalCodewords(), 0);
+ 		const auto functions = version.buildFunctionPattern();
+ 		bool readingUp = true;
+ 		for (int x = dimension - 1; x > 0; x -= 2) {
+@@ -334,9 +335,11 @@
+ 					const int xx = x - col;
+ 					if (functions.get(xx, y) || next.offsets[0].size() == bitCount)
+ 						continue;
+-					const unsigned mask = (xx + y) % 3 == 0 ? MASK_BIT : 0;
+-					next.offsets[0].push_back(uint16_t(y * dimension + xx + mask));
+-					next.offsets[1].push_back(uint16_t(xx * dimension + y + mask));
++					const size_t bit = next.offsets[0].size();
++					if ((xx + y) % 3 == 0)
++						next.masks[bit >> 3] |= uint8_t(0x80 >> (bit & 7));
++					next.offsets[0].push_back(uint16_t(y * dimension + xx));
++					next.offsets[1].push_back(uint16_t(xx * dimension + y));
+ 				}
+ 			}
+ 			readingUp = !readingUp;
+@@ -352,10 +355,9 @@
+ 	for (size_t i = 0; i < result.size(); ++i) {
+ 		unsigned byte = 0;
+ 		for (int bit = 0; bit < 8; ++bit) {
+-			const unsigned entry = offsets[i * 8 + bit];
+-			byte = (byte << 1) | ((pixels[entry & (MASK_BIT - 1)] != 0) ^ (entry >> 15));
+-		}
+-		result[i] = uint8_t(byte);
++			byte = (byte << 1) | (pixels[offsets[i * 8 + bit]] != 0);
++		}
++		result[i] = uint8_t(byte) ^ cache.masks[i];
+ 	}
+ 	return result;
+ }

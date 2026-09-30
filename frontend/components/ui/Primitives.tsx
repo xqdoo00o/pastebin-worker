@@ -147,12 +147,13 @@ export interface NativeSelectFieldProps extends React.SelectHTMLAttributes<HTMLS
   variant?: "default" | "receiver" | "compact"
 }
 
+const nativeSelectBaseClass =
+  "h-10 rounded-xl border border-default-200 bg-default-100 px-3 text-sm text-foreground transition-colors hover:border-default-400 focus:border-default-400 focus:outline-none"
+
 const nativeSelectClass: Record<NonNullable<NativeSelectFieldProps["variant"]>, string> = {
-  default:
-    "h-10 w-full rounded-xl border border-default-200 bg-default-100 px-3 text-sm text-foreground transition-colors hover:border-default-400 focus:border-default-400 focus:outline-none",
+  default: `${nativeSelectBaseClass} w-full`,
   receiver: "h-10 min-w-0 rounded-xl border border-default-300 bg-content1 px-2.5 text-base text-foreground",
-  compact:
-    "h-10 w-16 rounded-xl border border-default-200 bg-default-100 px-3 text-sm text-foreground transition-colors hover:border-default-400 focus:border-default-400 focus:outline-none",
+  compact: `${nativeSelectBaseClass} w-16`,
 }
 
 /** Labelled native select used where direct DOM access or native mobile pickers

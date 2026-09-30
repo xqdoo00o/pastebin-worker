@@ -1,10 +1,6 @@
 import { CHAR_GEN } from "../shared/constants.js"
 export { escapeHtml } from "../shared/encoding.js"
 
-export function decode(buffer: ArrayBuffer | ArrayBufferView<ArrayBufferLike>): string {
-  return new TextDecoder().decode(buffer)
-}
-
 export function atob_utf8(value: string): string {
   const value_latin1 = atob(value)
   return new TextDecoder("utf-8").decode(
@@ -21,12 +17,11 @@ export class WorkerError extends Error {
 }
 
 export function jsonResponse(value: unknown, init?: ResponseInit, space?: number): Response {
+  const headers = new Headers(init?.headers)
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json;charset=UTF-8")
   return new Response(JSON.stringify(value, null, space), {
     ...init,
-    headers: {
-      "Content-Type": "application/json;charset=UTF-8",
-      ...init?.headers,
-    },
+    headers,
   })
 }
 

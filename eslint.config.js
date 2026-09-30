@@ -62,6 +62,13 @@ export default defineConfig(
     extends: [tseslint.configs.disableTypeChecked],
   },
   {
+    files: ["frontend/pwa/service-worker.js"],
+    extends: [tseslint.configs.disableTypeChecked],
+    languageOptions: {
+      globals: { self: "readonly", caches: "readonly", Request: "readonly", URL: "readonly", fetch: "readonly" },
+    },
+  },
+  {
     files: ["codecs/**/*.mjs", "codecs/argon2/src/*.js", "codecs/*/src/*.d.ts"],
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: {

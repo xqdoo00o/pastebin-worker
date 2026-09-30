@@ -39,7 +39,8 @@ extern "C" {
  * A QR Code structure is an immutable square grid of dark and light cells.
  * The library provides functions to create a QR Code from text or binary data.
  * The library covers the QR Code Model 2 specification, supporting all versions (sizes)
- * from 1 to 40, all 4 error correction levels, and 4 character encoding modes.
+ * from 1 to 40, plus the transfer-only v48 extension, all 4 error correction
+ * levels, and 4 character encoding modes.
  * 
  * Ways to create a QR Code object:
  * - High level: Take the payload data and call qrcodegen_encodeText() or qrcodegen_encodeBinary().
@@ -103,8 +104,7 @@ enum qrcodegen_Mode {
  * and initialize a qrcodegen_Segment struct with appropriate values.
  * Even in the most favorable conditions, a QR Code can only hold 7089 characters of data.
  * Any segment longer than this is meaningless for the purpose of generating QR Codes.
- * Moreover, the maximum allowed bit length is 32767 because
- * the largest QR Code (version 40) has 31329 modules.
+ * The bit length must fit in an int and in the supplied data buffer.
  */
 struct qrcodegen_Segment {
 	// The mode indicator of this segment.
@@ -120,7 +120,7 @@ struct qrcodegen_Segment {
 	uint8_t *data;
 	
 	// The number of valid data bits used in the buffer. Requires
-	// 0 <= bitLength <= 32767, and bitLength <= (capacity of data array) * 8.
+	// 0 <= bitLength <= INT_MAX, and bitLength <= (capacity of data array) * 8.
 	// The character count (numChars) must agree with the mode and the bit buffer length.
 	int bitLength;
 };
@@ -130,7 +130,7 @@ struct qrcodegen_Segment {
 /*---- Macro constants and functions ----*/
 
 #define qrcodegen_VERSION_MIN   1  // The minimum version number supported in the QR Code Model 2 standard
-#define qrcodegen_VERSION_MAX  40  // The maximum version number supported in the QR Code Model 2 standard
+#define qrcodegen_VERSION_MAX  48  // Model 2 versions 1-40 plus the transfer-only v48 extension
 
 // Calculates the number of bytes needed to store any QR Code up to and including the given version number,
 // as a compile-time constant. For example, 'uint8_t buffer[qrcodegen_BUFFER_LEN_FOR_VERSION(25)];'
@@ -139,21 +139,28 @@ struct qrcodegen_Segment {
 #define qrcodegen_BUFFER_LEN_FOR_VERSION(n)  ((((n) * 4 + 17) * ((n) * 4 + 17) + 7) / 8 + 1)
 
 // The worst-case number of bytes needed to store one QR Code, up to and including
-// version 40. This value equals 3918, which is just under 4 kilobytes.
+// version 48. This value equals 5462 bytes.
 // Use this more convenient value to avoid calculating tighter memory bounds for buffers.
 #define qrcodegen_BUFFER_LEN_MAX  qrcodegen_BUFFER_LEN_FOR_VERSION(qrcodegen_VERSION_MAX)
 
 // Zero-initialized cache used by the fixed-mask streaming extension below. The
-// position table stores every data/remainder module in QR codeword traversal order.
-#define qrcodegen_RAW_DATA_MODULES_MAX  29648
+// position table is allocated for the selected version and stores every
+// data/remainder module in QR codeword traversal order using 16-bit offsets.
+// The mask is already applied in qrcodeTemplate, so offsets need no flag. Call
+// qrcodegen_freeFixedMaskCache() before releasing this cache.
 struct qrcodegen_FixedMaskCache {
 	uint8_t version;
 	uint8_t ecl;
 	uint8_t rsDegree;
 	uint8_t rsDivisor[32];
-	uint8_t qrcodeTemplate[qrcodegen_BUFFER_LEN_MAX];
-	uint16_t modulePositions[qrcodegen_RAW_DATA_MODULES_MAX];
+	// Products of the cached divisor with every GF(256) coefficient. Full lanes
+	// let the streaming remainder loop keep its state in SIMD registers.
+	uint8_t rsProducts[256][32];
+	uint8_t *qrcodeTemplate;
+	uint16_t *modulePositions;
 };
+
+void qrcodegen_freeFixedMaskCache(struct qrcodegen_FixedMaskCache *cache);
 
 
 
@@ -165,7 +172,7 @@ struct qrcodegen_FixedMaskCache {
  * at the given ECC level, then false is returned.
  * 
  * The input text must be encoded in UTF-8 and contain no NULs.
- * Requires 1 <= minVersion <= maxVersion <= 40.
+ * Requires 1 <= minVersion <= maxVersion <= 48; versions 41-47 are skipped.
  * 
  * The smallest possible QR Code version within the given range is automatically
  * chosen for the output. Iff boostEcl is true, then the ECC level of the result
@@ -205,7 +212,7 @@ bool qrcodegen_encodeText(const char *text, uint8_t tempBuffer[], uint8_t qrcode
  * If the data is too long to fit in any version in the given range
  * at the given ECC level, then false is returned.
  * 
- * Requires 1 <= minVersion <= maxVersion <= 40.
+ * Requires 1 <= minVersion <= maxVersion <= 48; versions 41-47 are skipped.
  * 
  * The smallest possible QR Code version within the given range is automatically
  * chosen for the output. Iff boostEcl is true, then the ECC level of the result
@@ -229,8 +236,7 @@ bool qrcodegen_encodeText(const char *text, uint8_t tempBuffer[], uint8_t qrcode
  * 
  * If successful, the resulting QR Code will use byte mode to encode the data.
  * 
- * In the most optimistic case, a QR Code at version 40 with low ECC can hold any byte
- * sequence up to length 2953. This is the hard upper limit of the QR Code standard.
+ * The standard v40-L limit is 2953 bytes; transfer v48-L holds 4143 bytes.
  * 
  * Please consult the QR Code specification for information on
  * data capacities per version, ECC level, and text encoding mode.
@@ -286,7 +292,7 @@ bool qrcodegen_encodeSegments(const struct qrcodegen_Segment segs[], size_t len,
  * If the data is too long to fit in any version in the given range
  * at the given ECC level, then false is returned.
  * 
- * Requires 1 <= minVersion <= maxVersion <= 40.
+ * Requires 1 <= minVersion <= maxVersion <= 48; versions 41-47 are skipped.
  * 
  * The smallest possible QR Code version within the given range is automatically
  * chosen for the output. Iff boostEcl is true, then the ECC level of the result
@@ -338,9 +344,7 @@ bool qrcodegen_isAlphanumeric(const char *text);
 /* 
  * Returns the number of bytes (uint8_t) needed for the data buffer of a segment
  * containing the given number of characters using the given mode. Notes:
- * - Returns SIZE_MAX on failure, i.e. numChars > INT16_MAX or the internal
- *   calculation of the number of needed bits exceeds INT16_MAX (i.e. 32767).
- * - Otherwise, all valid results are in the range [0, ceil(INT16_MAX / 8)], i.e. at most 4096.
+ * - Returns SIZE_MAX on failure if the bit count exceeds INT_MAX.
  * - It is okay for the user to allocate more bytes for the buffer than needed.
  * - For byte mode, numChars measures the number of bytes, not Unicode code points.
  * - For ECI mode, numChars must be 0, and the worst-case number of bytes is returned.
@@ -382,7 +386,7 @@ struct qrcodegen_Segment qrcodegen_makeEci(long assignVal, uint8_t buf[]);
 
 /* 
  * Returns the side length of the given QR Code, assuming that encoding succeeded.
- * The result is in the range [21, 177]. Note that the length of the array buffer
+ * The result is in the range [21, 209]. Note that the length of the array buffer
  * is related to the side length - every 'uint8_t qrcode[]' must have length at least
  * qrcodegen_BUFFER_LEN_FOR_VERSION(version), which equals ceil(size^2 / 8 + 1).
  */

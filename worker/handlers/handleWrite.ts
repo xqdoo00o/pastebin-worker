@@ -1,11 +1,12 @@
 import { verifyAuth } from "../pages/auth.js"
-import { decode, genRandStr, jsonResponse, WorkerError, timingSafeEqual } from "../common.js"
+import { genRandStr, jsonResponse, WorkerError } from "../common.js"
+import { assertPastePassword, requirePasteMetadata } from "../pasteAccess.js"
 import {
   createPaste,
   allocateRandomPasteName,
-  getPasteMetadata,
   metaResponseFromMetadata,
   updatePaste,
+  type PasteMetadata,
 } from "../storage/storage.js"
 import {
   BINARY_MIME_TYPE,
@@ -16,7 +17,7 @@ import {
   PASSWD_SEP,
   TEXT_MIME_TYPE,
 } from "../../shared/constants.js"
-import { parsePath, parseSize, parseExpiration } from "../../shared/parsers.js"
+import { parsePath, parseExpiration, parseSize } from "../../shared/parsers.js"
 import { isOriginalFileInfo, parseReadLimit, verifyPassword } from "../../shared/verify.js"
 import type { OriginalFileInfo, PasteResponse } from "../../shared/interfaces.js"
 import {
@@ -25,14 +26,8 @@ import {
   handleMPUCreate,
   handleMPUCreateUpdate,
   handleMPUResume,
+  parseMPUCompleteIdentity,
 } from "./handleMPU.js"
-
-interface ParsedMultipartPart {
-  filename?: string
-  content: ArrayBuffer
-  contentAsString: () => string
-  contentLength: number
-}
 
 function parseOriginalFileInfos(raw: string | undefined): OriginalFileInfo[] | undefined {
   if (!raw) return undefined
@@ -67,47 +62,104 @@ function parseRemainingReads(raw: string | undefined, defaultReads: number): num
   return remainingReads === 0 ? undefined : remainingReads
 }
 
-async function multipartToMap(
-  req: Request,
-  maxPartSize: number,
-  sizeLimitLabel: string,
-): Promise<Map<string, ParsedMultipartPart>> {
-  const partsMap = new Map<string, ParsedMultipartPart>()
-  let formData: FormData
-
+function parseUploadedParts(raw: string | undefined): R2UploadedPart[] {
+  let parsed: unknown
   try {
-    formData = await req.formData()
+    parsed = JSON.parse(raw ?? "")
+  } catch {
+    throw new WorkerError(400, "invalid uploaded parts")
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new WorkerError(400, "invalid uploaded parts")
+  }
+  const parts: unknown[] = parsed
+  if (
+    parts.some((part) => {
+      if (typeof part !== "object" || part === null) return true
+      const entry = part as Record<string, unknown>
+      return (
+        typeof entry.partNumber !== "number" ||
+        !Number.isSafeInteger(entry.partNumber) ||
+        entry.partNumber < 1 ||
+        typeof entry.etag !== "string" ||
+        entry.etag.length === 0
+      )
+    })
+  ) {
+    throw new WorkerError(400, "invalid uploaded parts")
+  }
+  return parts as R2UploadedPart[]
+}
+
+const FORM_METADATA_ALLOWANCE_BYTES = 1024 * 1024
+const MPU_COMPLETE_MAX_PART_BYTES = 1024 * 1024
+
+async function parseUploadForm(req: Request, maxPartSize: number, sizeLimitLabel: string): Promise<FormData> {
+  // Include boundaries, headers and metadata without reducing the advertised
+  // content limit. Count actual bytes even when Content-Length is absent/wrong.
+  const maxBodySize = maxPartSize + FORM_METADATA_ALLOWANCE_BYTES
+  const tooLarge = () => new WorkerError(413, "multipart request body is too large")
+  if (Number(req.headers.get("Content-Length")) > maxBodySize) {
+    void req.body?.cancel().catch(() => undefined)
+    throw tooLarge()
+  }
+  const reader = req.body?.getReader()
+  let exceeded = false
+  let received = 0
+  const body = reader
+    ? new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          try {
+            const next = await reader.read()
+            if (next.done) {
+              controller.close()
+              return
+            }
+            received += next.value.byteLength
+            if (received > maxBodySize) {
+              exceeded = true
+              controller.error(tooLarge())
+              void reader.cancel().catch(() => undefined)
+              return
+            }
+            controller.enqueue(next.value)
+          } catch (error) {
+            controller.error(error)
+          }
+        },
+        cancel: (reason: unknown) => reader.cancel(reason),
+      })
+    : null
+  let formData: FormData
+  try {
+    formData = await new Response(body, { headers: { "Content-Type": req.headers.get("Content-Type")! } }).formData()
   } catch (err) {
+    if (exceeded) throw tooLarge()
     console.warn("Failed to parse multipart request:", err instanceof Error ? err.message : err)
     throw new WorkerError(400, "Failed to parse multipart request")
-  }
-
-  for (const [name, value] of formData.entries()) {
-    if (typeof value === "string") {
-      const bytes = new TextEncoder().encode(value)
-      if (bytes.byteLength > maxPartSize) {
-        throw new WorkerError(413, `payload too large (max ${sizeLimitLabel} allowed)`)
-      }
-      partsMap.set(name, {
-        content: bytes.buffer,
-        contentLength: bytes.byteLength,
-        contentAsString: () => value,
-      })
-    } else {
-      if (value.size > maxPartSize) {
-        throw new WorkerError(413, `payload too large (max ${sizeLimitLabel} allowed)`)
-      }
-      const arrayBuffer = await value.arrayBuffer()
-      partsMap.set(name, {
-        filename: value.name,
-        content: arrayBuffer,
-        contentLength: arrayBuffer.byteLength,
-        contentAsString: () => decode(arrayBuffer),
-      })
+  } finally {
+    if (reader) {
+      // Also stop unread input when the multipart parser rejects early.
+      void reader.cancel().catch(() => undefined)
+      reader.releaseLock()
     }
   }
+  for (const value of formData.values()) {
+    const size = typeof value === "string" ? new TextEncoder().encode(value).byteLength : value.size
+    if (size > maxPartSize) throw new WorkerError(413, `payload too large (max ${sizeLimitLabel} allowed)`)
+  }
+  return formData
+}
 
-  return partsMap
+// Preserve the existing last-field-wins behavior, including file-valued metadata.
+function lastFormValue(form: FormData, name: string): FormDataEntryValue | undefined {
+  const values = form.getAll(name)
+  return values[values.length - 1]
+}
+
+async function formText(form: FormData, name: string): Promise<string | undefined> {
+  const value = lastFormValue(form, name)
+  return typeof value === "string" ? value : value?.text()
 }
 
 export async function handlePostOrPut(
@@ -149,24 +201,32 @@ export async function handlePostOrPut(
   }
 
   const parts = isMPUComplete
-    ? await multipartToMap(request, parseSize(env.R2_MAX_ALLOWED)!, env.R2_MAX_ALLOWED)
-    : await multipartToMap(request, DIRECT_UPLOAD_MAX_BYTES, "5 MiB")
+    ? await parseUploadForm(request, MPU_COMPLETE_MAX_PART_BYTES, "1 MiB")
+    : await parseUploadForm(request, DIRECT_UPLOAD_MAX_BYTES, "5 MiB")
 
   if (!parts.has("c")) {
     throw new WorkerError(400, "cannot find content in formdata")
   }
-  const { filename, content, contentAsString, contentLength } = parts.get("c")!
+  const part = lastFormValue(parts, "c")!
+  const filename = typeof part === "string" ? undefined : part.name
+  const content = isMPUComplete
+    ? new ArrayBuffer(0)
+    : typeof part === "string"
+      ? new TextEncoder().encode(part).buffer
+      : part.stream()
+  const contentLength = content instanceof ArrayBuffer ? content.byteLength : (part as File).size
+  if (!isMPUComplete && contentLength > parseSize(env.R2_MAX_ALLOWED)!) {
+    throw new WorkerError(413, `payload too large (max ${env.R2_MAX_ALLOWED} allowed)`)
+  }
   const isPrivate = parts.has("p")
-  const passwdFromForm = parts.get("s")?.contentAsString()
-  const expireFromForm: string | undefined = parts.get("e")?.contentAsString()
-  const encryptionScheme: string | undefined = parts.get("encryption-scheme")?.contentAsString()
-  const highlightLanguage = parts.get("lang")?.contentAsString()
-  const filenames = parseOriginalFileInfos(parts.get("filenames")?.contentAsString())
-  const mimeType = parseMimeType(parts.get("mimeType")?.contentAsString())
-  const remainingReads = parseRemainingReads(parts.get("reads")?.contentAsString(), env.DEFAULT_READS)
-  const expire = expireFromForm ? expireFromForm : env.DEFAULT_EXPIRATION
-
-  const uploadedParts = isMPUComplete ? (JSON.parse(contentAsString()) as R2UploadedPart[]) : undefined
+  const passwdFromForm = await formText(parts, "s")
+  const expireFromForm = await formText(parts, "e")
+  const encryptionScheme = await formText(parts, "encryption-scheme")
+  const highlightLanguage = await formText(parts, "lang")
+  const filenames = parseOriginalFileInfos(await formText(parts, "filenames"))
+  const mimeType = parseMimeType(await formText(parts, "mimeType"))
+  const remainingReads = parseRemainingReads(await formText(parts, "reads"), env.DEFAULT_READS)
+  const expire = expireFromForm || env.DEFAULT_EXPIRATION
 
   // parse expiration
   let expirationSeconds = parseExpiration(expire)
@@ -184,113 +244,55 @@ export async function handlePostOrPut(
     if (!ok) throw new WorkerError(400, msg)
   }
 
-  function makeResponse(created: PasteResponse, additionalHeaders: Record<string, string | undefined> = {}): Response {
-    const headers = new Headers()
-    for (const [name, value] of Object.entries(additionalHeaders)) {
-      if (value !== undefined) headers.set(name, value)
-    }
-    return jsonResponse(created, { headers }, 2)
-  }
-
-  function accessUrl(short: string): string {
-    return env.DEPLOY_URL + "/" + short
-  }
-
-  function manageUrl(short: string, passwd: string): string {
-    return env.DEPLOY_URL + "/" + short + PASSWD_SEP + passwd
-  }
-
-  const now = new Date()
-  if (isPut) {
-    let pasteName: string | undefined
-    let password: string | undefined
-    // if isMPUComplete, we cannot parse path
-    if (!isMPUComplete) {
-      const parsed = parsePath(url.pathname)
-      if (parsed.password === undefined) {
-        throw new WorkerError(403, `no password for PUT request`)
-      }
-      pasteName = parsed.name
-      password = parsed.password
-    } else {
-      pasteName = url.searchParams.get("name") || undefined
-      if (pasteName === undefined) {
-        throw new WorkerError(400, `no name for MPU complete`)
-      }
-    }
-
-    const r2Object = isMPUComplete ? await handleMPUComplete(request, env, uploadedParts!) : undefined
-
-    const originalMetadata = await getPasteMetadata(env, pasteName)
-    if (originalMetadata === null) {
-      throw new WorkerError(404, `paste of name ‘${pasteName}’ is not found`)
-    }
-
-    // no need to check password for MPCComplete, it is already checked on creation
-    if (!isMPUComplete && !timingSafeEqual(password, originalMetadata.passwd)) {
-      throw new WorkerError(403, `incorrect password for paste ‘${pasteName}’`)
-    }
-
-    const newPasswd = passwdFromForm || originalMetadata.passwd
-    const newMetadata = await updatePaste(env, pasteName, content, originalMetadata, {
-      expirationSeconds,
-      now,
-      passwd: newPasswd,
-      contentLength: r2Object?.size || contentLength,
-      filename,
-      filenames,
-      mimeType,
-      highlightLanguage,
-      encryptionScheme,
-      remainingReads,
-      isMPUComplete,
-    })
-    return makeResponse(
-      {
-        ...metaResponseFromMetadata(newMetadata),
-        url: accessUrl(pasteName),
-        manageUrl: manageUrl(pasteName, newPasswd),
-        expirationSeconds,
-      },
-      { etag: r2Object?.httpEtag },
-    )
+  let pasteName: string
+  let password: string | undefined
+  if (isMPUComplete) {
+    const name = url.searchParams.get("name")
+    if (name === null || (isPut && name === "")) throw new WorkerError(400, "no name for MPU complete")
+    pasteName = name
+  } else if (isPut) {
+    const parsed = parsePath(url.pathname)
+    if (parsed.password === undefined) throw new WorkerError(403, "no password for PUT request")
+    pasteName = parsed.name
+    password = parsed.password
   } else {
-    let pasteName: string | undefined
-    if (isMPUComplete) {
-      if (url.searchParams.has("name")) {
-        pasteName = url.searchParams.get("name")!
-      } else {
-        throw new WorkerError(400, `no name for MPU complete`)
-      }
-    } else {
-      pasteName = await allocateRandomPasteName(env, isPrivate ? PRIVATE_PASTE_NAME_LEN : PASTE_NAME_LEN)
-    }
-
-    const r2Object = isMPUComplete ? await handleMPUComplete(request, env, uploadedParts!) : undefined
-
-    const password = passwdFromForm || genRandStr(DEFAULT_PASSWD_LEN)
-    const newMetadata = await createPaste(env, pasteName, content, {
-      expirationSeconds,
-      now,
-      passwd: password,
-      filename,
-      filenames,
-      mimeType,
-      highlightLanguage,
-      contentLength: r2Object?.size || contentLength,
-      encryptionScheme,
-      remainingReads,
-      isMPUComplete,
-    })
-
-    return makeResponse(
-      {
-        ...metaResponseFromMetadata(newMetadata),
-        url: accessUrl(pasteName),
-        manageUrl: manageUrl(pasteName, password),
-        expirationSeconds,
-      },
-      { etag: r2Object?.httpEtag },
-    )
+    pasteName = await allocateRandomPasteName(env, isPrivate ? PRIVATE_PASTE_NAME_LEN : PASTE_NAME_LEN)
   }
+
+  let originalMetadata: PasteMetadata | undefined
+  if (isPut) {
+    const metadata = await requirePasteMetadata(env, pasteName)
+    // MPU updates were authorized when their upload was created.
+    if (!isMPUComplete) assertPastePassword(pasteName, password, metadata)
+    originalMetadata = metadata
+  }
+  const mpuIdentity = isMPUComplete ? parseMPUCompleteIdentity(request) : undefined
+  const uploadedParts = mpuIdentity ? parseUploadedParts(await formText(parts, "c")) : undefined
+  const r2Object = mpuIdentity ? await handleMPUComplete(env, mpuIdentity, uploadedParts!) : undefined
+
+  const passwd = passwdFromForm || originalMetadata?.passwd || genRandStr(DEFAULT_PASSWD_LEN)
+  const options = {
+    expirationSeconds,
+    now: new Date(),
+    passwd,
+    filename,
+    filenames,
+    mimeType,
+    highlightLanguage,
+    contentLength: r2Object?.size ?? contentLength,
+    encryptionScheme,
+    remainingReads,
+    isMPUComplete,
+    r2Key: r2Object?.key,
+  }
+  const metadata = originalMetadata
+    ? await updatePaste(env, pasteName, content, originalMetadata, options)
+    : await createPaste(env, pasteName, content, options)
+  const response: PasteResponse = {
+    ...metaResponseFromMetadata(metadata),
+    url: env.DEPLOY_URL + "/" + pasteName,
+    manageUrl: env.DEPLOY_URL + "/" + pasteName + PASSWD_SEP + passwd,
+    expirationSeconds,
+  }
+  return jsonResponse(response, { headers: r2Object ? { etag: r2Object.httpEtag } : undefined }, 2)
 }

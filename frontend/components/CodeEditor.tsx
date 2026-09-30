@@ -88,7 +88,7 @@ export function CodeEditor({
     [deferredContent, hljs, lang],
   )
   const languageItems = useMemo(() => availableLanguages.map((language) => ({ key: language })), [availableLanguages])
-  const [heightPx, setHeightPx] = useState<number>(Math.max(countTextLines(content) * 24, 100)) // Estimate initial height for SSR
+  const [heightPx, setHeightPx] = useState(() => Math.max(countTextLines(content) * 24, 100)) // Estimate initial height for SSR
   const [tabSetting, setTabSettings] = useState<TabSetting>({ char: "space", width: 2 })
 
   function syncScroll() {
@@ -208,7 +208,7 @@ export function CodeEditor({
               ref={refLineNumbers}
               lineCount={lineCount}
               className={
-                "line-number-rows font-mono absolute pointer-events-none text-default-500 top-0 left-1 overflow-hidden " +
+                "font-mono absolute pointer-events-none text-default-500 top-0 left-1 overflow-hidden " +
                 "border-r-1 border-default-300"
               }
               style={{ height: `${heightPx}px` }}

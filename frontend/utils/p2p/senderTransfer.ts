@@ -1,6 +1,6 @@
 import { ensureXXHashReady } from "../../wasm/xxhash-loader.js"
 import { asError, FileReadError } from "../errors.js"
-import { createSpeedTracker, sendData, streamBlobToDataChannel } from "./transfer.js"
+import { createSpeedTracker, P2PSendWindow, sendData, streamBlobToDataChannel } from "./transfer.js"
 import {
   appendHashData,
   createBlockHashState,
@@ -35,9 +35,15 @@ interface SenderPeerTransferOptions {
 export class SenderPeerTransferService {
   constructor(private readonly options: SenderPeerTransferOptions) {}
 
-  async send(peer: SenderPeerState, version: SenderFileVersion, rawOffset: number): Promise<void> {
+  async send(
+    peer: SenderPeerState,
+    version: SenderFileVersion,
+    rawOffset: number,
+    receiveWindow: number,
+  ): Promise<void> {
     if (!peer.isPairAuthorized || peer.dc.readyState !== "open") return
     const operationGeneration = invalidateSenderPeerOperation(peer)
+    const sendWindow = (peer.sendWindow = new P2PSendWindow(receiveWindow))
     const isCurrentOperation = () =>
       peer.operationGeneration === operationGeneration && this.options.peers.get(peer.peerId) === peer
     const { file: activeFile, verifyTransfer } = version
@@ -60,6 +66,7 @@ export class SenderPeerTransferService {
         channel: peer.dc,
         chunkSize: this.options.verification.chunkSize(peer),
         shouldContinue: () => isCurrentOperation() && isPeerSending(peer),
+        beforeChunk: (size) => sendWindow.reserve(size, () => isCurrentOperation() && isPeerSending(peer)),
         onReaderChange: (reader, active) => {
           if (active) peer.activeReader = reader
           else if (peer.activeReader === reader) peer.activeReader = undefined
@@ -114,7 +121,8 @@ export class SenderPeerTransferService {
   async resendBlocks(peer: SenderPeerState, indices: number[]): Promise<void> {
     if (!peer.isPairAuthorized || peer.dc.readyState !== "open" || !isPeerVerifying(peer)) return
     const version = peer.activeVersion
-    if (!version?.verifyTransfer || !version.verificationManifest) return
+    const sendWindow = peer.sendWindow
+    if (!version?.verifyTransfer || !version.verificationManifest || !sendWindow) return
     const { file: activeFile } = version
     const validIndices = verificationHashIndices(version.verificationManifest, indices)
     if (validIndices.length === 0) return
@@ -141,6 +149,7 @@ export class SenderPeerTransferService {
           channel: peer.dc,
           chunkSize: this.options.verification.chunkSize(peer),
           shouldContinue: isCurrentOperation,
+          beforeChunk: (size) => sendWindow.reserve(size, isCurrentOperation),
           onReaderChange: (reader, active) => {
             if (active) peer.activeReader = reader
             else if (peer.activeReader === reader) peer.activeReader = undefined

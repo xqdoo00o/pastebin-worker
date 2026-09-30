@@ -57,6 +57,32 @@ export const XIcon = (props: HTMLAttributes<SVGElement>) => (
   </svg>
 )
 
+export const FullscreenIcon = (props: HTMLAttributes<SVGElement>) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={2}
+    {...props}
+  >
+    <path strokeLinecap="round" strokeLinejoin="round" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5" />
+  </svg>
+)
+
+export const ExitFullscreenIcon = (props: HTMLAttributes<SVGElement>) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    fill="none"
+    viewBox="0 0 24 24"
+    stroke="currentColor"
+    strokeWidth={2}
+    {...props}
+  >
+    <path strokeLinecap="round" strokeLinejoin="round" d="M3 8h5V3m13 5h-5V3M3 16h5v5m13-5h-5v5" />
+  </svg>
+)
+
 export const PlusIcon = (props: HTMLAttributes<SVGElement>) => (
   <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" {...props}>
     <path d="M0 0h24v24H0z" fill="none" />

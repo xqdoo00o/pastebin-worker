@@ -7,7 +7,7 @@
 //   the next one — a generation counter prevents zombie capture loops.
 // - Progress tracks distinct RFC 6330 symbols collected; matrix recovery is
 //   atomic, so there is no meaningful per-source-symbol solved count.
-// - Android Chrome exposes torch / focusMode / frameRate.max through
+// - Android Chrome exposes ISO / frameRate.max through
 //   getCapabilities; iOS Safari exposes none of them. Camera helpers own the
 //   probing, so everything here is capability-gated rather than UA-gated.
 
@@ -17,6 +17,9 @@ import { ensureZstdDecoderReady } from "../../wasm/zstd-loader.js"
 import {
   CAPTURE_FPS_OPTIONS,
   CAPTURE_WIDTH_OPTIONS,
+  DEFAULT_CAMERA_ISO,
+  DEFAULT_CAMERA_ISO_RANGE,
+  clampToStep,
   loadOpticalReceiverSettings,
   saveOpticalReceiverSettings,
 } from "../shared/settings.js"
@@ -24,19 +27,14 @@ import type { DecodeWorkerOutput } from "../shared/worker-messages.js"
 import { loadNanoRQCodecModule } from "../shared/wasm-module.js"
 import { loadOpticalCodecModule } from "../codec/wasm-module.js"
 import {
-  acquireCamera,
-  applyAdvancedConstraint,
-  cameraOptionState,
-  cameraSelection,
   desktopScreenCaptureAvailable,
   formatActiveReceiverSettings,
   formatPendingReceiverSettings,
   formatReceiverStatus,
-  preferredCameraMode,
-  probeCameraCapabilities,
   type ReceiverPhase,
   type RequestedCameraSettings,
 } from "./camera.js"
+import { createReceiverCameraController, type ReceiverCameraPreferences } from "./camera-controller.js"
 import { CapturePipeline } from "./capture-pipeline.js"
 import { MediaSourceController, prepareMediaPreview } from "./media-source.js"
 import { MultipartOpticalAssembler, OpticalPartTransferMismatchError } from "./part-assembler.js"
@@ -67,6 +65,7 @@ export interface OpticalReceiverController {
   selectApng(file: File): void
   updateCaptureWidth(value: number): void
   updateCaptureFps(value: number): void
+  updateIso(value: number): void
   updateWorkerCount(value: number): void
   updateCamera(value: string): void
   reset(): void
@@ -80,9 +79,10 @@ export function opticalDecodeWorkerLimit(hardwareConcurrency = navigator.hardwar
   return Math.max(1, hardwareConcurrency || 6)
 }
 
-/** Leave two logical processors available for capture, rendering and the UI. */
+/** Leave two logical processors available for capture, rendering and the UI,
+ * while bounding retained full-frame buffers on high-core-count devices. */
 export function opticalDefaultDecodeWorkerCount(workerLimit: number): number {
-  return Math.max(1, workerLimit - 2)
+  return Math.min(6, Math.max(1, workerLimit - 2))
 }
 
 export function createOpticalReceiverController(
@@ -105,18 +105,31 @@ export function createOpticalReceiverController(
       cameraId: "",
       captureWidth: 1280,
       captureFps: 60,
+      iso: DEFAULT_CAMERA_ISO,
       workers: opticalDefaultDecodeWorkerCount(workerLimit),
     },
     { captureWidths: CAPTURE_WIDTH_OPTIONS, captureFps: CAPTURE_FPS_OPTIONS, workers: workerOptions },
   )
-  let preferredCameraId = restoredReceiverSettings.cameraId
-  let captureWidth = restoredReceiverSettings.captureWidth
-  let captureFps = restoredReceiverSettings.captureFps
+  const cameraPreferences: ReceiverCameraPreferences = {
+    cameraId: restoredReceiverSettings.cameraId,
+    captureWidth: restoredReceiverSettings.captureWidth,
+    captureFps: restoredReceiverSettings.captureFps,
+    preferredIso: restoredReceiverSettings.iso,
+    iso: clampToStep(restoredReceiverSettings.iso, DEFAULT_CAMERA_ISO_RANGE),
+    isoRange: DEFAULT_CAMERA_ISO_RANGE,
+  }
   let workerCount = restoredReceiverSettings.workers
   const receiverView = new ReceiverView((updater) => {
     if (!disposed) updateState(updater)
   })
-  receiverView.patch({ cameraId: preferredCameraId, captureWidth, captureFps, workers: workerCount })
+  receiverView.patch({
+    cameraId: cameraPreferences.cameraId,
+    captureWidth: cameraPreferences.captureWidth,
+    captureFps: cameraPreferences.captureFps,
+    iso: cameraPreferences.iso,
+    isoRange: cameraPreferences.isoRange,
+    workers: workerCount,
+  })
 
   let stream: MediaStream | null = null
   const receiverRuntime = new OpticalReceiverRuntime()
@@ -170,9 +183,7 @@ export function createOpticalReceiverController(
     assembler: multipartAssembler,
     fountainClient,
     receivedFile: receivedFileResource,
-    setReceiverPhase: (phase) => setReceiverPhase(phase),
     renderReceiverStatus,
-    showError,
     offerRetry,
     teardownReceiver,
     suspendReceiver,
@@ -217,17 +228,46 @@ export function createOpticalReceiverController(
   window.addEventListener("resize", syncPreviewAspect)
   window.visualViewport?.addEventListener("resize", syncPreviewAspect)
 
+  const camera = createReceiverCameraController({
+    preferences: cameraPreferences,
+    video,
+    getStream: () => stream,
+    setStream: (next) => {
+      stream = next
+    },
+    isActive: () => !disposed && !receiverSession.done && receiverSession.mode === "camera",
+    view: receiverView,
+    persist: persistReceiverSettings,
+    reportSettings: reportReceiverSettings,
+    offerRetry,
+    onSwitchStart: () => {
+      setReceiverPhase("starting")
+      capturePipeline.stop()
+      pool.resize(0)
+      receiverView.patch({ previewVisible: false })
+    },
+    onSwitchReady: (track) => {
+      syncPreviewAspect()
+      receiverView.patch({ previewVisible: true })
+      pool.resize(workerCount)
+      setReceiverPhase(receiverRuntime.snapshot ? "receiving" : "searching")
+      capturePipeline.start(track)
+    },
+    restartCapture: (track) => capturePipeline.restartWorkerSource(track),
+  })
+
   function persistReceiverSettings(): void {
     saveOpticalReceiverSettings({
-      cameraId: preferredCameraId,
-      captureWidth,
-      captureFps,
+      cameraId: cameraPreferences.cameraId,
+      captureWidth: cameraPreferences.captureWidth,
+      captureFps: cameraPreferences.captureFps,
+      iso: cameraPreferences.preferredIso,
       workers: workerCount,
     })
   }
 
   function requestedCameraSettings(): RequestedCameraSettings {
-    return { width: captureWidth, frameRate: captureFps }
+    return { width: cameraPreferences.captureWidth, frameRate: cameraPreferences.captureFps }
   }
 
   function renderReceiverStatus(): void {
@@ -264,10 +304,6 @@ export function createOpticalReceiverController(
     renderReceiverStatus()
   }
 
-  function showError(message: string): void {
-    receiverView.showError(message)
-  }
-
   function updateReceiveModeUi(): void {
     receiverView.updateMode(receiverSession.mode)
   }
@@ -286,7 +322,9 @@ export function createOpticalReceiverController(
 
   function reportPendingReceiverSettings(): void {
     if (receiverSession.mode === "screen") {
-      receiverView.patch({ cameraActual: `Will request ${captureFps} fps · ${workerCount} decode workers` })
+      receiverView.patch({
+        cameraActual: `Will request ${cameraPreferences.captureFps} fps · ${workerCount} decode workers`,
+      })
       return
     }
     receiverView.patch({ cameraActual: formatPendingReceiverSettings(requestedCameraSettings(), workerCount) })
@@ -305,32 +343,6 @@ export function createOpticalReceiverController(
   function stopUpdateTimer(): void {
     receiverRuntime.stopUpdateTimer()
   }
-
-  async function populateCameraOptions(): Promise<void> {
-    let devices: MediaDeviceInfo[]
-    try {
-      devices = await navigator.mediaDevices.enumerateDevices()
-    } catch {
-      return
-    }
-    if (receiverSession.done) return
-    const state = cameraOptionState(devices, preferredCameraId)
-    receiverView.patch({
-      cameraOptions: state.options,
-      cameraId: state.selected,
-      cameraDisabled: state.disabled,
-    })
-    if (preferredCameraId !== state.selected) {
-      preferredCameraId = state.selected
-      persistReceiverSettings()
-    }
-  }
-
-  function handleDeviceChange(): void {
-    if (stream && !receiverSession.done) void populateCameraOptions()
-  }
-
-  navigator.mediaDevices?.addEventListener("devicechange", handleDeviceChange)
 
   function handleDecodeTaskComplete(output: DecodeWorkerOutput): void {
     fountainClient.recordSubmitted(output.forwardedSymbols)
@@ -395,7 +407,7 @@ export function createOpticalReceiverController(
       if (error instanceof OpticalPartTransferMismatchError && multipartAssembler.progress()) {
         await suspendReceiver()
         resetReceiver()
-        showError(error.message)
+        receiverView.showError(error.message)
         return
       }
       await teardownReceiver()
@@ -439,6 +451,10 @@ export function createOpticalReceiverController(
     try {
       await fountainClient.ensure()
     } catch (err) {
+      if (stale(mode, generation) || stream !== activeStream) {
+        mediaSource.stop(activeStream)
+        return false
+      }
       await teardownReceiver()
       if (receiverSession.isCurrent(mode, generation)) {
         offerRetry(`decoder: ${errorMessage(err)}`)
@@ -452,6 +468,40 @@ export function createOpticalReceiverController(
     return true
   }
 
+  /** Adopt a captured stream only while its attempt is current. */
+  async function prepareReceiverStream(
+    activeStream: MediaStream,
+    mode: "camera" | "screen",
+    generation: number,
+  ): Promise<MediaStreamTrack | undefined> {
+    if (stale(mode, generation)) {
+      mediaSource.stop(activeStream)
+      return undefined
+    }
+    const track = activeStream.getVideoTracks()[0]
+    if (!track) {
+      mediaSource.stop(activeStream)
+      offerRetry("no video track was shared.")
+      return undefined
+    }
+    stream = activeStream
+    if (mode === "camera") await camera.initializeTrack(track)
+    const previewResult = await mediaSource.preparePreview(
+      activeStream,
+      () => stale(mode, generation),
+      (captured) => prepareMediaPreview(video, captured),
+    )
+    if (previewResult === "stale") return undefined
+    if (previewResult === "no-frame") {
+      if (!stale(mode, generation)) {
+        const label = mode === "camera" ? "camera" : "screen capture"
+        offerRetry(`${label} opened, but its preview did not produce a video frame — try again.`)
+      }
+      return undefined
+    }
+    return (await ensureFountainWorkerFor(mode, generation, activeStream)) ? track : undefined
+  }
+
   /** Start the decode pipeline once the stream, preview, and fountain worker are
    * all live: reveal the viewfinder, size the pool, report the negotiated
    * settings, and drive the capture loop. */
@@ -461,12 +511,10 @@ export function createOpticalReceiverController(
     pool.resize(workerCount)
     setReceiverPhase("searching")
     if (mode === "camera") {
-      void applyCameraExtras()
-      void populateCameraOptions()
+      void camera.populateOptions()
     }
-    reportReceiverSettings()
     capturePipeline.start(track)
-    if (mode === "camera") reportReceiverSettings()
+    reportReceiverSettings()
     receiverRuntime.startUpdateTimer(updateReceiverState)
     void receiverWakeLock.start()
   }
@@ -475,18 +523,17 @@ export function createOpticalReceiverController(
     const generation = receiverSession.beginAttempt()
     if (!desktopScreenAvailable) return
     if (!navigator.mediaDevices?.getDisplayMedia) {
-      showError("screen capture is unavailable in this browser or requires a secure context.")
+      receiverView.showError("screen capture is unavailable in this browser or requires a secure context.")
       return
     }
     setReceiverPhase("starting")
     receiverView.patch({ startDisabled: true, startLabel: "Starting…" })
-    // for safari
-    // if (!(await ensureCodecModules("screen", generation))) return
+    // Keep display capture before asynchronous codec loading to retain user activation.
 
     let captured: MediaStream
     try {
       captured = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: captureFps } },
+        video: { frameRate: { ideal: cameraPreferences.captureFps } },
         audio: false,
       })
     } catch (err) {
@@ -496,32 +543,12 @@ export function createOpticalReceiverController(
       return
     }
     const activeStream = captured
-    const track = activeStream.getVideoTracks()[0]
-    if (!track) {
-      mediaSource.stop(activeStream)
-      if (receiverSession.isCurrent("screen", generation)) offerRetry("no video track was shared.")
-      return
-    }
-    // for safari
     if (!(await ensureCodecModules("screen", generation))) {
       mediaSource.stop(activeStream)
       return
     }
-    stream = activeStream
-    const previewResult = await mediaSource.preparePreview(
-      activeStream,
-      () => stale("screen", generation),
-      (activeStream) => prepareMediaPreview(video, activeStream),
-    )
-    if (previewResult === "stale") return
-    if (previewResult === "no-frame") {
-      if (receiverSession.isCurrent("screen", generation)) {
-        offerRetry("screen capture opened, but its preview did not produce a video frame — try again.")
-      }
-      return
-    }
-
-    if (!(await ensureFountainWorkerFor("screen", generation, activeStream))) return
+    const track = await prepareReceiverStream(activeStream, "screen", generation)
+    if (!track) return
 
     track.addEventListener(
       "ended",
@@ -540,10 +567,11 @@ export function createOpticalReceiverController(
       return
     }
     const generation = receiverSession.beginAttempt()
+    camera.clearCapabilities()
     if (!navigator.mediaDevices?.getUserMedia) {
       // On insecure origins the API doesn't exist AT ALL — this is the plain-
       // http-over-LAN case. localhost is exempt; other hosts need https.
-      showError(
+      receiverView.showError(
         "camera needs a secure context — this page must be served over https to " +
           "use the camera from another device. `npm run dev` already is.",
       )
@@ -554,61 +582,10 @@ export function createOpticalReceiverController(
     // error paths below all have to leave a usable Start button behind.
     receiverView.patch({ startDisabled: true, startLabel: "Starting…" })
     if (!(await ensureCodecModules("camera", generation))) return
-    const getUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
-    let cameraError: unknown
-    try {
-      stream = await acquireCamera(getUserMedia, cameraSelection(preferredCameraId), captureWidth, captureFps)
-    } catch (err) {
-      cameraError = err
-      const denied = err instanceof DOMException && err.name === "NotAllowedError"
-      if (preferredCameraId && !denied) {
-        // Device IDs can change when permission/site data is reset. A stale
-        // preference must not make the receiver unusable: clear it and retry Auto.
-        preferredCameraId = ""
-        receiverView.patch({ cameraId: "" })
-        persistReceiverSettings()
-        try {
-          stream = await acquireCamera(getUserMedia, cameraSelection(""), captureWidth, captureFps)
-          cameraError = undefined
-        } catch (fallbackError) {
-          cameraError = fallbackError
-        }
-      }
-    }
-    if (!stream) {
-      if (stale("camera", generation)) return
-      const err = cameraError
-      const denied = err instanceof DOMException && err.name === "NotAllowedError"
-      const gone = err instanceof DOMException && ["NotFoundError", "OverconstrainedError"].includes(err.name)
-      offerRetry(
-        denied
-          ? "camera permission denied — allow it, then tap Start camera again."
-          : gone
-            ? "the selected camera is no longer available — choose Auto and try again."
-            : `camera: ${errorMessage(err)}`,
-      )
-      return
-    }
-    const activeStream = stream
-    const previewResult = await mediaSource.preparePreview(
-      activeStream,
-      () => stale("camera", generation),
-      (activeStream) => prepareMediaPreview(video, activeStream),
-    )
-    if (previewResult === "stale") return
-    if (previewResult === "no-frame") {
-      if (receiverSession.isCurrent("camera", generation)) {
-        offerRetry("camera opened, but its preview did not produce a video frame — try again.")
-      }
-      return
-    }
-
-    // Camera permission, stream acquisition, and the first preview frame have
-    // all succeeded. Only now create the stateful NanoRQ worker; abandoning the
-    // camera prompt or failing to open a camera leaves no worker behind.
-    if (!(await ensureFountainWorkerFor("camera", generation, activeStream))) return
-
-    startPipeline(activeStream.getVideoTracks()[0], "camera")
+    const captured = await camera.acquire(() => stale("camera", generation))
+    if (!captured) return
+    const track = await prepareReceiverStream(captured, "camera", generation)
+    if (track) startPipeline(track, "camera")
   }
 
   /** Report what the source actually negotiated — iOS in particular will happily
@@ -617,111 +594,16 @@ export function createOpticalReceiverController(
     const track = stream?.getVideoTracks()[0]
     if (!track) return
     const settings = track.getSettings()
-    if (receiverSession.mode === "screen") {
-      const width =
-        settings.width && settings.height ? `${settings.width}×${settings.height}` : "resolution unavailable"
-      const fps = settings.frameRate ? ` @ ${Math.round(settings.frameRate)} fps` : ""
-      receiverView.patch({
-        cameraActual: `Actual ${width}${fps} · ${pool.size} decode workers · ${capturePipeline.mode} capture · ${note}`,
-      })
-    } else {
-      receiverView.patch({
-        cameraActual: formatActiveReceiverSettings(
-          settings,
-          requestedCameraSettings(),
-          pool.size,
-          capturePipeline.mode,
-          note,
-        ),
-      })
-    }
-    renderReceiverStatus()
-  }
-
-  /** Use what this camera can actually do, probed rather than UA-sniffed.
-   *  Continuous autofocus is applied silently — a lens hunting between frames is
-   *  the top decode killer, and a camera that refuses is left as it was. Frame
-   *  rates the current mode can't reach are grayed out. */
-  async function applyCameraExtras() {
-    const track = stream?.getVideoTracks()[0]
-    if (!track) return
-    const caps = probeCameraCapabilities(track)
-    if (caps.continuousFocus) {
-      await applyAdvancedConstraint(track, { focusMode: "continuous" })
-    }
-    if (receiverSession.done || track !== stream?.getVideoTracks()[0]) return
     receiverView.patch({
-      disabledCaptureFps: caps.maxFrameRate ? CAPTURE_FPS_OPTIONS.filter((value) => value > caps.maxFrameRate!) : [],
-      disabledCaptureWidths: caps.maxWidth ? CAPTURE_WIDTH_OPTIONS.filter((value) => value > caps.maxWidth!) : [],
+      cameraActual: formatActiveReceiverSettings(
+        settings,
+        pool.size,
+        capturePipeline.backendLabel,
+        note,
+        receiverSession.mode === "camera",
+      ),
     })
-  }
-
-  /**
-   * Switch lenses without discarding fountain state. Capture and QR decode
-   * workers are restarted so no late frame from the old camera reaches NanoRQ.
-   */
-  async function switchCamera(): Promise<void> {
-    if (receiverSession.done || !stream) return
-    const previousStream = stream
-    const previousDeviceId = previousStream.getVideoTracks()[0]?.getSettings().deviceId ?? ""
-    const requestedDeviceId = preferredCameraId
-    receiverView.patch({ cameraDisabled: true, cameraActual: "Switching camera…" })
-    setReceiverPhase("starting")
-    capturePipeline.stop()
-    pool.resize(0)
-    receiverView.patch({ previewVisible: false })
-    previousStream.getTracks().forEach((track) => track.stop())
-    stream = null
-    video.srcObject = null
-
-    const getUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
-    let nextStream: MediaStream
-    let restoredPrevious = false
-    try {
-      nextStream = await acquireCamera(getUserMedia, cameraSelection(requestedDeviceId), captureWidth, captureFps)
-    } catch {
-      try {
-        nextStream = await acquireCamera(getUserMedia, cameraSelection(previousDeviceId), captureWidth, captureFps)
-        restoredPrevious = true
-      } catch {
-        receiverView.patch({ cameraDisabled: false })
-        offerRetry("the camera could not be restarted — choose another camera and try again.")
-        return
-      }
-    }
-
-    if (receiverSession.done) {
-      nextStream.getTracks().forEach((track) => track.stop())
-      return
-    }
-
-    stream = nextStream
-    const previewReady = await prepareMediaPreview(video, nextStream)
-    if (receiverSession.done || stream !== nextStream) {
-      nextStream.getTracks().forEach((track) => track.stop())
-      if (video.srcObject === nextStream) video.srcObject = null
-      return
-    }
-    if (!previewReady) {
-      nextStream.getTracks().forEach((track) => track.stop())
-      stream = null
-      if (video.srcObject === nextStream) video.srcObject = null
-      receiverView.patch({ cameraDisabled: false })
-      offerRetry("the camera restarted, but its preview did not produce a video frame — try again.")
-      return
-    }
-    syncPreviewAspect()
-    receiverView.patch({ previewVisible: true })
-    pool.resize(workerCount)
-    setReceiverPhase(receiverRuntime.snapshot ? "receiving" : "searching")
-    capturePipeline.start(stream.getVideoTracks()[0])
-    receiverView.patch({ cameraDisabled: false })
-    if (restoredPrevious) preferredCameraId = previousDeviceId
-    await populateCameraOptions()
-    void applyCameraExtras()
-    reportReceiverSettings(
-      restoredPrevious ? "selected camera unavailable; kept the previous camera" : "changes apply live",
-    )
+    renderReceiverStatus()
   }
 
   function applyDecodeWorkerSetting(): void {
@@ -731,42 +613,13 @@ export function createOpticalReceiverController(
     reportReceiverSettings()
   }
 
-  async function applyCameraSettings(): Promise<void> {
-    if (receiverSession.done) return
-    const track = stream?.getVideoTracks()[0]
-    if (!track) return
-    reportReceiverSettings("applying camera settings…")
-    try {
-      await track.applyConstraints(preferredCameraMode(captureWidth, captureFps))
-    } catch {
-      // Some devices (notably iOS) refuse a live reconfigure. Keep the stream we
-      // have rather than tearing down a transfer in progress.
-      if (!receiverSession.done) reportReceiverSettings("camera refused the live change; restart to apply")
-      return
-    }
-    // The transfer may have completed while applyConstraints was pending. Do not
-    // recreate capture infrastructure that finish() has already torn down.
-    if (receiverSession.done || track !== stream?.getVideoTracks()[0]) return
-    // A transferred clone has its own constraints. Recreate the worker source
-    // immediately after a camera width/fps change so capture does not wait for
-    // the actual-settings UI to settle. Other capture modes consume the original
-    // track and update in place.
-    capturePipeline.restartWorkerSource(track)
-    // Give the camera mode 1 s to settle before displaying the track's actual
-    // dimensions and frame rate. This also covers teardown or camera switching
-    // during the UI-only settling delay.
-    await new Promise<void>((resolve) => window.setTimeout(resolve, 1000))
-    if (receiverSession.done || track !== stream?.getVideoTracks()[0]) return
-    reportReceiverSettings()
-  }
-
   async function applyScreenSettings(): Promise<void> {
     if (receiverSession.done || receiverSession.mode !== "screen") return
     const track = stream?.getVideoTracks()[0]
     if (!track) return
     reportReceiverSettings("applying screen FPS…")
     try {
-      await track.applyConstraints({ frameRate: { ideal: captureFps } })
+      await track.applyConstraints({ frameRate: { ideal: cameraPreferences.captureFps } })
     } catch {
       if (!receiverSession.done && receiverSession.mode === "screen")
         reportReceiverSettings("screen capture refused the FPS change")
@@ -780,6 +633,8 @@ export function createOpticalReceiverController(
   }
 
   function stopMediaStream(): void {
+    camera.cancel()
+    camera.clearCapabilities()
     const currentStream = stream
     stream = null
     video.srcObject = null
@@ -866,20 +721,32 @@ export function createOpticalReceiverController(
   window.addEventListener("pageshow", handlePageShow)
 
   function updateCaptureWidth(value: number): void {
-    captureWidth = value
+    cameraPreferences.captureWidth = value
     receiverView.patch({ captureWidth: value })
     persistReceiverSettings()
-    if (stream && !receiverSession.done && receiverSession.mode === "camera") void applyCameraSettings()
+    if (stream && !receiverSession.done && receiverSession.mode === "camera") camera.schedule("mode")
     else if (!receiverSession.done) reportPendingReceiverSettings()
   }
 
   function updateCaptureFps(value: number): void {
-    captureFps = value
+    cameraPreferences.captureFps = value
     receiverView.patch({ captureFps: value })
     persistReceiverSettings()
     if (stream && !receiverSession.done && receiverSession.mode === "screen") void applyScreenSettings()
-    else if (stream && !receiverSession.done && receiverSession.mode === "camera") void applyCameraSettings()
+    else if (stream && !receiverSession.done && receiverSession.mode === "camera") camera.schedule("mode")
     else if (!receiverSession.done) reportPendingReceiverSettings()
+  }
+
+  function updateIso(value: number): void {
+    cameraPreferences.iso = clampToStep(value, cameraPreferences.isoRange)
+    cameraPreferences.preferredIso = cameraPreferences.iso
+    receiverView.patch({ iso: cameraPreferences.iso })
+    if (stream && !receiverSession.done && receiverSession.mode === "camera") {
+      camera.schedule("exposure")
+    } else {
+      persistReceiverSettings()
+      if (!receiverSession.done) reportPendingReceiverSettings()
+    }
   }
 
   function updateWorkerCount(value: number): void {
@@ -891,15 +758,16 @@ export function createOpticalReceiverController(
   }
 
   function updateCamera(value: string): void {
-    preferredCameraId = value
+    cameraPreferences.cameraId = value
     receiverView.patch({ cameraId: value })
     persistReceiverSettings()
-    if (stream && !receiverSession.done) void switchCamera()
+    if (stream && !receiverSession.done) void camera.switchCamera()
   }
 
   function dispose(): void {
     if (disposed) return
     disposed = true
+    camera.cancel()
     video.removeEventListener("resize", syncPreviewAspect)
     video.removeEventListener("resize", reportScreenResize)
     video.removeEventListener("loadedmetadata", syncPreviewAspect)
@@ -907,7 +775,7 @@ export function createOpticalReceiverController(
     window.visualViewport?.removeEventListener("resize", syncPreviewAspect)
     window.removeEventListener("pagehide", handlePageHide)
     window.removeEventListener("pageshow", handlePageShow)
-    navigator.mediaDevices?.removeEventListener("devicechange", handleDeviceChange)
+    camera.dispose()
     receiverSession.invalidate()
     receivedFileResource.release()
     transferCoordinator.resetParts()
@@ -920,6 +788,7 @@ export function createOpticalReceiverController(
     selectApng: (file) => void startApng(file),
     updateCaptureWidth,
     updateCaptureFps,
+    updateIso,
     updateWorkerCount,
     updateCamera,
     reset: resetReceiver,

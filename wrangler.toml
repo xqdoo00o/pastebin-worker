@@ -19,8 +19,8 @@ run_worker_first = true
 binding = "ASSETS"
 
 [triggers]
-# clean r2 garbage every day
-crons = ["0 0 * * *"]
+# clean r2 garbage in bounded hourly batches
+crons = ["0 * * * *"]
 
 [observability]
 # enable to collect logs
@@ -146,7 +146,7 @@ TURN_URLS = []
 # TX FPS: 10, 15, 20, 24, 30, 50, or 60
 DEFAULT_QR_TX_FPS = 30
 
-# Bytes carried by each QR frame: 500, 1000, 1465, 1850, 2331, or 2953.
+# Bytes carried by each QR frame: 500, 1000, 1450, 1850, 2331, 2953, or 4143.
 # Use a size that fits the selected ECC level (L supports the largest frames).
 DEFAULT_QR_FRAME_BYTES = 2953
 

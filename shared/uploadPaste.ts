@@ -14,21 +14,20 @@ export class UploadError extends Error {
   }
 }
 
-export interface UploadOptions {
+interface UploadMetadataOptions {
   content: File
   filenames?: OriginalFileInfo[]
-  isUpdate: boolean
-
-  // we allow it to be undefined for convenience
-  isPrivate?: boolean
-
   password?: string
-
   highlightLanguage?: string
   encryptionScheme?: EncryptionScheme
   inferMimeType?: boolean
   expire?: string
   remainingReads?: number
+}
+
+export interface UploadOptions extends UploadMetadataOptions {
+  isUpdate: boolean
+  isPrivate?: boolean
   manageUrl?: string
 }
 
@@ -131,17 +130,6 @@ async function maybeAddMimeType(
 
   const mimeType = await inferMimeTypeFromContent(content)
   if (mimeType !== undefined) fd.set("mimeType", mimeType)
-}
-
-interface UploadMetadataOptions {
-  content: File
-  filenames?: OriginalFileInfo[]
-  password?: string
-  highlightLanguage?: string
-  encryptionScheme?: EncryptionScheme
-  inferMimeType?: boolean
-  expire?: string
-  remainingReads?: number
 }
 
 async function appendUploadMetadata(fd: FormData, options: UploadMetadataOptions): Promise<void> {
@@ -252,7 +240,7 @@ export async function uploadMPUSource(
   concurrency: number = DEFAULT_MPU_CONCURRENCY,
   signal?: AbortSignal,
 ): Promise<PasteResponse> {
-  const { isUpdate, isPrivate, expire, manageUrl } = options
+  const { isUpdate, isPrivate, manageUrl } = options
   // Internal controller: cancels all in-flight subrequests when one chunk fails or external signal aborts.
   const ctrl = new AbortController()
   const onExternalAbort = () => ctrl.abort()
@@ -275,6 +263,14 @@ export async function uploadMPUSource(
   }
 
   async function doMPU(): Promise<PasteResponse> {
+    ctrl.signal.throwIfAborted()
+    if (!Number.isSafeInteger(source.partCount) || source.partCount < 1) {
+      throw new TypeError("uploadMPUSource: partCount must be a positive integer")
+    }
+    const completeFormData = new FormData()
+    await appendUploadMetadata(completeFormData, options)
+    ctrl.signal.throwIfAborted()
+
     const createReqUrl = isUpdate ? new URL(`${apiUrl}/mpu/create-update`) : new URL(`${apiUrl}/mpu/create`)
     if (!isUpdate) {
       if (isPrivate) {
@@ -290,10 +286,6 @@ export async function uploadMPUSource(
       createReqUrl.searchParams.set("name", nameFromUrl)
       createReqUrl.searchParams.set("password", passwordFromUrl)
     }
-    if (expire !== undefined) {
-      createReqUrl.searchParams.set("e", expire)
-    }
-
     const createReqResp = await fetch(createReqUrl, { method: "POST", signal: ctrl.signal })
     if (!createReqResp.ok) {
       throw new UploadError(createReqResp.status, await createReqResp.text())
@@ -301,10 +293,6 @@ export async function uploadMPUSource(
     const parsedCreateResp: MPUCreateResponse = await createReqResp.json()
     createResp = parsedCreateResp
     const { key: createKey, uploadId: createUploadId, name: createName } = parsedCreateResp
-
-    if (!Number.isInteger(source.partCount) || source.partCount < 1) {
-      throw new TypeError("uploadMPUSource: partCount must be a positive integer")
-    }
 
     const chunkLoaded = new Array<number>(source.partCount).fill(0)
     let totalLoaded = 0
@@ -352,13 +340,11 @@ export async function uploadMPUSource(
     })
     reportProgress?.(true)
 
-    const completeFormData = new FormData()
     const completeUrl = new URL(`${apiUrl}/mpu/complete`)
     completeUrl.searchParams.set("name", createName)
     completeUrl.searchParams.set("key", createKey)
     completeUrl.searchParams.set("uploadId", createUploadId)
     completeFormData.set("c", new File([JSON.stringify(uploadedParts)], source.name))
-    await appendUploadMetadata(completeFormData, options)
     const completeReqResp = await fetch(completeUrl, {
       method: isUpdate ? "PUT" : "POST",
       body: completeFormData,

@@ -1,4 +1,5 @@
 import type { OpticalFile } from "../shared/protocol.js"
+import { DEFAULT_CAMERA_ISO, DEFAULT_CAMERA_ISO_RANGE, type NumericRange } from "../shared/settings.js"
 
 export type ReceiveMode = "camera" | "screen" | "apng"
 
@@ -44,6 +45,9 @@ export interface ReceiverUiState {
   cameraDisabled: boolean
   captureWidth: number
   captureFps: number
+  iso: number
+  isoRange: NumericRange
+  isoAvailable: boolean
   workers: number
   disabledCaptureWidths: readonly number[]
   disabledCaptureFps: readonly number[]
@@ -71,6 +75,9 @@ export const initialReceiverUiState: ReceiverUiState = {
   cameraDisabled: true,
   captureWidth: 1280,
   captureFps: 60,
+  iso: DEFAULT_CAMERA_ISO,
+  isoRange: DEFAULT_CAMERA_ISO_RANGE,
+  isoAvailable: false,
   workers: 1,
   disabledCaptureWidths: [],
   disabledCaptureFps: [],

@@ -3,6 +3,7 @@ import type { ReactNode } from "react"
 import { pickPublicEnv, type PublicEnv } from "../shared/interfaces.js"
 import { DARK_MODE_SCRIPT } from "../shared/darkMode.js"
 import { escapeHtml } from "../shared/encoding.js"
+import { PWA_HEAD_HTML } from "../shared/pwa.js"
 
 // Slim per-entry asset map produced by the `ssr-manifest` Vite plugin in
 // frontend/vite.config.js. Importing the full Vite manifest pulls every chunk
@@ -27,13 +28,9 @@ export async function renderStaticReact(node: ReactNode): Promise<string> {
 }
 
 export function getAssetPaths(manifest: SsrManifest, entryKey: string): SsrAssetPaths {
-  return (
-    manifest[entryKey] ?? {
-      jsFile: `assets/${entryKey.replace(".html", ".js")}`,
-      jsPreloadPaths: [],
-      cssPaths: ["assets/style.css"],
-    }
-  )
+  const entry = manifest[entryKey]
+  if (!entry) throw new Error(`Frontend manifest is missing entry: ${entryKey}`)
+  return entry
 }
 
 export function renderModulePreloadLinks(jsPaths: readonly string[]): string {
@@ -68,6 +65,7 @@ export function renderReactDocument({
 <meta charset="UTF-8" />
 <link rel="icon" href="/favicon.ico" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+${entryKey === "index.html" ? PWA_HEAD_HTML : ""}
 <title>${escapeHtml(title)}</title>
 ${renderCssLinks(cssPaths)}
 ${renderModulePreloadLinks(jsPreloadPaths)}

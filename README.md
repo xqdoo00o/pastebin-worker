@@ -1,6 +1,6 @@
 # Pastebin Worker
 
-This is a pastebin running on Cloudflare workers. Try it on [shz.al](https://shz.al).
+This is a pastebin running on Cloudflare worker. Try it on [shz.al](https://shz.al).
 
 **Philosophy**: effortless deployment, friendly CLI usage, rich functionality.
 
@@ -13,6 +13,7 @@ This is a pastebin running on Cloudflare workers. Try it on [shz.al](https://shz
 1. URL shortener.
 1. Smart and tweakable handling for `Content-Type` and `Content-Disposition`.
 1. Direct P2P file transfer with verification, pause/resume, and crash-safe browser checkpoints when OPFS is available.
+1. Install the homepage as a PWA with a standalone window and offline access to a previously visited public homepage.
 
 ## Usage
 
@@ -25,6 +26,14 @@ This is a pastebin running on Cloudflare workers. Try it on [shz.al](https://shz
 4. [doc/skill.md](doc/skill.md) is a concise, AI-agent-oriented packaging of the API. Make it available to your coding agent so it can upload, fetch, and manage pastes via this service.
 
 ## Deploy
+
+The homepage includes an **Install app** button when the browser offers installation. On iOS, the button shows
+Safari's **Share → Add to Home Screen** instructions. PWA support is included in `pnpm build:frontend` and works
+over HTTPS or localhost. The Vite development server does not register a service worker.
+
+Only the public homepage and built static assets enter the PWA cache. Auth-protected homepages, paste content,
+management URLs, and P2P signaling stay online. Uploads and P2P need connectivity; QR transfer can work offline
+after its assets have loaded once. Updates activate after existing pages close to avoid interrupting transfers.
 
 You are free to deploy the pastebin on your own domain if you host your domain on Cloudflare.
 

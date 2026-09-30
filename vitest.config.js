@@ -1,15 +1,18 @@
 import { defineConfig } from "vitest/config"
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers"
 
+// Workers require Istanbul rather than V8 coverage.
+const coverage = {
+  provider: "istanbul",
+  reporter: ["text", "json-summary", "html", "json"],
+  exclude: ["**/test/**"],
+}
+
 export default defineConfig({
   test: {
     // Leave enough process capacity for the Workers pool when all projects run together.
     maxWorkers: 4,
-    coverage: {
-      provider: "istanbul", // v8 is not supported due for cf workers
-      reporter: ["text", "json-summary", "html", "json"],
-      exclude: ["**/test/**"],
-    },
+    coverage,
     projects: [
       defineConfig({
         plugins: [
@@ -30,11 +33,7 @@ export default defineConfig({
           // BASIC_AUTH is mutable test state, and password hashing can block
           // unrelated Worker files when the pool runs them in parallel.
           fileParallelism: false,
-          coverage: {
-            provider: "istanbul", // v8 is not supported due for cf workers
-            reporter: ["text", "json-summary", "html", "json"],
-            exclude: ["**/test/**"],
-          },
+          coverage,
         },
       }),
       {
@@ -43,11 +42,7 @@ export default defineConfig({
           include: ["frontend/test/**/*.spec.{ts,tsx}"],
           name: "Frontend",
           environment: "jsdom",
-          coverage: {
-            provider: "istanbul",
-            reporter: ["text", "json-summary", "html", "json"],
-            exclude: ["**/test/**"],
-          },
+          coverage,
         },
       },
       {
@@ -55,11 +50,7 @@ export default defineConfig({
           include: ["shared/test/**/*.spec.ts"],
           name: "Shared",
           environment: "node",
-          coverage: {
-            provider: "istanbul",
-            reporter: ["text", "json-summary", "html", "json"],
-            exclude: ["**/test/**"],
-          },
+          coverage,
         },
       },
     ],

@@ -66,13 +66,17 @@ static int library_error(size_t result)
     return PW_ZSTD_LIBRARY_ERROR_BASE + (int)ZSTD_getErrorCode(result);
 }
 
-static int reserve_output(PwZstdOutput *output, size_t additional)
+static int reserve_output(PwZstdOutput *output, size_t additional, size_t capacity_limit)
 {
     if (additional > SIZE_MAX - output->size) {
         output->error = PW_ZSTD_ALLOCATION_ERROR;
         return output->error;
     }
     const size_t required = output->size + additional;
+    if (required > capacity_limit) {
+        output->error = PW_ZSTD_OUTPUT_LIMIT_ERROR;
+        return output->error;
+    }
     if (required <= output->capacity) {
         return PW_ZSTD_OK;
     }
@@ -84,7 +88,7 @@ static int reserve_output(PwZstdOutput *output, size_t additional)
             capacity = required;
             break;
         }
-        capacity = grown;
+        capacity = grown > capacity_limit ? capacity_limit : grown;
     }
     uint8_t *const data = (uint8_t *)realloc(output->data, capacity);
     if (data == NULL) {
@@ -243,7 +247,7 @@ static int compress_stream(
     size_t reserve_size = chunk_capacity;
     size_t remaining = 1;
     do {
-        const int reserve = reserve_output(&compressor->output, reserve_size);
+        const int reserve = reserve_output(&compressor->output, reserve_size, SIZE_MAX);
         if (reserve != PW_ZSTD_OK) {
             return reserve;
         }
@@ -394,14 +398,29 @@ int pw_zstd_decompressor_push(PwZstdDecompressor *decompressor, const uint8_t *i
     }
     ZSTD_inBuffer input = {input_bytes, input_size, 0};
     const size_t chunk_capacity = ZSTD_DStreamOutSize();
+    const size_t capacity_limit = decompressor->max_output == SIZE_MAX
+        ? SIZE_MAX
+        : decompressor->max_output + 1;
     size_t result = decompressor->last_result;
 
     do {
         const size_t output_remaining = decompressor->max_output - decompressor->total_output;
-        const size_t write_capacity = output_remaining < chunk_capacity
+        size_t write_capacity = output_remaining < chunk_capacity
             ? output_remaining + 1
             : chunk_capacity;
-        const int reserve = reserve_output(&decompressor->output, write_capacity);
+        /* A retained buffer may fit the next complete frame. Let zstd use its
+         * single-pass shortcut in that case, without growing speculatively.
+         * Unknown-size and partially decoded frames keep block-sized writes. */
+        if (input.pos == 0 && decompressor->output.size == 0 &&
+            decompressor->output.capacity > write_capacity) {
+            const unsigned long long frame_size = ZSTD_getFrameContentSize(input_bytes, input_size);
+            if (frame_size > write_capacity && frame_size <= decompressor->output.capacity) {
+                write_capacity = frame_size > output_remaining
+                    ? output_remaining + 1
+                    : (size_t)frame_size;
+            }
+        }
+        const int reserve = reserve_output(&decompressor->output, write_capacity, capacity_limit);
         if (reserve != PW_ZSTD_OK) {
             return reserve;
         }
@@ -429,6 +448,37 @@ int pw_zstd_decompressor_push(PwZstdDecompressor *decompressor, const uint8_t *i
     } while (input.pos < input.size || result != 0);
 
     decompressor->last_result = result;
+    return PW_ZSTD_OK;
+}
+
+/* Emit at most one block per call. progress[0] is consumed input bytes and
+ * progress[1] says to call again (possibly with empty input to drain output).
+ * The caller can persist each block before allowing any more decompression. */
+int pw_zstd_decompressor_step(PwZstdDecompressor *decompressor, const uint8_t *input_bytes,
+                             uint32_t input_size, uint32_t *progress)
+{
+    if (decompressor == NULL || decompressor->finished || progress == NULL) {
+        return PW_ZSTD_STATE_ERROR;
+    }
+    if (decompressor->output.error != PW_ZSTD_OK) return decompressor->output.error;
+    clear_output(&decompressor->output);
+    const size_t block_capacity = 128 * 1024;
+    const size_t remaining = decompressor->max_output - decompressor->total_output;
+    const size_t capacity = remaining < block_capacity ? remaining + 1 : block_capacity;
+    const int reserve = reserve_output(&decompressor->output, capacity, block_capacity);
+    if (reserve != PW_ZSTD_OK) return reserve;
+    ZSTD_inBuffer input = {input_bytes, input_size, 0};
+    ZSTD_outBuffer output = {decompressor->output.data, capacity, 0};
+    const size_t result = ZSTD_decompressStream(decompressor->context, &output, &input);
+    if (ZSTD_isError(result)) {
+        return decompressor->output.error = library_error(result);
+    }
+    if (output.pos > remaining) return decompressor->output.error = PW_ZSTD_OUTPUT_LIMIT_ERROR;
+    decompressor->output.size = output.pos;
+    decompressor->total_output += output.pos;
+    decompressor->last_result = result;
+    progress[0] = (uint32_t)input.pos;
+    progress[1] = input.pos < input.size || (output.pos == output.size && result != 0);
     return PW_ZSTD_OK;
 }
 

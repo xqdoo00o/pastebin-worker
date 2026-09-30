@@ -27,11 +27,13 @@ const ctx = self as unknown as {
 }
 
 const PROGRESS_INTERVAL_MS = 250
+const STREAM_SWITCH_IDLE_MS = 1_000
 
 let decoder: RaptorQDecoder | null = null
 let identity = ""
 let header: DecodedFrameHeader | null = null
 let lastProgressAt = -Infinity
+let lastStreamFrameAt = -Infinity
 let completed = false
 let verdictMessage: string | null = null
 let codecReady: Promise<unknown> | undefined
@@ -90,9 +92,13 @@ async function decodeFrame(buffer: ArrayBuffer): Promise<void> {
   // Ignore the completed identity without rebuilding its matrix.
   if (completed && sameStream(header, parsed.header)) return
 
-  // Once collection has started, another valid optical stream in the same
-  // camera view must not repeatedly destroy the current RaptorQ matrix.
-  if (decoder && !sameStream(header, parsed.header)) return
+  const now = performance.now()
+  // Keep collecting while the current stream is visible, even if another QR
+  // stream or a delayed decode-worker result is interleaved. Once it disappears,
+  // let a valid replacement (new file or B/frame setting) start a fresh matrix.
+  // Silence alone never discards progress, and duplicate frames still count as
+  // visibility so a looping sender does not lose its matrix to another stream.
+  if (decoder && !sameStream(header, parsed.header) && now - lastStreamFrameAt < STREAM_SWITCH_IDLE_MS) return
 
   const started = !decoder || !sameStream(header, parsed.header)
   if (started) {
@@ -105,6 +111,7 @@ async function decodeFrame(buffer: ArrayBuffer): Promise<void> {
     lastProgressAt = -Infinity
     completed = false
   }
+  lastStreamFrameAt = now
 
   decoder!.addFrame(parsed.block)
 
@@ -133,7 +140,6 @@ async function decodeFrame(buffer: ArrayBuffer): Promise<void> {
     return
   }
 
-  const now = performance.now()
   if (started || now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
     lastProgressAt = now
     ctx.postMessage({ type: "progress", started, snapshot: snapshot() })

@@ -2,6 +2,14 @@ import { BINARY_SNIFF_BYTES } from "./constants.js"
 
 const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true })
 
+// Optional native APIs: the fallback remains usable on older browsers.
+type Base64Bytes = Uint8Array & {
+  toBase64?: (options?: { alphabet?: "base64url"; omitPadding?: boolean }) => string
+}
+const base64Constructor = Uint8Array as Uint8ArrayConstructor & {
+  fromBase64?: (value: string) => Uint8Array<ArrayBuffer>
+}
+
 const HTML_ESCAPE_REPLACEMENTS: Readonly<Record<string, string>> = {
   "&": "&amp;",
   "<": "&lt;",
@@ -15,12 +23,15 @@ export function escapeHtml(value: string): string {
 }
 
 export function bytesToBase64(bytes: Uint8Array): string {
+  const native = (bytes as Base64Bytes).toBase64
+  if (native) return native.call(bytes)
   let binary = ""
   for (const byte of bytes) binary += String.fromCharCode(byte)
   return btoa(binary)
 }
 
 export function base64ToBytes(encoded: string): Uint8Array<ArrayBuffer> {
+  if (base64Constructor.fromBase64) return base64Constructor.fromBase64(encoded)
   const binary = atob(encoded)
   const bytes = new Uint8Array(binary.length)
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
@@ -28,6 +39,8 @@ export function base64ToBytes(encoded: string): Uint8Array<ArrayBuffer> {
 }
 
 export function bytesToBase64Url(bytes: Uint8Array): string {
+  const native = (bytes as Base64Bytes).toBase64
+  if (native) return native.call(bytes, { alphabet: "base64url", omitPadding: true })
   return bytesToBase64(bytes).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")
 }
 
@@ -53,14 +66,4 @@ export function decodeUtf8(bytes: Uint8Array): string | null {
   } catch {
     return null
   }
-}
-
-// Returns "UTF-8" if the bytes are valid UTF-8 (which subsumes pure ASCII), null otherwise.
-// Used to decide whether a paste should render as text or be treated as a binary download.
-//
-// This is a deliberate simplification of full charset detection: legacy single-byte encodings
-// (ISO-8859-1, Windows-1252, etc.) are reported as binary. UTF-8 is universal enough today
-// that the regression is acceptable, and the user can still force-render via the UI.
-export function detectUtf8(bytes: Uint8Array): "UTF-8" | null {
-  return decodeUtf8(bytes) === null ? null : "UTF-8"
 }

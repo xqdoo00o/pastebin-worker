@@ -117,7 +117,15 @@ export function DisplayPaste({ config }: { config: PublicEnv }) {
       const canPreview = preview.kind === "text" || preview.kind === "deferred-text"
       setCanPreview(canPreview)
       if (canPreview) {
-        if (bytes) await loadP2PTextPreview(file, bytes, isCurrent, highlightLanguage, encoding)
+        if (bytes)
+          await loadP2PTextPreview(
+            file,
+            bytes,
+            isCurrent,
+            highlightLanguage,
+            encoding,
+            preview.kind === "text" ? preview.text : undefined,
+          )
         else setStatus("Transfer complete. Choose whether to preview or save.")
         return
       }
@@ -148,12 +156,14 @@ export function DisplayPaste({ config }: { config: PublicEnv }) {
     isCurrentSession: () => boolean = () => true,
     highlightLanguage?: string,
     encoding: "UTF-8" | null = null,
+    text?: string,
   ): Promise<void> {
     const content = existingContent ?? new Uint8Array(await file.arrayBuffer())
     if (!isCurrentSession()) return
     paste.showPreview({
       file,
       content,
+      text: text ?? new TextDecoder().decode(content),
       lang: highlightLanguage,
       isBinary: false,
       encoding,
@@ -176,6 +186,7 @@ export function DisplayPaste({ config }: { config: PublicEnv }) {
         paste={{
           file: paste.pasteFile,
           contentBuffer: paste.pasteContentBuffer,
+          text: paste.pasteText,
           lang: paste.pasteLang,
           isFileBinary: paste.isFileBinary,
           guessedEncoding: paste.guessedEncoding,
@@ -198,7 +209,7 @@ export function DisplayPaste({ config }: { config: PublicEnv }) {
           file: p2p.file,
           isPaused: p2p.isPaused,
           isPausing: p2p.isPausing,
-          isReconnecting: p2p.isReconnecting,
+          transferStatus: p2p.transferStatus,
           isAcceptingUpdate: p2p.isAcceptingUpdate,
         }}
         actions={{

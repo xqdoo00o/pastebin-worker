@@ -29,16 +29,7 @@ interface P2PCreateOptions {
   isPrivate?: boolean
 }
 
-async function readP2PCreateOptions(request: Request, url: URL): Promise<P2PCreateOptions> {
-  const expire = url.searchParams.get("expire")
-  const maxTransfers = url.searchParams.get("maxTransfers")
-  if (expire !== null || maxTransfers !== null) {
-    return {
-      ...(expire !== null ? { expire } : {}),
-      ...(maxTransfers !== null ? { maxTransfers } : {}),
-    }
-  }
-
+async function readP2PCreateOptions(request: Request): Promise<P2PCreateOptions> {
   try {
     const body: unknown = await request.json()
     if (typeof body !== "object" || body === null) return {}
@@ -87,7 +78,7 @@ async function handleP2PCreate(request: Request, env: Env, url = new URL(request
 
   const authResponse = await verifyAuth(request, env)
   if (authResponse !== null) return authResponse
-  const options = await readP2PCreateOptions(request, url)
+  const options = await readP2PCreateOptions(request)
   const expirationSeconds = getP2PExpirationSeconds(options, env)
   const maxTransfers = getP2PMaxTransfers(options, env)
 

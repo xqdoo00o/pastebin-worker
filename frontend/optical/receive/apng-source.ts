@@ -1,5 +1,6 @@
 import { asError } from "../../utils/errors.js"
 import { readFileBytes } from "../../utils/byteSource.js"
+import { disposeWorker } from "../../utils/workerLifecycle.js"
 import type { DecodeWorkerPool } from "../shared/worker-pool.js"
 import type { ApngParserWorkerOutput } from "../shared/worker-messages.js"
 import { configuredWasmVariant } from "../shared/wasm-module.js"
@@ -16,6 +17,7 @@ interface ApngDecodeSourceOptions {
 
 export class ApngDecodeSource {
   private worker: Worker | undefined
+  private cancel: (() => void) | undefined
   private nextFrameId = 0
 
   constructor(private readonly options: ApngDecodeSourceOptions) {}
@@ -30,10 +32,15 @@ export class ApngDecodeSource {
       const settle = (error?: Error) => {
         if (settled) return
         settled = true
-        this.dispose(worker)
+        if (this.worker === worker) {
+          this.worker = undefined
+          this.cancel = undefined
+        }
+        disposeWorker(worker)
         if (error) reject(error)
         else resolve()
       }
+      this.cancel = () => settle(new DOMException("APNG decoding was cancelled.", "AbortError"))
       worker.onmessage = (event: MessageEvent<ApngParserWorkerOutput>) => {
         if (this.options.isStale(generation)) {
           settle(new Error("APNG decoding was cancelled."))
@@ -99,14 +106,6 @@ export class ApngDecodeSource {
   }
 
   abort(): void {
-    if (this.worker) this.dispose(this.worker)
-  }
-
-  private dispose(worker: Worker): void {
-    worker.onmessage = null
-    worker.onerror = null
-    worker.onmessageerror = null
-    worker.terminate()
-    if (this.worker === worker) this.worker = undefined
+    this.cancel?.()
   }
 }

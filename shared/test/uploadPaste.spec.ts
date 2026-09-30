@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { mapWithConcurrency } from "../async.js"
-import { UploadError, uploadMPU, uploadNormal } from "../uploadPaste.js"
+import { UploadError, uploadMPU, uploadMPUSource, uploadNormal } from "../uploadPaste.js"
 import { BINARY_MIME_TYPE, BINARY_SNIFF_BYTES, TEXT_MIME_TYPE } from "../constants.js"
 
 const API_URL = "https://example.com"
@@ -295,7 +295,7 @@ describe("uploadMPU", () => {
     expect(create.method).toStrictEqual("POST")
     expect(create.url).toContain("/mpu/create")
     expect(create.url).toContain("p=1")
-    expect(create.url).toContain("e=1d")
+    expect(new URL(create.url).searchParams.has("e")).toBe(false)
 
     const resumeCalls = xhrCalls.filter((c) => c.url.includes("/mpu/resume"))
     expect(resumeCalls).toHaveLength(3)
@@ -327,6 +327,37 @@ describe("uploadMPU", () => {
     const completeReq = fetchCalls.find((c) => c.url.includes("/mpu/complete"))!
     expect((completeReq.body as FormData).get("mimeType")).toStrictEqual(BINARY_MIME_TYPE)
   })
+
+  it("checks local metadata before creating a multipart upload", async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal("fetch", fetchMock)
+    const content = makeFile(8)
+    vi.spyOn(content, "slice").mockReturnValue({
+      arrayBuffer: () => Promise.reject(new Error("unreadable file")),
+    } as Blob)
+
+    await expect(uploadMPU(API_URL, 4, { content, inferMimeType: true, isUpdate: false })).rejects.toThrow(
+      "unreadable file",
+    )
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each([0, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid part count %s before creating a multipart upload",
+    async (partCount) => {
+      const fetchMock = vi.fn<typeof fetch>()
+      vi.stubGlobal("fetch", fetchMock)
+
+      await expect(
+        uploadMPUSource(
+          API_URL,
+          { name: "blob", size: 0, partCount, getPart: () => Promise.resolve(new Blob()) },
+          { content: makeFile(0), isUpdate: false },
+        ),
+      ).rejects.toThrow("partCount must be a positive integer")
+      expect(fetchMock).not.toHaveBeenCalled()
+    },
+  )
 
   it("accumulates multipart progress incrementally and ignores regressing XHR values", async () => {
     setupHappyPath(2)

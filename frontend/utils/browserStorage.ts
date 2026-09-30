@@ -74,3 +74,18 @@ export function storageKeysWithPrefix(storage: Storage | undefined, prefix: stri
   }
   return keys
 }
+
+/** Remove invalid records in one namespace without coupling their schemas. */
+export function pruneStorageRecords(
+  storage: Storage | undefined,
+  prefix: string,
+  isValid: (value: unknown, suffix: string) => boolean,
+): number {
+  let removed = 0
+  for (const key of storageKeysWithPrefix(storage, prefix)) {
+    const suffix = key.slice(prefix.length)
+    const valid = readStorageJson(storage, key, (value) => !!suffix && isValid(value, suffix))
+    if (!valid && removeStorageItem(storage, key)) removed += 1
+  }
+  return removed
+}

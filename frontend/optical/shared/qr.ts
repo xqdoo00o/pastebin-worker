@@ -7,6 +7,12 @@ export interface QrBitmap {
 }
 
 export const TRANSFER_QR_MARGIN = 4
+export const TRANSFER_QR_MASK = 3
+export const QR_VERSION_MAX = 48
+
+export function isSupportedQrVersion(version: number): boolean {
+  return Number.isInteger(version) && ((version >= 1 && version <= 40) || version === QR_VERSION_MAX)
+}
 
 export function qrPackedMatrix(qr: QrBitmap): Uint8Array {
   const packed = qr.packed
@@ -16,10 +22,10 @@ export function qrPackedMatrix(qr: QrBitmap): Uint8Array {
   return packed
 }
 
-/** Recover the ISO version number from a symbol's module width. */
+/** Recover the supported version number from a symbol's module width. */
 export function qrVersion(qr: Pick<QrBitmap, "size">): number {
   const version = (qr.size - 17) / 4
-  if (!Number.isInteger(version) || version < 1 || version > 40) {
+  if (!isSupportedQrVersion(version)) {
     throw new Error(`Invalid QR module width: ${qr.size}`)
   }
   return version

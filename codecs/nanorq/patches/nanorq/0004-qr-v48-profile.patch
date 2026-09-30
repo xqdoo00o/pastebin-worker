@@ -1,0 +1,19 @@
+diff --git a/include/qr_v48.h b/include/qr_v48.h
+new file mode 100644
+index 0000000..e2f4c80
+--- /dev/null
++++ b/include/qr_v48.h
+@@ -0,0 +1,13 @@
++/* Transfer-only QR v48 profile. The 209x209 layout follows the Model 2
++ * alignment and version-BCH formulas beyond the ISO version-40 limit.
++ * 5196 raw codewords leave these exact byte-mode capacities after the
++ * 20-bit mode/count header: L 4143, M 2953, Q 2331, H 1450 bytes. */
++#ifndef NANORQ_QR_V48_H
++#define NANORQ_QR_V48_H
++
++/* Ordered by qrcodegen_Ecc: L, M, Q, H. The 19-byte H degree requires
++ * 197 blocks to hit the requested 1450-byte limit exactly. */
++static const int QR_V48_ECC_PER_BLOCK[4] = {30, 28, 27, 19};
++static const int QR_V48_BLOCKS[4] = {35, 80, 106, 197};
++
++#endif

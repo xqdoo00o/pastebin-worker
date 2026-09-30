@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { PublicEnv } from "../../shared/interfaces.js"
 import { ReceiverConnectionRecovery } from "../utils/p2p/receiverRecovery.js"
-import { ReceiverStorageCoordinator } from "../utils/p2p/receiverStorageCoordinator.js"
+import { ReceiverStorageCoordinator, type P2PReceiveStorageError } from "../utils/p2p/receiverStorageCoordinator.js"
 import { ReceiverStorageSession } from "../utils/p2p/receiverSession.js"
 import { createP2PRoom, updateP2PRoom } from "../utils/p2p/roomClient.js"
 import { SenderPeerRecoveryCoordinator } from "../utils/p2p/senderRecovery.js"
@@ -156,7 +156,7 @@ describe("P2P receiver coordinators", () => {
     const meta = {
       revision: "revision-1",
       name: "file.bin",
-      size: 8,
+      size: 8 * 1024 * 1024,
       type: "application/octet-stream",
       lastModified: 0,
       senderBrowser: "Test",
@@ -166,13 +166,56 @@ describe("P2P receiver coordinators", () => {
     await coordinator.prepare(meta, false, () => true, vi.fn())
     await coordinator.enqueue(async () => {
       await coordinator.append(0, new ArrayBuffer(4))
-      await coordinator.checkpointData({ meta, receivedBytes: 4, completedHashes: ["hash"] }, true)
+      await coordinator.checkpointData({ meta, receivedBytes: 4, completedHashes: () => ["hash"] }, true)
     })
 
     expect(append).toHaveBeenCalledOnce()
     expect(checkpoint).toHaveBeenCalledOnce()
     expect(coordinator.checkpoint).toMatchObject({ roomName: "room", peerId: "peer-1", receivedBytes: 4 })
     expect(sent).toContainEqual({ type: "transfer-checkpoint" })
+    const snapshot = vi.fn(() => ["hash"])
+    await coordinator.checkpointData({ meta, receivedBytes: 8, completedHashes: snapshot })
+    expect(snapshot).not.toHaveBeenCalled()
+    await coordinator.checkpointData({ meta, receivedBytes: 1024 * 1024 + 4, completedHashes: snapshot })
+    expect(snapshot).toHaveBeenCalledOnce()
+  })
+
+  it("waits for the first checkpoint interval and marks only storage failures", async () => {
+    const { store, append, checkpoint } = mockReceivedStore("persistent")
+    const storage = new ReceiverStorageSession(
+      { canRestore: () => true, create: vi.fn(() => Promise.resolve(store)), restore: vi.fn() },
+      "storage-2",
+    )
+    const coordinator = new ReceiverStorageCoordinator({
+      roomName: "room-2",
+      peerId: "peer-2",
+      storage,
+      sendSignal: () => true,
+    })
+    const meta = {
+      revision: "test-revision",
+      name: "file.bin",
+      size: 8 * 1024 * 1024,
+      type: "application/octet-stream",
+      lastModified: 0,
+      senderBrowser: "Test",
+      verifyTransfer: false,
+    }
+    await coordinator.prepare(meta, false, () => false, vi.fn())
+    const hashes = vi.fn(() => [])
+    await coordinator.checkpointData({ meta, receivedBytes: 64 * 1024, completedHashes: hashes })
+    expect(checkpoint).not.toHaveBeenCalled()
+    expect(hashes).not.toHaveBeenCalled()
+    await coordinator.checkpointData({ meta, receivedBytes: 1024 * 1024, completedHashes: hashes })
+    expect(checkpoint).toHaveBeenCalledOnce()
+    expect(hashes).toHaveBeenCalledOnce()
+
+    const diskError = new Error("disk full")
+    append.mockRejectedValueOnce(diskError)
+    await expect(coordinator.append(0, new ArrayBuffer(1))).rejects.toMatchObject({
+      name: "P2PReceiveStorageError",
+      cause: diskError,
+    } satisfies Partial<P2PReceiveStorageError>)
   })
 })
 

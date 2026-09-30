@@ -1,17 +1,10 @@
 import type { MPUCreateResponse } from "../../shared/interfaces.js"
 import { PASTE_NAME_LEN, PRIVATE_PASTE_NAME_LEN } from "../../shared/constants.js"
-import { dateToUnix, jsonResponse, WorkerError, timingSafeEqual } from "../common.js"
-import { allocateRandomPasteName, getPasteMetadata } from "../storage/storage.js"
-import { parseExpiration, parseSize } from "../../shared/parsers.js"
-
-function mpuExpireMetadata(url: URL, env: Env): Record<string, string> {
-  const expireParam = url.searchParams.get("e")
-  const expirationSeconds = expireParam ? parseExpiration(expireParam) : null
-  const maxExpiration = parseExpiration(env.MAX_EXPIRATION)!
-  const effectiveExpiration = expirationSeconds ? Math.min(expirationSeconds, maxExpiration) : maxExpiration
-  const willExpireAtUnix = dateToUnix(new Date()) + effectiveExpiration
-  return { willExpireAtUnix: String(willExpireAtUnix) }
-}
+import { jsonResponse, WorkerError } from "../common.js"
+import { allocateRandomPasteName } from "../storage/storage.js"
+import { newPasteObjectKey, pasteNameFromObjectKey } from "../storage/objectKey.js"
+import { assertPastePassword, requirePasteMetadata } from "../pasteAccess.js"
+import { parseSize } from "../../shared/parsers.js"
 
 function createMultipartUploadResponse(name: string, multipartUpload: { key: string; uploadId: string }): Response {
   const response: MPUCreateResponse = {
@@ -32,7 +25,7 @@ function requireSearchParams<const Names extends readonly string[]>(
   return values as Record<Names[number], string>
 }
 
-// POST /mpu/create?p=<optional isPrivate>&e=<optional expire>
+// POST /mpu/create?p=<optional isPrivate>
 // returns JSON { name: string, key: string, uploadId: string }
 export async function handleMPUCreate(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url)
@@ -40,9 +33,9 @@ export async function handleMPUCreate(request: Request, env: Env): Promise<Respo
 
   const name = await allocateRandomPasteName(env, isPrivate ? PRIVATE_PASTE_NAME_LEN : PASTE_NAME_LEN)
 
-  const multipartUpload = await env.R2.createMultipartUpload(name, {
-    customMetadata: mpuExpireMetadata(url, env),
-  })
+  // The final expiration is selected at completion and stored in KV. A time
+  // fixed here would count upload time against the paste's promised lifetime.
+  const multipartUpload = await env.R2.createMultipartUpload(newPasteObjectKey(name))
   return createMultipartUploadResponse(name, multipartUpload)
 }
 
@@ -56,17 +49,10 @@ export async function handleMPUCreateUpdate(request: Request, env: Env): Promise
     "missing name or password (password) in searchParams",
   )
 
-  const metadata = await getPasteMetadata(env, name)
-  if (metadata === null) {
-    throw new WorkerError(404, `paste of name ‘${name}’ is not found`)
-  }
-  if (!timingSafeEqual(password, metadata.passwd)) {
-    throw new WorkerError(403, `incorrect password for paste ‘${name}’`)
-  }
+  const metadata = await requirePasteMetadata(env, name)
+  assertPastePassword(name, password, metadata)
 
-  const multipartUpload = await env.R2.createMultipartUpload(name, {
-    customMetadata: mpuExpireMetadata(url, env),
-  })
+  const multipartUpload = await env.R2.createMultipartUpload(newPasteObjectKey(name))
   return createMultipartUploadResponse(name, multipartUpload)
 }
 
@@ -88,7 +74,10 @@ export async function handleMPUResume(request: Request, env: Env): Promise<Respo
     throw new WorkerError(400, "missing request body")
   }
 
-  const partNumber = parseInt(partNumberString)
+  const partNumber = Number(partNumberString)
+  if (!/^[1-9]\d*$/.test(partNumberString) || !Number.isSafeInteger(partNumber)) {
+    throw new WorkerError(400, "invalid partNumber")
+  }
   const multipartUpload = env.R2.resumeMultipartUpload(key, uploadId)
   let uploadedPart: R2UploadedPart
   try {
@@ -127,18 +116,21 @@ export async function handleMPUAbort(request: Request, env: Env): Promise<Respon
 // formdata same as POST/PUT a normal paste, but
 //   - field `c` is interpreted as JSON { partNumber: number, etag: string }[]
 //   - field `n` is ignored
-export async function handleMPUComplete(request: Request, env: Env, completeBody: R2UploadedPart[]): Promise<R2Object> {
+export function parseMPUCompleteIdentity(request: Request): { uploadId: string; key: string; name: string } {
   const url = new URL(request.url)
-  const { uploadId, key, name } = requireSearchParams(
-    url,
-    ["uploadId", "key", "name"] as const,
-    "no uploadId or key for MPU complete",
-  )
-
-  const multipartUpload = env.R2.resumeMultipartUpload(key, uploadId)
-  if (name !== multipartUpload.key) {
-    throw new WorkerError(400, `name ‘${name}’ is not consistent with the originally specified name`)
+  const identity = requireSearchParams(url, ["uploadId", "key", "name"] as const, "no uploadId or key for MPU complete")
+  if (identity.name !== pasteNameFromObjectKey(identity.key)) {
+    throw new WorkerError(400, `name ‘${identity.name}’ is not consistent with the originally specified name`)
   }
+  return identity
+}
+
+export async function handleMPUComplete(
+  env: Env,
+  { uploadId, key }: ReturnType<typeof parseMPUCompleteIdentity>,
+  completeBody: R2UploadedPart[],
+): Promise<R2Object> {
+  const multipartUpload = env.R2.resumeMultipartUpload(key, uploadId)
 
   let object: R2Object
   try {

@@ -1,7 +1,7 @@
 import { RaptorQEncoder } from "./fountain.js"
 import { WasmNanoRQQrGenerator } from "./nanorq-runtime.js"
 import { qrVersion, type QrBitmap, type QrErrorCorrection } from "./qr.js"
-import { frameHeaderLength, packFrameInto, symbolLength, type FrameHeader, type FramePart } from "./wire.js"
+import { frameHeaderLength, packFrameInto, symbolLength, type FramePart } from "./wire.js"
 
 export interface OpticalQrFrameEncoderOptions {
   container: Uint8Array
@@ -25,7 +25,6 @@ export class OpticalQrFrameEncoder {
 
   private readonly encoder: RaptorQEncoder
   private readonly qrGenerator: WasmNanoRQQrGenerator
-  private readonly header: FrameHeader
   private readonly ecc: QrErrorCorrection
   private readonly wireFrame: Uint8Array
   private readonly block: Uint8Array
@@ -36,21 +35,18 @@ export class OpticalQrFrameEncoder {
     const headerLen = frameHeaderLength(part.count)
     this.encoder = new RaptorQEncoder(container, symbolLength(frameBytes, part.count))
     try {
+      this.k = this.encoder.k
+      this.packetLen = this.encoder.packetLen
+      this.ecc = ecc
+      this.wireFrame = new Uint8Array(headerLen + this.packetLen)
+      this.block = this.wireFrame.subarray(headerLen)
+      // Only the adjacent RaptorQ packet changes between frames.
+      packFrameInto({ totalLen: container.length, containerTag, part }, this.block, this.wireFrame)
       this.qrGenerator = new WasmNanoRQQrGenerator()
     } catch (error) {
       this.encoder.free()
       throw error
     }
-    this.k = this.encoder.k
-    this.packetLen = this.encoder.packetLen
-    this.header = {
-      totalLen: container.length,
-      containerTag,
-      part,
-    }
-    this.ecc = ecc
-    this.wireFrame = new Uint8Array(headerLen + this.packetLen)
-    this.block = this.wireFrame.subarray(headerLen)
   }
 
   get version(): number | undefined {
@@ -63,7 +59,6 @@ export class OpticalQrFrameEncoder {
 
   encode(sequence: number): QrBitmap {
     this.encoder.encodeInto(sequence, this.block)
-    packFrameInto(this.header, this.block, this.wireFrame)
     const qr = this.qrGenerator.encode(this.wireFrame, this.ecc, this.lockedVersion)
     if (this.lockedVersion === undefined) {
       this.lockedVersion = qrVersion(qr)

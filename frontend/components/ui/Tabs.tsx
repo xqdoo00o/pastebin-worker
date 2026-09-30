@@ -21,6 +21,29 @@ export function Tabs({ selectedKey, onSelectionChange, children, classNames = {}
   const selectedTab = tabs.find((tab, index) => selectedKey === keyForTab(tab, index))
   const selectedTabProps = selectedTab?.props as TabProps | undefined
 
+  function handleTabKeyDown(event: React.KeyboardEvent<HTMLButtonElement>, index: number): void {
+    let nextIndex: number
+    switch (event.key) {
+      case "ArrowRight":
+        nextIndex = (index + 1) % tabs.length
+        break
+      case "ArrowLeft":
+        nextIndex = (index + tabs.length - 1) % tabs.length
+        break
+      case "Home":
+        nextIndex = 0
+        break
+      case "End":
+        nextIndex = tabs.length - 1
+        break
+      default:
+        return
+    }
+    event.preventDefault()
+    onSelectionChange(keyForTab(tabs[nextIndex], nextIndex))
+    event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIndex]?.focus()
+  }
+
   return (
     <div className={classNames.base}>
       <div role="tablist" className={`flex ${classNames.tabList || ""}`}>
@@ -35,6 +58,7 @@ export function Tabs({ selectedKey, onSelectionChange, children, classNames = {}
               aria-selected={isSelected}
               tabIndex={isSelected ? 0 : -1}
               onClick={() => onSelectionChange(tabKey)}
+              onKeyDown={(event) => handleTabKeyDown(event, index)}
               className={`cursor-pointer rounded-sm text-sm transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-default-400 ${isSelected ? "text-default-700" : "text-default-500 hover:text-default-700"} ${classNames.tab || ""}`}
             >
               <span className="relative inline-block pb-1">

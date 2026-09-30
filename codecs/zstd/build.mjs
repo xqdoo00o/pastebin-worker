@@ -1,7 +1,14 @@
-import { copyFileSync, mkdirSync, readdirSync, rmSync } from "node:fs"
+import { readdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
 
-import { collapseEmscriptenVariantGlue, emscriptenCodecBuildContext, ensurePinnedGitCheckout } from "../build-utils.mjs"
+import {
+  emscriptenModuleFlags,
+  copyFileIfChanged,
+  createCodecBuildOutput,
+  collapseEmscriptenVariantGlue,
+  emscriptenCodecBuildContext,
+  ensurePinnedGitCheckout,
+} from "../build-utils.mjs"
 import { codecBuildState } from "../build-state.mjs"
 import { toolOverride } from "../emscripten/toolchain.mjs"
 
@@ -10,7 +17,7 @@ const inputHash = buildHash()
 const zstdRoot = join(codecRoot, "third_party", "zstd")
 const zstdRepository = "https://github.com/facebook/zstd.git"
 const zstdRevision = "f8745da6ff1ad1e7bab384bd1f9d742439278e99"
-const git = process.env.ZSTD_GIT || toolOverride("GIT").value || "git"
+const git = toolOverride("GIT").value || "git"
 const { emcc, run, output } = emscriptenCodecBuildContext({ cwd: codecRoot })
 
 ensurePinnedGitCheckout({
@@ -30,7 +37,7 @@ function cSources(directory) {
     .map((entry) => join(directory, entry.name))
 }
 
-mkdirSync(outputRoot, { recursive: true })
+const buildOutput = createCodecBuildOutput(codecRoot, outputRoot)
 const wrapperSource = join(codecRoot, "src", "zstd_codec.c")
 const commonSources = cSources(join(zstdRoot, "lib", "common"))
 const encoderSources = [
@@ -59,6 +66,7 @@ const decoderExports = [
   "_pw_zstd_decompressor_new",
   "_pw_zstd_decompressor_free",
   "_pw_zstd_decompressor_push",
+  "_pw_zstd_decompressor_step",
   "_pw_zstd_decompressor_finish",
   "_pw_zstd_decompressor_output",
   "_pw_zstd_decompressor_output_size",
@@ -105,25 +113,17 @@ function compileZstd(targetName, target, { capability, simd, threaded = false })
     "-DZSTD_LEGACY_SUPPORT=0",
     ...(threaded ? ["-DZSTD_MULTITHREAD=1", "-DPW_ZSTD_WORKERS=3", "-pthread"] : []),
     ...target.flags,
-    "-sWASM=1",
-    "-sMODULARIZE=1",
-    "-sEXPORT_ES6=1",
-    `-sEXPORT_NAME=${target.exportName}`,
-    "-sINCOMING_MODULE_JS_API=instantiateWasm",
-    "-sENVIRONMENT=web,worker",
-    "-sFILESYSTEM=0",
-    "-sASSERTIONS=0",
-    "-sMALLOC=emmalloc",
-    "-sALLOW_MEMORY_GROWTH=1",
-    "-sMAXIMUM_MEMORY=2147483648",
+    ...emscriptenModuleFlags({
+      exportName: target.exportName,
+      maximumMemory: 2147483648,
+      runtimeMethods: "HEAPU8,UTF8ToString",
+    }),
     ...(threaded
       ? ["-sINITIAL_MEMORY=67108864", "-sPTHREAD_POOL_SIZE=3", "-sPTHREAD_POOL_SIZE_STRICT=0", "-pthread"]
       : []),
     `-sEXPORTED_FUNCTIONS=${JSON.stringify(target.exports)}`,
-    "-sEXPORTED_RUNTIME_METHODS=HEAPU8,UTF8ToString",
-    "--no-entry",
     "-o",
-    join(outputRoot, `${targetName}_${capability}.js`),
+    join(buildOutput.directory, `${targetName}_${capability}.js`),
   ])
 }
 
@@ -144,13 +144,15 @@ compileZstd(
 // Every supported caller injects a compiled module. Keep one stable JS wrapper
 // per role and discard the duplicate scalar glue.
 for (const targetName of Object.keys(targets)) {
-  collapseEmscriptenVariantGlue({ outputRoot, baseName: targetName })
+  collapseEmscriptenVariantGlue({ outputRoot: buildOutput.directory, baseName: targetName })
 }
 
-copyFileSync(join(codecRoot, "src", "zstd_encoder.d.ts"), join(outputRoot, "zstd_encoder.d.ts"))
-copyFileSync(join(codecRoot, "src", "zstd_encoder.d.ts"), join(outputRoot, "zstd_encoder_threaded.d.ts"))
-copyFileSync(join(codecRoot, "src", "zstd_decoder.d.ts"), join(outputRoot, "zstd_decoder.d.ts"))
-copyFileSync(join(zstdRoot, "LICENSE"), join(outputRoot, "LICENSE"))
+buildOutput.publish()
+
+copyFileIfChanged(join(codecRoot, "src", "zstd_encoder.d.ts"), join(outputRoot, "zstd_encoder.d.ts"))
+copyFileIfChanged(join(codecRoot, "src", "zstd_encoder.d.ts"), join(outputRoot, "zstd_encoder_threaded.d.ts"))
+copyFileIfChanged(join(codecRoot, "src", "zstd_decoder.d.ts"), join(outputRoot, "zstd_decoder.d.ts"))
+copyFileIfChanged(join(zstdRoot, "LICENSE"), join(outputRoot, "LICENSE"))
 for (const staleName of ["zstd_codec.js", "zstd_codec.d.ts", "zstd_codec_simd.wasm", "zstd_codec_scalar.wasm"]) {
   rmSync(join(outputRoot, staleName), { force: true })
 }

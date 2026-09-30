@@ -6,6 +6,7 @@ import type {
   P2PProgress,
   P2PReceiverSession,
   P2PTransferHistoryItem,
+  P2PTransferStatus,
 } from "./protocol.js"
 import { asError } from "../errors.js"
 
@@ -28,6 +29,7 @@ interface ReceiverControllerOptions {
 interface ReceiverControllerState {
   isMode: boolean
   status?: string
+  transferStatus: P2PTransferStatus
   connectionRoute?: P2PConnectionRoute
   meta?: P2PFileMeta
   updateMeta?: P2PFileMeta
@@ -37,17 +39,16 @@ interface ReceiverControllerState {
   canPreviewFile: boolean
   isPaused: boolean
   isPausing: boolean
-  isReconnecting: boolean
   isAcceptingUpdate: boolean
 }
 
 const initialState: ReceiverControllerState = {
   isMode: false,
+  transferStatus: "READY",
   transferHistory: [],
   canPreviewFile: false,
   isPaused: false,
   isPausing: false,
-  isReconnecting: false,
   isAcceptingUpdate: false,
 }
 
@@ -74,6 +75,7 @@ function reducer(state: ReceiverControllerState, action: ReceiverControllerActio
         ...state,
         transferHistory,
         status: undefined,
+        transferStatus: "READY",
         meta: undefined,
         file: undefined,
         canPreviewFile: false,
@@ -96,7 +98,6 @@ export function useP2PReceiverController(name: string, config: PublicEnv, option
   const sessionIdRef = useRef(0)
   const fileGenerationRef = useRef(0)
   const metaRef = useRef<P2PFileMeta | undefined>(undefined)
-  const transferHistorySequenceRef = useRef(0)
   const startRef = useRef<(status?: string) => Promise<void>>(() => Promise.resolve())
 
   const setStatus = useCallback((status: string | undefined) => {
@@ -115,7 +116,6 @@ export function useP2PReceiverController(name: string, config: PublicEnv, option
       sessionIdRef.current = sessionId
       fileGenerationRef.current += 1
       metaRef.current = undefined
-      transferHistorySequenceRef.current = 0
       const isCurrentSession = () => sessionIdRef.current === sessionId
       dispatch({ type: "start", status: initialStatus })
 
@@ -130,6 +130,9 @@ export function useP2PReceiverController(name: string, config: PublicEnv, option
       sessionRef.current = receiverModule.startP2PReceiver(name, config, {
         onStatus: (status) => {
           if (isCurrentSession()) dispatch({ type: "patch", patch: { status } })
+        },
+        onTransferStatusChange: (transferStatus) => {
+          if (isCurrentSession()) dispatch({ type: "patch", patch: { transferStatus } })
         },
         onConnectionRouteChange: (connectionRoute) => {
           if (isCurrentSession()) dispatch({ type: "patch", patch: { connectionRoute } })
@@ -157,9 +160,6 @@ export function useP2PReceiverController(name: string, config: PublicEnv, option
         },
         onPausePendingChange: (isPausing) => {
           if (isCurrentSession()) dispatch({ type: "patch", patch: { isPausing } })
-        },
-        onReconnectingChange: (isReconnecting) => {
-          if (isCurrentSession()) dispatch({ type: "patch", patch: { isReconnecting } })
         },
         onFile: (file) => {
           if (!isCurrentSession()) return
@@ -212,10 +212,9 @@ export function useP2PReceiverController(name: string, config: PublicEnv, option
 
     let archived: P2PTransferHistoryItem | undefined
     if (current.meta) {
-      const id = current.meta.revision || `p2p-transfer-${transferHistorySequenceRef.current++}`
       const isComplete = current.file !== undefined
       archived = {
-        id,
+        id: current.meta.revision,
         meta: current.meta,
         status: isComplete ? current.status || "Transfer complete." : "Transfer stopped for a newer version.",
         transferStatus: isComplete ? "DONE" : "STOPPED",

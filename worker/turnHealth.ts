@@ -144,13 +144,13 @@ export function parseStunMessage(raw: Uint8Array): StunMessage {
     const valueOffset = offset + 4
     const paddedEnd = valueOffset + Math.ceil(attributeLength / 4) * 4
     if (paddedEnd > raw.byteLength) throw new TurnHealthCheckError("invalid STUN attribute length")
-    attributes.set(view.getUint16(offset), raw.slice(valueOffset, valueOffset + attributeLength))
+    attributes.set(view.getUint16(offset), raw.subarray(valueOffset, valueOffset + attributeLength))
     offset = paddedEnd
   }
 
   return {
     type,
-    transactionId: raw.slice(8, 20),
+    transactionId: raw.subarray(8, 20),
     attributes,
   }
 }
@@ -230,7 +230,7 @@ async function readStunMessage(reader: ReadableStreamDefaultReader, deadline: nu
     if (buffered.byteLength < STUN_HEADER_BYTES) continue
     const bodyLength = new DataView(buffered.buffer, buffered.byteOffset, buffered.byteLength).getUint16(2)
     const messageLength = STUN_HEADER_BYTES + bodyLength
-    if (buffered.byteLength >= messageLength) return parseStunMessage(buffered.slice(0, messageLength))
+    if (buffered.byteLength >= messageLength) return parseStunMessage(buffered.subarray(0, messageLength))
   }
 }
 

@@ -8,8 +8,12 @@ import {
   refreshP2PConnectionRoute,
   selectedP2PConnectionRoute,
 } from "../utils/p2p/rtc.js"
-import { createP2PSignalingTransport, P2PReconnectPolicy } from "../utils/p2p/signalingTransport.js"
-import { p2pControlMessageLengthLimit } from "../utils/p2p/transfer.js"
+import {
+  createP2PRoomRetryProbe,
+  createP2PSignalingTransport,
+  P2PReconnectPolicy,
+} from "../utils/p2p/signalingTransport.js"
+import { P2PSendWindow, p2pControlMessageLengthLimit } from "../utils/p2p/transfer.js"
 import {
   appendHashData,
   createBlockHashState,
@@ -34,6 +38,37 @@ import { isP2PIceCandidate, isP2PIceServer, isP2PSignalMessage, parseP2PSignalMe
 
 beforeAll(() => initializeXXHash(readFileSync("frontend/wasm/xxhash/xxhash_simd.wasm")))
 
+describe("P2P receive window", () => {
+  it("holds data until processing is acknowledged, rejecting future and stale credit", async () => {
+    const window = new P2PSendWindow(8)
+    await window.reserve(8, () => true)
+    const sent = vi.fn()
+    const pending = window.reserve(4, () => true).then(sent)
+    window.acknowledge(100)
+    await Promise.resolve()
+    expect(sent).not.toHaveBeenCalled()
+    window.acknowledge(4)
+    await pending
+    const next = window.reserve(4, () => true).then(sent)
+    window.acknowledge(2)
+    await Promise.resolve()
+    expect(sent).toHaveBeenCalledOnce()
+    window.acknowledge(8)
+    await next
+    expect(sent).toHaveBeenCalledTimes(2)
+  })
+
+  it("releases a blocked sender when its transfer is paused or replaced", async () => {
+    const window = new P2PSendWindow(8)
+    await window.reserve(8, () => true)
+    let active = true
+    const pending = window.reserve(1, () => active)
+    active = false
+    window.wake()
+    await pending
+  })
+})
+
 class MockWakeLockSentinel extends EventTarget {
   released = false
   release = vi.fn(() => {
@@ -50,7 +85,44 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+describe("P2P room retry probes", () => {
+  it.each([404, 410, 200, 503])("ignores a late HTTP %i response after the session closes", async (status) => {
+    const response = deferred<Response>()
+    const fetch = vi.fn(() => response.promise)
+    vi.stubGlobal("fetch", fetch)
+    let active = true
+    const shouldRun = vi.fn(() => active)
+    const onUnavailable = vi.fn()
+    const onRetry = vi.fn()
+    const probe = createP2PRoomRetryProbe(__WRANGLER_CONFIG__, "closed-room", { shouldRun, onUnavailable, onRetry })
+    probe()
+    probe()
+    expect(fetch).toHaveBeenCalledOnce()
+    active = false
+    response.resolve(new Response(null, { status }))
+    await vi.waitFor(() => expect(shouldRun).toHaveBeenCalledTimes(2))
+    expect(onUnavailable).not.toHaveBeenCalled()
+    expect(onRetry).not.toHaveBeenCalled()
+  })
+})
+
 describe("P2P signaling validation", () => {
+  it.each([
+    { type: "offer", peerId: "peer", sdp: { type: "offer" } },
+    { type: "answer", peerId: "peer", sdp: { type: "answer" } },
+    { type: "candidate", peerId: "peer", candidate: {} },
+  ])("rejects $type messages without a negotiation ID", (message) => {
+    expect(isP2PSignalMessage(message)).toBe(false)
+  })
+
+  it.each([
+    { type: "ready", role: "sender", peers: { sender: true, receivers: [{ peerId: "peer" }] } },
+    { type: "peer-joined", role: "receiver", peerId: "peer" },
+    { type: "peer-signaling-disconnected", role: "receiver", peerId: "peer" },
+  ])("rejects $type receiver presence without a connection ID", (message) => {
+    expect(isP2PSignalMessage(message)).toBe(false)
+  })
+
   it("parses a valid ready message with TURN configuration", () => {
     const message = {
       type: "ready",
@@ -72,7 +144,9 @@ describe("P2P signaling validation", () => {
       type: "receiver-reconnect-expired",
     })
     expect(
-      parseP2PSignalMessage('{"type":"offer","peerId":"receiver-1","sdp":{"type":"offer"},"directOnly":true}'),
+      parseP2PSignalMessage(
+        '{"type":"offer","peerId":"receiver-1","sdp":{"type":"offer"},"negotiationId":"negotiation","directOnly":true}',
+      ),
     ).toMatchObject({ type: "offer", directOnly: true })
   })
 
@@ -81,9 +155,15 @@ describe("P2P signaling validation", () => {
     expect(isP2PIceCandidate({ candidate: "candidate", sdpMLineIndex: -1 })).toBe(false)
     expect(isP2PIceServer({ urls: [] })).toBe(false)
     expect(isP2PIceServer({ urls: "turn:turn.example.com", credentialType: "token" })).toBe(false)
-    expect(isP2PSignalMessage({ type: "offer", peerId: "receiver-1", sdp: { type: "offer" }, directOnly: "yes" })).toBe(
-      false,
-    )
+    expect(
+      isP2PSignalMessage({
+        type: "offer",
+        peerId: "receiver-1",
+        sdp: { type: "offer" },
+        negotiationId: "negotiation",
+        directOnly: "yes",
+      }),
+    ).toBe(false)
   })
 
   it("rejects unknown, malformed, and oversized messages", () => {
@@ -95,6 +175,7 @@ describe("P2P signaling validation", () => {
           type: "candidate",
           peerId: "peer-1",
           candidate: { sdpMLineIndex: -1 },
+          negotiationId: "negotiation",
         }),
       ),
     ).toThrow("Invalid P2P signaling message.")
@@ -244,6 +325,7 @@ describe("P2P signaling transport", () => {
 describe("P2P data messages", () => {
   it("parses messages from each peer direction through one validator", () => {
     const meta = {
+      revision: "test-revision",
       name: "file.bin",
       size: 4,
       type: "",
@@ -257,16 +339,22 @@ describe("P2P data messages", () => {
       type: "meta",
       meta,
     })
-    expect(parseP2PDataMessage(JSON.stringify({ type: "progress", doneBytes: 3 }), "receiver")).toStrictEqual({
+    expect(
+      parseP2PDataMessage(JSON.stringify({ type: "progress", revision: meta.revision, doneBytes: 3 }), "receiver"),
+    ).toStrictEqual({
       type: "progress",
+      revision: meta.revision,
       doneBytes: 3,
     })
   })
 
   it("rejects invalid fields and messages sent in the wrong direction", () => {
-    expect(() => parseP2PDataMessage(JSON.stringify({ type: "download", offset: -1 }), "receiver")).toThrow(
-      "download offset",
-    )
+    expect(() =>
+      parseP2PDataMessage(
+        JSON.stringify({ type: "download", revision: "revision", receiveWindow: 1024 * 1024, offset: -1 }),
+        "receiver",
+      ),
+    ).toThrow("download offset")
     expect(() => parseP2PDataMessage(JSON.stringify({ type: "received", revision: "" }), "receiver")).toThrow(
       "revision",
     )
@@ -277,11 +365,51 @@ describe("P2P data messages", () => {
       parseP2PDataMessage(
         JSON.stringify({
           type: "meta",
-          meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+          meta: {
+            revision: "test-revision",
+            senderBrowser: "",
+            name: "file.bin",
+            size: 4,
+            type: "",
+            lastModified: 0,
+            verifyTransfer: false,
+          },
         }),
         "sender",
       ),
     ).toThrow("Invalid P2P file metadata")
+  })
+
+  it.each([
+    { type: "download", offset: 0, receiveWindow: 1024 * 1024 },
+    { type: "progress", doneBytes: 0 },
+    { type: "received" },
+  ])("rejects $type messages without a file revision", (message) => {
+    expect(() => parseP2PDataMessage(JSON.stringify(message), "receiver")).toThrow("revision")
+  })
+
+  it.each([undefined, 0, 1024 * 1024 - 1, 4 * 1024 * 1024 + 1])(
+    "rejects an invalid receive window (%s)",
+    (receiveWindow) => {
+      expect(() =>
+        parseP2PDataMessage(
+          JSON.stringify({ type: "download", revision: "revision", offset: 0, receiveWindow }),
+          "receiver",
+        ),
+      ).toThrow("receive window")
+    },
+  )
+
+  it("rejects file metadata without a revision", () => {
+    const meta = {
+      name: "file.bin",
+      size: 4,
+      type: "",
+      lastModified: 0,
+      senderBrowser: "Test browser",
+      verifyTransfer: false,
+    }
+    expect(() => parseP2PDataMessage(JSON.stringify({ type: "meta", meta }), "sender")).toThrow("file metadata")
   })
 })
 
@@ -666,6 +794,7 @@ describe("P2P persistent receive store", () => {
 describe("P2P resume checkpoint cleanup", () => {
   it("restores checkpoints containing XXH3 hashes and rejects legacy SHA-1 hashes", () => {
     const checkpoint = {
+      storageId: "00000000-0000-4000-8000-000000000063",
       version: 1 as const,
       roomName: "xxh3-room",
       peerId: "00000000-0000-4000-8000-000000000063",
@@ -697,12 +826,22 @@ describe("P2P resume checkpoint cleanup", () => {
     expect(readP2PResumeCheckpoint("sha1-room")).toBeUndefined()
     expect(localStorage.getItem("pastebin-worker:p2p-resume:sha1-room")).toBeNull()
 
+    for (const incompatible of [
+      { ...checkpoint, storageId: undefined },
+      { ...checkpoint, meta: { ...checkpoint.meta, revision: undefined } },
+    ]) {
+      localStorage.setItem("pastebin-worker:p2p-resume:xxh3-room", JSON.stringify(incompatible))
+      expect(readP2PResumeCheckpoint("xxh3-room")).toBeUndefined()
+      expect(localStorage.getItem("pastebin-worker:p2p-resume:xxh3-room")).toBeNull()
+    }
+
     localStorage.removeItem("pastebin-worker:p2p-resume:xxh3-room")
   })
 
   it("removes stale or malformed checkpoints for every room and preserves unrelated storage", () => {
     const now = Date.now()
     writeP2PResumeCheckpoint({
+      storageId: "00000000-0000-4000-8000-000000000063",
       version: 1,
       roomName: "active-room",
       peerId: "00000000-0000-4000-8000-000000000063",
@@ -722,6 +861,7 @@ describe("P2P resume checkpoint cleanup", () => {
     localStorage.setItem(
       "pastebin-worker:p2p-resume:stale-room",
       JSON.stringify({
+        storageId: "00000000-0000-4000-8000-000000000064",
         version: 1,
         roomName: "stale-room",
         peerId: "00000000-0000-4000-8000-000000000064",

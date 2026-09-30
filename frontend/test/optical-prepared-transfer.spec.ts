@@ -1,20 +1,16 @@
-import { readFileSync } from "node:fs"
+import { initializeTransferTestCodecs } from "./transfer-codec-test.js"
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest"
-import { initializeZstdDecoder, initializeZstdEncoder } from "../wasm/zstd-runtime.js"
-import { initializeXXHash } from "../wasm/xxhash-runtime.js"
+import * as zstd from "../wasm/zstd-runtime.js"
+import * as xxhash from "../wasm/xxhash-runtime.js"
 import { STREAMING_FILE_READ_CHUNK_BYTES } from "../../shared/constants.js"
-import { prepareOpticalTransfer } from "../optical/send/prepared-transfer.js"
-import { unpackFile } from "../optical/shared/protocol.js"
+import { prepareOpticalPayload } from "../optical/send/prepared-transfer.js"
+import { prepareOpticalTransfer } from "./optical-transfer-helper.js"
+import { fitsInOneStream, opticalPartPayloadSize, unpackFile } from "../optical/shared/protocol.js"
 
-beforeAll(async () => {
-  await Promise.all([
-    initializeZstdEncoder(readFileSync("frontend/wasm/zstd/zstd_encoder_simd.wasm")),
-    initializeZstdDecoder(readFileSync("frontend/wasm/zstd/zstd_decoder_simd.wasm")),
-    initializeXXHash(readFileSync("frontend/wasm/xxhash/xxhash_simd.wasm")),
-  ])
-})
+beforeAll(initializeTransferTestCodecs)
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
 
@@ -29,6 +25,125 @@ function noise(length: number): Uint8Array<ArrayBuffer> {
 }
 
 describe("lazy optical transfer preparation", () => {
+  it("repartitions a raw source without hashing it again and keeps part views stable", async () => {
+    const hash = vi.spyOn(xxhash, "xxh3Chunks")
+    const payload = await prepareOpticalPayload({ name: "raw.zip", type: "application/zip", data: noise(257).buffer })
+    try {
+      await expect(payload.partition(10)).rejects.toThrow("needs 26 parts")
+      expect(hash).not.toHaveBeenCalled()
+      const first = await payload.partition(100)
+      const second = await payload.partition(150)
+      expect(first.summary.partCount).toBe(3)
+      expect(second.summary.partCount).toBe(2)
+      expect(hash).toHaveBeenCalledOnce()
+      const oldPart = await first.getPart(1)
+      const newPart = await second.getPart(1)
+      expect(oldPart.part.count).toBe(2)
+      expect(newPart.part.count).toBe(1)
+      expect(oldPart.part.transferId).toBe(newPart.part.transferId)
+      expect(oldPart.transmittedSize).toBe(100)
+      expect(newPart.transmittedSize).toBe(107)
+    } finally {
+      await payload.cleanup()
+    }
+    await expect(payload.partition(100)).rejects.toThrow("no longer prepared")
+  })
+
+  it("reuses compressed output and its source hash across partition changes", async () => {
+    const compress = vi.spyOn(zstd, "createStreamingZstdCompressor")
+    const hash = vi.spyOn(xxhash, "xxh3Chunks")
+    const data = new Uint8Array(32_000)
+    const block = noise(4_000)
+    for (let offset = 0; offset < data.length; offset += block.length) data.set(block, offset)
+    const payload = await prepareOpticalPayload({ name: "logs.txt", type: "text/plain", data: data.buffer })
+    try {
+      const first = await payload.partition(1_000)
+      await expect(payload.partition(20)).rejects.toThrow("cannot fit its metadata")
+      const second = await payload.partition(2_000)
+      const oldPart = await first.getPart(0)
+      const newPart = await second.getPart(0)
+      expect(first.summary.compression).toBe("zstd")
+      expect(first.summary.partCount).toBeGreaterThan(second.summary.partCount)
+      expect(oldPart.part.transferId).toBe(newPart.part.transferId)
+      expect(compress).toHaveBeenCalledOnce()
+      expect(hash).not.toHaveBeenCalled()
+      await payload.cleanup()
+      await expect(first.getPart(0)).rejects.toThrow("no longer prepared")
+    } finally {
+      await payload.cleanup()
+    }
+  })
+
+  it.each([
+    [500, 24],
+    [1000, 48],
+    [1450, 64],
+    [1850, 64],
+    [2331, 64],
+    [2953, 64],
+    [4143, 64],
+  ])("keeps the %i-byte QR part budget within one source block, including maximum metadata", (frameBytes, mib) => {
+    const budget = opticalPartPayloadSize(frameBytes)
+    expect(budget).toBe(mib * 1024 * 1024)
+    expect(fitsInOneStream(budget + 17 + 2 * 0xffff, frameBytes, 15)).toBe(true)
+  })
+
+  it.each([500, 1000, 2953])("splits raw payloads at the selected %i-byte QR budget", async (frameBytes) => {
+    const budget = opticalPartPayloadSize(frameBytes)
+    const data = new ArrayBuffer(budget + 1)
+    new Uint8Array(data)[budget] = 123
+    const transfer = await prepareOpticalTransfer(
+      { name: "payload.zip", type: "application/zip", data },
+      { partPayloadSize: budget },
+    )
+    try {
+      expect(transfer.summary).toMatchObject({ compression: "none", transmittedSize: budget + 1, partCount: 2 })
+      expect(transfer.summary.containerSize).toBe(budget + 17 + "payload.zip".length + "application/zip".length)
+      expect(fitsInOneStream(transfer.summary.containerSize, frameBytes, 1)).toBe(true)
+      const last = await transfer.getPart(1)
+      const recovered = await unpackFile(last.container, last.part)
+      expect(recovered.part).toMatchObject({ index: 1, count: 1 })
+      expect(recovered.bytes).toEqual(Uint8Array.of(123))
+    } finally {
+      await transfer.cleanup()
+    }
+  })
+
+  it.each([500, 1000, 2953])("accepts exactly 16 parts and rejects overflow at %i bytes/frame", async (frameBytes) => {
+    const budget = opticalPartPayloadSize(frameBytes)
+    // Virtual file sizes exercise the real production limits without allocating
+    // or hashing a gigabyte. Part materialization is covered separately above.
+    const file = new File([], "large.zip", { type: "application/zip" })
+    const size = vi.spyOn(file, "size", "get").mockReturnValue(budget * 16)
+    const hash = vi.spyOn(xxhash, "xxh3Chunks").mockResolvedValue(1n)
+    const transfer = await prepareOpticalTransfer(file, { partPayloadSize: budget })
+    expect(transfer.summary.partCount).toBe(16)
+    await transfer.cleanup()
+
+    size.mockReturnValue(budget * 16 + 1)
+    await expect(prepareOpticalTransfer(file, { partPayloadSize: budget })).rejects.toThrow(
+      frameBytes === 2953 ? "too large to split" : "needs 17 parts",
+    )
+    expect(hash).toHaveBeenCalledOnce()
+  })
+
+  it("applies the part limit after compression rather than rejecting the original size", async () => {
+    const bytes = new TextEncoder().encode("compressible payload\n".repeat(2_000))
+    const transfer = await prepareOpticalTransfer(
+      { name: "payload.txt", type: "text/plain", data: bytes.buffer },
+      { partPayloadSize: 1_000 },
+    )
+    try {
+      expect(bytes.length).toBeGreaterThan(16_000)
+      expect(transfer.summary).toMatchObject({ compression: "zstd", partCount: 1 })
+      const part = await transfer.getPart(0)
+      const recovered = await unpackFile(part.container, part.part)
+      expect(new TextDecoder().decode(recovered.bytes)).toBe(new TextDecoder().decode(bytes))
+    } finally {
+      await transfer.cleanup()
+    }
+  })
+
   it("reports a file deleted while optical compression is reading it", async () => {
     const file = new File(["compressible text\n".repeat(100)], "deleted-during-qr-compression.txt", {
       type: "text/plain",

@@ -2,6 +2,9 @@ import { hydrateRoot, createRoot } from "react-dom/client"
 import React from "react"
 import { PasteBin } from "../PasteBin.js"
 import { HljsProvider } from "../../utils/highlight-client.js"
+import { registerPwa } from "../../utils/pwa.js"
+
+registerPwa()
 
 const rootElement = document.getElementById("root")!
 const config = __WRANGLER_CONFIG__

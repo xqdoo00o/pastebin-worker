@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import type { SenderWorkerInput, SenderWorkerOutput } from "../optical/shared/worker-messages.js"
 import type {
   OpticalMemoryFile,
-  PreparedOpticalTransfer,
-  PrepareOpticalTransferOptions,
+  PreparedOpticalPayload,
+  PrepareOpticalPayloadOptions,
 } from "../optical/send/prepared-transfer.js"
 import { monochromeByteLength } from "../optical/shared/monochrome.js"
 
@@ -59,23 +59,23 @@ describe("optical sender worker configuration", () => {
       }),
     )
     const cleanup = vi.fn(() => Promise.resolve())
-    const prepareOpticalTransfer = vi.fn<
-      (file: File | OpticalMemoryFile, options?: PrepareOpticalTransferOptions) => Promise<PreparedOpticalTransfer>
-    >(() =>
+    const partition = vi.fn((_budget: number) =>
       Promise.resolve({
         summary: {
-          containerSize: 1,
-          compression: "none",
+          containerSize: _budget === 64 * 1024 * 1024 ? _budget : 1,
+          compression: "none" as const,
           originalSize: 1,
           transmittedSize: 1,
           partCount: 3,
         },
         getPart,
-        cleanup,
       }),
     )
+    const prepareOpticalPayload = vi.fn<
+      (file: File | OpticalMemoryFile, options?: PrepareOpticalPayloadOptions) => Promise<PreparedOpticalPayload>
+    >((_file, _options) => Promise.resolve({ partition, cleanup }))
     vi.doMock("../optical/send/prepared-transfer.js", () => ({
-      prepareOpticalTransfer,
+      prepareOpticalPayload,
     }))
     vi.doMock("../optical/shared/qr-frame-encoder.js", () => ({
       OpticalQrFrameEncoder: MockFrameEncoder,
@@ -92,15 +92,31 @@ describe("optical sender worker configuration", () => {
     const dispatch = (data: SenderWorkerInput) => workerScope.onmessage?.({ data } as MessageEvent<SenderWorkerInput>)
     dispatch({ type: "init", wasmModule: {}, xxhashWasmModule: {} })
     const data = Uint8Array.of(1).buffer
-    dispatch({ type: "prepareBytes", name: "payload.bin", mediaType: "application/octet-stream", data })
+    dispatch({
+      type: "prepareBytes",
+      name: "payload.bin",
+      mediaType: "application/octet-stream",
+      data,
+    })
+    dispatch({ type: "partition", requestId: 1, partPayloadSize: 48 * 1024 * 1024 })
     await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "prepared" })))
-    expect(prepareOpticalTransfer).toHaveBeenCalledOnce()
-    expect(prepareOpticalTransfer.mock.calls[0]?.[0]).toEqual({
+    expect(prepareOpticalPayload).toHaveBeenCalledOnce()
+    expect(prepareOpticalPayload.mock.calls[0]?.[0]).toEqual({
       name: "payload.bin",
       type: "application/octet-stream",
       data,
     })
+    expect(partition).toHaveBeenCalledWith(48 * 1024 * 1024)
     expect(getPart).not.toHaveBeenCalled()
+
+    dispatch({ type: "copyPreparedPart", requestId: 99, part: 3 })
+    await vi.waitFor(() =>
+      expect(postMessage).toHaveBeenCalledWith({
+        type: "preparedPartError",
+        requestId: 99,
+        message: "The requested optical part is not prepared.",
+      }),
+    )
 
     dispatch({ type: "configure", session: 1, frameBytes: 1000, ecc: "L" })
     await vi.waitFor(() => expect(construct).toHaveBeenCalledOnce())
@@ -128,13 +144,59 @@ describe("optical sender worker configuration", () => {
     expect(encode.mock.calls.map(([sequence]) => sequence)).toEqual([0, 1])
     const batch = postMessage.mock.calls.map(([message]) => message).find((message) => message.type === "batch")
     expect(batch?.type === "batch" ? batch.monochromeBuffers[0]?.byteLength : 0).toBe(monochromeByteLength(29, 29))
+    expect(batch?.type === "batch" ? batch.partBytes : 0).toBe(1)
 
-    dispatch({ type: "configure", session: 4, frameBytes: 1465, ecc: "L" })
+    dispatch({ type: "configure", session: 4, frameBytes: 1450, ecc: "L" })
     await vi.waitFor(() => expect(construct).toHaveBeenCalledTimes(2))
     expect(free).toHaveBeenCalledOnce()
 
+    // An invalid budget clears playback but retains the source for a later retry.
+    partition.mockRejectedValueOnce(new RangeError("Too many parts"))
+    dispatch({ type: "partition", requestId: 2, partPayloadSize: 24 * 1024 * 1024 })
+    await vi.waitFor(() =>
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "error", requestId: 2, message: "Too many parts" }),
+      ),
+    )
+    dispatch({ type: "partition", requestId: 3, partPayloadSize: 64 * 1024 * 1024 })
+    await vi.waitFor(() =>
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "prepared", requestId: 3, partPayloadSize: 64 * 1024 * 1024 }),
+      ),
+    )
+    expect(prepareOpticalPayload).toHaveBeenCalledOnce()
+    expect(cleanup).not.toHaveBeenCalled()
+
+    const nextPartLoads = getPart.mock.calls.filter(([index]) => index === 1).length
+    dispatch({ type: "configure", session: 5, frameBytes: 1450, ecc: "L" })
+    await vi.waitFor(() => expect(construct).toHaveBeenCalledTimes(3))
+    expect(getPart.mock.calls.filter(([index]) => index === 1)).toHaveLength(nextPartLoads)
+
+    getPart.mockRejectedValueOnce(new Error("Part read failed."))
+    dispatch({ type: "copyPreparedPart", requestId: 100, part: 2 })
+    await vi.waitFor(() =>
+      expect(postMessage).toHaveBeenCalledWith({
+        type: "preparedPartError",
+        requestId: 100,
+        message: "Part read failed.",
+      }),
+    )
+
+    // Disposal must also interrupt lazy hashing after source preparation has finished.
+    const signal = prepareOpticalPayload.mock.calls[0]?.[1]?.signal
+    partition.mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          signal?.addEventListener("abort", () => reject(new DOMException("Hash cancelled", "AbortError")), {
+            once: true,
+          })
+        }),
+    )
+    dispatch({ type: "partition", requestId: 4, partPayloadSize: 48 * 1024 * 1024 })
+    await vi.waitFor(() => expect(partition).toHaveBeenCalledTimes(4))
     dispatch({ type: "dispose" })
     await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith({ type: "disposed" }))
+    expect(signal?.aborted).toBe(true)
     expect(cleanup).toHaveBeenCalledOnce()
   })
 
@@ -176,16 +238,19 @@ describe("optical sender worker configuration", () => {
       })
     })
     vi.doMock("../optical/send/prepared-transfer.js", () => ({
-      prepareOpticalTransfer: () =>
+      prepareOpticalPayload: () =>
         Promise.resolve({
-          summary: {
-            containerSize: 1,
-            compression: "none",
-            originalSize: 3,
-            transmittedSize: 3,
-            partCount: 3,
-          },
-          getPart,
+          partition: () =>
+            Promise.resolve({
+              summary: {
+                containerSize: 1,
+                compression: "none",
+                originalSize: 3,
+                transmittedSize: 3,
+                partCount: 3,
+              },
+              getPart,
+            }),
           cleanup: () => Promise.resolve(),
         }),
     }))
@@ -209,6 +274,7 @@ describe("optical sender worker configuration", () => {
       mediaType: "application/octet-stream",
       data: new ArrayBuffer(3),
     })
+    dispatch({ type: "partition", requestId: 1, partPayloadSize: 48 * 1024 * 1024 })
     await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "prepared" })))
     dispatch({ type: "configure", session: 1, frameBytes: 1000, ecc: "L" })
     await vi.waitFor(() => expect(getPart.mock.calls.some(([index]) => index === 1)).toBe(true))
@@ -233,8 +299,8 @@ describe("optical sender worker configuration", () => {
       initializeZstdEncoder: () => Promise.resolve(),
     }))
     vi.doMock("../wasm/xxhash-runtime.js", () => ({ initializeXXHash: () => Promise.resolve() }))
-    const prepareOpticalTransfer = vi.fn()
-    vi.doMock("../optical/send/prepared-transfer.js", () => ({ prepareOpticalTransfer }))
+    const prepareOpticalPayload = vi.fn()
+    vi.doMock("../optical/send/prepared-transfer.js", () => ({ prepareOpticalPayload }))
 
     const postMessage = vi.fn<(message: SenderWorkerOutput) => void>()
     const workerScope: {
@@ -256,6 +322,6 @@ describe("optical sender worker configuration", () => {
     await vi.waitFor(() =>
       expect(postMessage).toHaveBeenCalledWith({ type: "error", message: "NanoRQ initialization failed" }),
     )
-    expect(prepareOpticalTransfer).not.toHaveBeenCalled()
+    expect(prepareOpticalPayload).not.toHaveBeenCalled()
   })
 })

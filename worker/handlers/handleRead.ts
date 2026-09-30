@@ -5,7 +5,7 @@ import { makeMarkdown } from "../pages/markdown.js"
 import type { PasteBody, PasteBodyRange, PasteMetadata, PasteRecord } from "../storage/storage.js"
 import {
   consumeRead,
-  deletePaste,
+  cleanupPasteVersion,
   discardPasteRecord,
   getPasteRecord,
   getRemainingReads,
@@ -16,6 +16,7 @@ import {
 import { parsePath } from "../../shared/parsers.js"
 import { BINARY_MIME_TYPE, MAX_URL_REDIRECT_LEN, TEXT_MIME_TYPE } from "../../shared/constants.js"
 import { filenameForTitle, itemCountLabel } from "../../shared/format.js"
+import { escapeHtml } from "../../shared/encoding.js"
 import { mimeEssence } from "../../shared/fileType.js"
 import { getP2PRoomStatus } from "../p2p.js"
 import { handleStaticPages } from "./staticPages.js"
@@ -56,8 +57,29 @@ function lastModifiedHeader(metadata: PasteMetadata): Headers {
   return lastModified ? { "Last-Modified": new Date(lastModified * 1000).toUTCString() } : {}
 }
 
-function pasteResponseHeaders(metadata: PasteMetadata): Headers {
-  return { ...pasteCacheHeader(metadata), ...lastModifiedHeader(metadata) }
+function pasteEtag(metadata: PasteMetadata, representation: "raw" | "meta" = "raw"): string | undefined {
+  return hasReadLimit(metadata) ? undefined : `"${metadata.cacheVersion}-${representation}"`
+}
+
+function pasteResponseHeaders(metadata: PasteMetadata, etag?: string): Headers {
+  return { ...pasteCacheHeader(metadata), ...lastModifiedHeader(metadata), ...(etag ? { ETag: etag } : {}) }
+}
+
+function dateValidatorMatches(value: string, metadata: PasteMetadata): boolean {
+  // HTTP dates lose subsecond precision. Equality cannot prove that a mutable
+  // paste has not changed within that second; version ETags can.
+  return Date.parse(value) / 1000 > metadata.lastModifiedAtUnix
+}
+
+function isNotModified(request: Request, metadata: PasteMetadata, etag: string | undefined): boolean {
+  if (hasReadLimit(metadata)) return false
+  const ifNoneMatch = request.headers.get("If-None-Match")
+  if (ifNoneMatch !== null) {
+    if (ifNoneMatch.trim() === "*") return true
+    return !!etag && (ifNoneMatch.match(/(?:W\/)?"[^"\r\n]*"/g) ?? []).some((tag) => tag.replace(/^W\//, "") === etag)
+  }
+  const modifiedSince = request.headers.get("If-Modified-Since")
+  return modifiedSince !== null && dateValidatorMatches(modifiedSince, metadata)
 }
 
 type ParsedByteRange = { kind: "none" } | { kind: "unsatisfiable" } | { kind: "range"; range: PasteBodyRange }
@@ -94,19 +116,17 @@ function parseByteRange(value: string | null, size: number): ParsedByteRange {
   }
 }
 
-async function ifRangeMatches(request: Request, env: Env, name: string, metadata: PasteMetadata): Promise<boolean> {
+function ifRangeMatches(request: Request, metadata: PasteMetadata): boolean {
   const value = request.headers.get("If-Range")?.trim()
   if (!value) return true
   if (value.startsWith("W/")) return false
 
   if (value.startsWith('"')) {
     if (!value.endsWith('"')) return false
-    const object = await env.R2.head(name)
-    return object?.httpEtag === value
+    return value === pasteEtag(metadata)
   }
 
-  const date = Date.parse(value)
-  return !Number.isNaN(date) && metadata.lastModifiedAtUnix <= Math.floor(date / 1000)
+  return dateValidatorMatches(value, metadata)
 }
 
 async function refreshRemainingReads(env: Env, name: string, record: PasteRecord): Promise<void> {
@@ -137,7 +157,7 @@ async function consumeReadBeforeResponse(
 
 async function renderP2PDisplayShell(env: Env, name: string, isHead: boolean): Promise<Response> {
   const pageUrl = new URL("/display.html", env.DEPLOY_URL)
-  const page = (await (await env.ASSETS.fetch(pageUrl)).text()).replace("{{PASTE_NAME}}", `${name} (P2P)`)
+  const page = (await (await env.ASSETS.fetch(pageUrl)).text()).replace("{{PASTE_NAME}}", escapeHtml(`${name} (P2P)`))
   return new Response(isHead ? null : page, {
     headers: {
       "Content-Type": `text/html;charset=UTF-8`,
@@ -181,7 +201,7 @@ async function handleArticleRead(
 
 async function handleMetadataRead(env: Env, name: string, record: PasteRecord, isHead: boolean): Promise<Response> {
   await refreshRemainingReads(env, name, record)
-  const headers = pasteResponseHeaders(record.metadata)
+  const headers = pasteResponseHeaders(record.metadata, pasteEtag(record.metadata, "meta"))
   return isHead
     ? new Response(null, { headers: { "Content-Type": "application/json;charset=UTF-8", ...headers } })
     : jsonResponse(metaResponseFromMetadata(record.metadata), { headers }, 2)
@@ -247,7 +267,7 @@ async function handleDisplayRead({
   const titleFilename = filenameForTitle(filename)
   const page = (await (await env.ASSETS.fetch(pageUrl)).text()).replace(
     "{{PASTE_NAME}}",
-    name + (titleFilename ? " / " + titleFilename : ext ? ext : displayName ? " / " + displayName : ""),
+    escapeHtml(name + (titleFilename ? " / " + titleFilename : ext ? ext : displayName ? " / " + displayName : "")),
   )
   return new Response(isHead ? null : page, {
     headers: { "Content-Type": "text/html;charset=UTF-8", ...pasteResponseHeaders(record.metadata) },
@@ -255,7 +275,6 @@ async function handleDisplayRead({
 }
 
 export async function handleGet(request: Request, env: Env, ctx: ExecutionContext, isHead: boolean): Promise<Response> {
-  // TODO: handle etag
   const staticPageResp = await handleStaticPages(request, env)
   if (staticPageResp !== null) {
     return staticPageResp
@@ -292,7 +311,7 @@ export async function handleGet(request: Request, env: Env, ctx: ExecutionContex
       const opened = await openPasteBody(env, name, record, ctx, responseRange)
       if (deleteAfterBodyOpen) {
         deleteAfterBodyOpen = false
-        ctx.waitUntil(deletePaste(env, name, record.metadata, { readStateAlreadyFinal: true }))
+        ctx.waitUntil(cleanupPasteVersion(env, record.metadata))
       }
       if (opened === null) {
         throw new WorkerError(404, `paste of name '${name}' not found`)
@@ -318,18 +337,15 @@ export async function handleGet(request: Request, env: Env, ctx: ExecutionContex
 
     const decryptedContentType = record.metadata.encryptionScheme ? sanitize(realMime) : null
 
-    // check `if-modified-since`
-    const pasteLastModifiedUnix = record.metadata.lastModifiedAtUnix
-    const headerModifiedSince = request.headers.get("If-Modified-Since")
-    if (headerModifiedSince) {
-      const headerModifiedSinceUnix = Date.parse(headerModifiedSince) / 1000
-      if (pasteLastModifiedUnix <= headerModifiedSinceUnix) {
-        return new Response(null, {
-          status: 304, // Not Modified
-          headers: pasteResponseHeaders(record.metadata),
-        })
-      }
+    // Rendered pages also depend on application assets/configuration. Only raw
+    // bytes and metadata can be validated using the stored paste version alone.
+    const canValidate = role !== "u" && role !== "a" && role !== "d"
+    const etag = canValidate ? pasteEtag(record.metadata, role === "m" ? "meta" : "raw") : undefined
+    if (canValidate && isNotModified(request, record.metadata, etag)) {
+      return new Response(null, { status: 304, headers: pasteResponseHeaders(record.metadata, etag) })
     }
+
+    if ((isHead && role !== "m") || role === "d") await refreshRemainingReads(env, name, record)
 
     // determine filename with priority: url path > meta
     let returnFilename = filename || record.metadata.filename
@@ -372,7 +388,7 @@ export async function handleGet(request: Request, env: Env, ctx: ExecutionContex
     const supportsRange = record.metadata.location === "R2" && !hasReadLimit(record.metadata)
     if (!isHead && supportsRange) {
       const parsedRange = parseByteRange(request.headers.get("Range"), record.metadata.sizeBytes)
-      const applyRange = parsedRange.kind !== "none" && (await ifRangeMatches(request, env, name, record.metadata))
+      const applyRange = parsedRange.kind !== "none" && ifRangeMatches(request, record.metadata)
       if (applyRange && parsedRange.kind === "unsatisfiable") {
         return new Response(null, {
           status: 416,
@@ -380,23 +396,21 @@ export async function handleGet(request: Request, env: Env, ctx: ExecutionContex
             "Accept-Ranges": "bytes",
             "Content-Range": `bytes */${record.metadata.sizeBytes}`,
             "Access-Control-Expose-Headers": "Accept-Ranges, Content-Range",
-            ...pasteResponseHeaders(record.metadata),
+            ...pasteResponseHeaders(record.metadata, etag),
           },
         })
       }
       if (applyRange && parsedRange.kind === "range") responseRange = parsedRange.range
     }
 
-    if (isHead) {
-      await refreshRemainingReads(env, name, record)
-    } else {
+    if (!isHead) {
       await consumeBeforeOpen()
       await requireBody()
     }
 
     const headers: Headers = {
       "Content-Type": `${inferred_mime}`,
-      ...pasteResponseHeaders(record.metadata),
+      ...pasteResponseHeaders(record.metadata, etag),
     }
     const exposeHeaders = ["Content-Disposition"]
 
@@ -429,10 +443,6 @@ export async function handleGet(request: Request, env: Env, ctx: ExecutionContex
     if (record.metadata.remainingReads !== undefined) {
       headers["X-PB-Remaining-Reads"] = record.metadata.remainingReads.toString()
       exposeHeaders.push("X-PB-Remaining-Reads")
-    }
-
-    if (body?.httpEtag) {
-      headers.etag = body.httpEtag
     }
 
     if (returnFilename) {

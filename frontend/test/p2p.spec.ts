@@ -6,6 +6,7 @@ import type { P2PFileMeta, P2PProgress, P2PSenderPeerInfo, P2PVerificationManife
 import type { P2PCreateResponse, P2PIceServer, PublicEnv } from "../../shared/interfaces.js"
 import { P2P_DIRECT_PROBE_TIMEOUT_MS } from "../../shared/constants.js"
 import { verificationBlockSize } from "../utils/p2p/protocol.js"
+import { receiveWindowBytes } from "../utils/p2p/transfer.js"
 import { xxh3Hex } from "../utils/p2p/verification.js"
 import { initializeXXHash } from "../wasm/xxhash-runtime.js"
 import {
@@ -41,12 +42,17 @@ class MockDataChannel extends EventTarget {
   }
 
   receive(message: object) {
-    const data = message as { type?: string; meta?: Record<string, unknown> }
-    const normalized =
-      (data.type === "meta" || data.type === "file-update") && data.meta && data.meta.senderBrowser === undefined
-        ? { ...data, meta: { ...data.meta, senderBrowser: "Test browser" } }
-        : message
-    this.receiveData(JSON.stringify(normalized))
+    this.receiveData(JSON.stringify(message))
+  }
+
+  get fileRevision(): string {
+    for (const part of [...this.sent].reverse()) {
+      if (typeof part !== "string") continue
+      const message = JSON.parse(part) as { type: string; meta?: P2PFileMeta }
+      if (message.type === "meta" && message.meta) return message.meta.revision
+    }
+    // Unpaired-channel tests use a synthetic file revision.
+    return "test-revision"
   }
 
   receiveData(data: unknown) {
@@ -159,6 +165,14 @@ class MockWebSocket {
 
   receive(message: object) {
     this.onmessage?.call(this as unknown as WebSocket, new MessageEvent("message", { data: JSON.stringify(message) }))
+  }
+
+  negotiationId(peerId: string): string {
+    for (const part of [...this.sent].reverse()) {
+      const message = JSON.parse(part) as { type: string; peerId?: string; negotiationId?: string }
+      if (message.type === "offer" && message.peerId === peerId && message.negotiationId) return message.negotiationId
+    }
+    return "00000000-0000-4000-8000-000000000090"
   }
 }
 
@@ -356,7 +370,7 @@ async function openIncomingDataChannel(
   sdp = "offer",
 ): Promise<{ peer: MockPeerConnection; channel: MockDataChannel }> {
   const peerIndex = MockPeerConnection.instances.length
-  socket.receive({ type: "offer", peerId, sdp: { type: "offer", sdp } })
+  socket.receive({ negotiationId: socket.negotiationId(peerId), type: "offer", peerId, sdp: { type: "offer", sdp } })
   await vi.waitFor(() => expect(MockPeerConnection.instances.length).toBeGreaterThan(peerIndex))
   const peer = MockPeerConnection.instances[peerIndex]
   const channel = peer.dataChannel
@@ -386,7 +400,13 @@ async function startConnectedRelaySender(
     iceServers: relayIceServers,
     peers: {
       sender: true,
-      receivers: [{ peerId: "receiver-1", ...(options.connectionId ? { connectionId: options.connectionId } : {}) }],
+      receivers: [
+        {
+          connectionId: "test-connection",
+          peerId: "receiver-1",
+          ...(options.connectionId ? { connectionId: options.connectionId } : {}),
+        },
+      ],
     },
   })
   await vi.advanceTimersByTimeAsync(0)
@@ -461,7 +481,7 @@ describe("P2P transfer lifecycle", () => {
       type: "ready",
       role: "sender",
       iceServers,
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
 
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
@@ -641,7 +661,12 @@ describe("P2P transfer lifecycle", () => {
     const socket = MockWebSocket.instances[0]
     socket.receive({ type: "ready", role: "receiver", iceServers, peers: { sender: true, receivers: [] } })
     await flushTasks()
-    socket.receive({ type: "offer", peerId: "sender", sdp: { type: "offer", sdp: "relay-offer" } })
+    socket.receive({
+      negotiationId: socket.negotiationId("sender"),
+      type: "offer",
+      peerId: "sender",
+      sdp: { type: "offer", sdp: "relay-offer" },
+    })
     await flushTasks()
     const relayPeer = MockPeerConnection.instances[0]
     relayPeer.selectedCandidateType = "relay"
@@ -651,6 +676,7 @@ describe("P2P transfer lifecycle", () => {
     expect(onConnectionRouteChange).toHaveBeenLastCalledWith("relay")
 
     socket.receive({
+      negotiationId: socket.negotiationId("sender"),
       type: "offer",
       peerId: "sender",
       sdp: { type: "offer", sdp: "direct-offer" },
@@ -709,6 +735,7 @@ describe("P2P transfer lifecycle", () => {
     }
     expect(
       writeP2PResumeCheckpoint({
+        storageId: peerId,
         version: 1,
         roomName: "room",
         peerId,
@@ -754,7 +781,7 @@ describe("P2P transfer lifecycle", () => {
         type: "transfer-checkpoint",
       }),
     )
-    ws.receive({ type: "offer", peerId, sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({ negotiationId: ws.negotiationId(peerId), type: "offer", peerId, sdp: { type: "offer", sdp: "offer" } })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
@@ -785,6 +812,7 @@ describe("P2P transfer lifecycle", () => {
     }
     expect(
       writeP2PResumeCheckpoint({
+        storageId: peerId,
         version: 1,
         roomName: "room",
         peerId,
@@ -820,7 +848,7 @@ describe("P2P transfer lifecycle", () => {
     await vi.waitFor(() => expect(onPausedChange).toHaveBeenCalledWith(true))
     const ws = MockWebSocket.instances[0]
     ws.receive({ type: "ready", role: "receiver", peers: { sender: true, receivers: [] } })
-    ws.receive({ type: "offer", peerId, sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({ negotiationId: ws.negotiationId(peerId), type: "offer", peerId, sdp: { type: "offer", sdp: "offer" } })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
@@ -878,14 +906,27 @@ describe("P2P transfer lifecycle", () => {
     await vi.waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const firstPeerId = readP2PSessionPeer("room")?.peerId
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { name: "ready.bin", size: 20, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "ready.bin",
+        size: 20,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await vi.waitFor(() => expect(firstStatus).toHaveBeenLastCalledWith("File details received. Ready to receive."))
 
@@ -996,6 +1037,7 @@ describe("P2P transfer lifecycle", () => {
     channel.receive({
       type: "meta",
       meta: {
+        senderBrowser: "Test browser",
         revision: "reuse-revision",
         name: "reuse.bin",
         size: 4,
@@ -1067,6 +1109,7 @@ describe("P2P transfer lifecycle", () => {
     firstChannel.receive({
       type: "meta",
       meta: {
+        senderBrowser: "Test browser",
         revision: "recovery-revision",
         name: "recovery.bin",
         size: 4,
@@ -1151,6 +1194,7 @@ describe("P2P transfer lifecycle", () => {
     channel.receive({
       type: "meta",
       meta: {
+        senderBrowser: "Test browser",
         revision: "durable-termination",
         name: "durable.bin",
         size: 2 * 1024 * 1024,
@@ -1216,7 +1260,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
 
@@ -1234,13 +1278,13 @@ describe("P2P transfer lifecycle", () => {
     expect(metaMessage?.meta?.verifyTransfer).toStrictEqual(false)
     expect(metaMessage?.meta?.highlightLanguage).toStrictEqual("typescript")
 
-    dc.receive({ type: "download", offset: 0 })
+    dc.receive({ revision: dc.fileRevision, receiveWindow: receiveWindowBytes, type: "download", offset: 0 })
     await vi.waitFor(() => expect(readers[0]?.pendingReads).toBe(1))
     dc.receive({ type: "pause" })
     expect(
       dc.sent.some((part) => typeof part === "string" && (JSON.parse(part) as { type?: unknown }).type === "paused"),
     ).toStrictEqual(true)
-    dc.receive({ type: "download", offset: 0 })
+    dc.receive({ revision: dc.fileRevision, receiveWindow: receiveWindowBytes, type: "download", offset: 0 })
     await vi.waitFor(() => expect(readers[1]?.pendingReads).toBe(1))
 
     readers[0].resolveNext({ done: false, value: new Uint8Array([9, 9, 9, 9]) })
@@ -1261,7 +1305,7 @@ describe("P2P transfer lifecycle", () => {
     const latestPeerBeforeFeedback = onPeersChange.mock.calls[onPeersChange.mock.calls.length - 1]?.[0]?.[0]
     expect(latestPeerBeforeFeedback?.progress).toBeUndefined()
 
-    dc.receive({ type: "progress", doneBytes: 4 })
+    dc.receive({ revision: dc.fileRevision, type: "progress", doneBytes: 4 })
     const latestPeerAfterFeedback = onPeersChange.mock.calls[onPeersChange.mock.calls.length - 1]?.[0]?.[0]
     expect(latestPeerAfterFeedback?.progress?.doneBytes).toStrictEqual(4)
     expect(ws.sent.map((message) => JSON.parse(message) as { type?: string })).not.toContainEqual(
@@ -1288,7 +1332,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-invalid" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-invalid" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const dc = MockPeerConnection.instances[0].dataChannel
@@ -1296,7 +1340,9 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({ type: "receiver-pair-result", peerId: "receiver-invalid", accepted: true })
     await flushTasks()
 
-    dc.receiveData(JSON.stringify({ type: "download", offset: "0" }))
+    dc.receiveData(
+      JSON.stringify({ type: "download", revision: dc.fileRevision, receiveWindow: receiveWindowBytes, offset: "0" }),
+    )
     dc.receiveData("x".repeat(1024 * 1024 + 1))
 
     expect(onError).toHaveBeenCalledTimes(2)
@@ -1336,7 +1382,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const dc = MockPeerConnection.instances[0].dataChannel
@@ -1350,7 +1396,7 @@ describe("P2P transfer lifecycle", () => {
     expect(session.currentFile.revision).toStrictEqual(initialMeta?.meta?.revision)
     expect(initialMeta?.meta?.senderBrowser).toBeTypeOf("string")
 
-    dc.receive({ type: "download", offset: 0 })
+    dc.receive({ revision: dc.fileRevision, receiveWindow: receiveWindowBytes, type: "download", offset: 0 })
     await vi.waitFor(() => expect(oldReaders[0]?.pendingReads).toBe(1))
 
     const originalFiles = [{ name: "source/new.bin", sizeBytes: 3 }]
@@ -1386,7 +1432,7 @@ describe("P2P transfer lifecycle", () => {
     let latestPeers = onPeersChange.mock.calls[onPeersChange.mock.calls.length - 1]?.[0] || []
     expect(latestPeers.find((peer) => peer.peerId === "receiver-1")?.file.name).toStrictEqual("old.bin")
 
-    ws.receive({ type: "peer-joined", role: "receiver", peerId: "receiver-2" })
+    ws.receive({ connectionId: "test-connection", type: "peer-joined", role: "receiver", peerId: "receiver-2" })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(2))
     const newReceiverChannel = MockPeerConnection.instances[1].dataChannel
     newReceiverChannel.open()
@@ -1402,7 +1448,7 @@ describe("P2P transfer lifecycle", () => {
     dc.receive({ type: "progress", revision: initialMeta?.meta?.revision, doneBytes: 3 })
     dc.receive({ type: "received", revision: initialMeta?.meta?.revision })
 
-    dc.receive({ type: "download", revision: update?.meta?.revision, offset: 0 })
+    dc.receive({ receiveWindow: receiveWindowBytes, type: "download", revision: update?.meta?.revision, offset: 0 })
     await vi.waitFor(() => expect(newReaders[0]?.pendingReads).toBe(1))
     newReaders[0].resolveNext({ done: false, value: new Uint8Array([4, 5, 6]) })
     await vi.waitFor(() => expect(newReaders[0].pendingReads).toBe(1))
@@ -1485,7 +1531,15 @@ describe("P2P transfer lifecycle", () => {
     const { channel } = await openIncomingDataChannel(ws, "receiver-1")
     channel.receive({
       type: "meta",
-      meta: { revision: "old", name: "old.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "old",
+        name: "old.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -1494,7 +1548,15 @@ describe("P2P transfer lifecycle", () => {
 
     channel.receive({
       type: "file-update",
-      meta: { revision: "new", name: "new.bin", size: 3, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "new",
+        name: "new.bin",
+        size: 3,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await vi.waitFor(() =>
       expect(onUpdateAvailable).toHaveBeenLastCalledWith(expect.objectContaining({ name: "new.bin" })),
@@ -1536,11 +1598,27 @@ describe("P2P transfer lifecycle", () => {
     const { channel } = await openIncomingDataChannel(ws, "receiver-1")
     channel.receive({
       type: "meta",
-      meta: { revision: "old", name: "old.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "old",
+        name: "old.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     channel.receive({
       type: "file-update",
-      meta: { revision: "new", name: "new.bin", size: 3, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "new",
+        name: "new.bin",
+        size: 3,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await vi.waitFor(() => expect(onMeta).toHaveBeenLastCalledWith(expect.objectContaining({ name: "new.bin" })))
     expect(onUpdateAvailable).not.toHaveBeenCalled()
@@ -1577,28 +1655,54 @@ describe("P2P transfer lifecycle", () => {
     })
 
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "first" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "first" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const firstChannel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(firstChannel)
     firstChannel.open()
     firstChannel.receive({
       type: "meta",
-      meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
     firstChannel.receiveData(oldChunk)
     await vi.waitFor(() => expect(resolveOldChunk).toBeTypeOf("function"))
 
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "second" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "second" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(2))
     const secondChannel = MockPeerConnection.instances[1].dataChannel
     MockPeerConnection.instances[1].receiveDataChannel(secondChannel)
     secondChannel.open()
     secondChannel.receive({
       type: "meta",
-      meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
 
@@ -1632,7 +1736,15 @@ describe("P2P transfer lifecycle", () => {
     channel.receiveData(new Uint8Array([9, 9, 9, 9]).buffer)
     channel.receive({
       type: "meta",
-      meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -1660,7 +1772,12 @@ describe("P2P transfer lifecycle", () => {
     })
 
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const peer = MockPeerConnection.instances[0]
     const channel = peer.dataChannel
@@ -1668,7 +1785,15 @@ describe("P2P transfer lifecycle", () => {
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { revision: "complete", name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "complete",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -1702,14 +1827,27 @@ describe("P2P transfer lifecycle", () => {
     })
 
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { revision: "revision", name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "revision",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -1749,14 +1887,27 @@ describe("P2P transfer lifecycle", () => {
     })
 
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { revision: "revision", name: "file.bin", size: 3, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "revision",
+        name: "file.bin",
+        size: 3,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -1787,14 +1938,27 @@ describe("P2P transfer lifecycle", () => {
     })
 
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
 
@@ -1810,6 +1974,154 @@ describe("P2P transfer lifecycle", () => {
     const received = onFile.mock.calls[0][0]
     expect(Array.from(new Uint8Array(await received.arrayBuffer()))).toStrictEqual([1, 2, 3, 4])
     expect(onError).toHaveBeenCalledTimes(1)
+    session.close()
+  })
+
+  it("reports a protocol error without treating persistent storage as failed", async () => {
+    const root = {
+      *entries() {
+        yield* []
+      },
+      getFileHandle: vi.fn(() =>
+        Promise.resolve({ getFile: () => Promise.resolve(new File([new Uint8Array(4)], "file.bin")) }),
+      ),
+      removeEntry: vi.fn(() => Promise.resolve()),
+    }
+    vi.stubGlobal("Worker", MockStorageWorker)
+    vi.stubGlobal("navigator", {
+      userAgent: "Test browser",
+      storage: { getDirectory: () => Promise.resolve(root) },
+    })
+    const onError = vi.fn<(error: Error) => void>()
+    const onStatus = vi.fn<(status: string) => void>()
+    const session = startP2PReceiver("room", config, {
+      onStatus,
+      onMeta: vi.fn(),
+      onProgress: vi.fn(),
+      onPausedChange: vi.fn(),
+      onFile: vi.fn(),
+      onError,
+    })
+
+    const ws = MockWebSocket.instances[0]
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
+    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
+    const channel = MockPeerConnection.instances[0].dataChannel
+    MockPeerConnection.instances[0].receiveDataChannel(channel)
+    channel.open()
+    channel.receive({
+      type: "meta",
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
+    })
+    await flushTasks()
+    session.requestDownload()
+    await vi.waitFor(() =>
+      expect(
+        channel.sent.some(
+          (part) => typeof part === "string" && (JSON.parse(part) as { type?: string }).type === "download",
+        ),
+      ).toBe(true),
+    )
+
+    channel.receive({ type: "repair-start", index: 0, size: 4 })
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce())
+    expect(onError.mock.calls[0][0].message).toContain("Invalid P2P repair block index")
+    expect(onStatus.mock.calls.some(([status]) => status.startsWith("Disk storage failed"))).toBe(false)
+    expect(
+      channel.sent.some((part) => typeof part === "string" && (JSON.parse(part) as { type?: string }).type === "stop"),
+    ).toBe(false)
+    session.close()
+  })
+
+  it("stops on a persistent write failure", async () => {
+    class FailingStorageWorker extends MockStorageWorker {
+      override postMessage(
+        message: { id: number; type: string; checkpointBytes?: number; tailOffset?: number },
+        transfer: Transferable[] = [],
+      ) {
+        if (message.type === "write") {
+          queueMicrotask(() =>
+            this.onmessage?.(new MessageEvent("message", { data: { id: message.id, ok: false, error: "disk full" } })),
+          )
+          return
+        }
+        super.postMessage(message, transfer)
+      }
+    }
+    const root = {
+      *entries() {
+        yield* []
+      },
+    }
+    vi.stubGlobal("Worker", FailingStorageWorker)
+    vi.stubGlobal("navigator", {
+      userAgent: "Test browser",
+      storage: { getDirectory: () => Promise.resolve(root) },
+    })
+    const onError = vi.fn<(error: Error) => void>()
+    const onStatus = vi.fn<(status: string) => void>()
+    const session = startP2PReceiver("room", config, {
+      onStatus,
+      onMeta: vi.fn(),
+      onProgress: vi.fn(),
+      onPausedChange: vi.fn(),
+      onFile: vi.fn(),
+      onError,
+    })
+
+    const ws = MockWebSocket.instances[0]
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
+    await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
+    const channel = MockPeerConnection.instances[0].dataChannel
+    MockPeerConnection.instances[0].receiveDataChannel(channel)
+    channel.open()
+    channel.receive({
+      type: "meta",
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "file.bin",
+        size: 2 * 1024 * 1024,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
+    })
+    await flushTasks()
+    session.requestDownload()
+    await vi.waitFor(() =>
+      expect(
+        channel.sent.some(
+          (part) => typeof part === "string" && (JSON.parse(part) as { type?: string }).type === "download",
+        ),
+      ).toBe(true),
+    )
+
+    channel.receiveData(new ArrayBuffer(1024 * 1024))
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce())
+    expect(onError.mock.calls[0][0].message).toContain("Unable to write the P2P temporary file: disk full")
+    expect(onStatus.mock.calls.some(([status]) => status === "Disk storage failed. Stopping transfer...")).toBe(true)
+    expect(
+      channel.sent.some((part) => typeof part === "string" && (JSON.parse(part) as { type?: string }).type === "stop"),
+    ).toBe(true)
     session.close()
   })
 
@@ -1854,7 +2166,12 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
@@ -1862,6 +2179,8 @@ describe("P2P transfer lifecycle", () => {
     channel.receive({
       type: "meta",
       meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
         name: "large.txt",
         size: 64 * 1024 * 1024,
         type: "text/plain",
@@ -1933,14 +2252,27 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { revision: "old", name: "old.bin", size: 1, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "old",
+        name: "old.bin",
+        size: 1,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -1950,7 +2282,15 @@ describe("P2P transfer lifecycle", () => {
 
     channel.receive({
       type: "file-update",
-      meta: { revision: "new", name: "new.bin", size: 1, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "new",
+        name: "new.bin",
+        size: 1,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.acceptUpdate()
@@ -2011,14 +2351,27 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { revision: "three-mib", name: "3m.bin", size: fileSize, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "three-mib",
+        name: "3m.bin",
+        size: fileSize,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -2070,14 +2423,27 @@ describe("P2P transfer lifecycle", () => {
       onError,
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { revision: "truncated", name: "truncated.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "truncated",
+        name: "truncated.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -2119,7 +2485,12 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
@@ -2127,6 +2498,8 @@ describe("P2P transfer lifecycle", () => {
     channel.receive({
       type: "meta",
       meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
         name: "large.bin",
         size: 64 * 1024 * 1024,
         type: "application/octet-stream",
@@ -2185,7 +2558,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const dc = MockPeerConnection.instances[0].dataChannel
@@ -2193,7 +2566,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({ type: "receiver-pair-result", peerId: "receiver-1", accepted: true })
     await flushTasks()
 
-    dc.receive({ type: "download", offset: 0 })
+    dc.receive({ revision: dc.fileRevision, receiveWindow: receiveWindowBytes, type: "download", offset: 0 })
     await vi.waitFor(() =>
       expect(
         dc.sent.some((part) => typeof part === "string" && (JSON.parse(part) as { type?: unknown }).type === "done"),
@@ -2203,7 +2576,67 @@ describe("P2P transfer lifecycle", () => {
     session.close()
   })
 
-  it("builds the verification manifest from the file stream being sent", async () => {
+  it("bounds a slow receiver's queued bytes and resumes after pausing a full window", async () => {
+    const mib = 1024 * 1024
+    const bytes = new Uint8Array(3 * mib).fill(7)
+    const file = {
+      name: "window.bin",
+      size: bytes.length,
+      type: "application/octet-stream",
+      lastModified: 0,
+      slice: (start = 0, end = bytes.length) => ({
+        stream: () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(bytes.subarray(start, end))
+              controller.close()
+            },
+          }),
+      }),
+    } as unknown as File
+    const onError = vi.fn()
+    const session = await startP2PSender(file, config, "1h", "1", false, {
+      onStatus: vi.fn(),
+      onPeersChange: vi.fn(),
+      onError,
+    })
+    try {
+      const ws = MockWebSocket.instances[0]
+      ws.receive({
+        type: "ready",
+        role: "sender",
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
+      })
+      await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
+      const dc = MockPeerConnection.instances[0].dataChannel
+      dc.open()
+      ws.receive({ type: "receiver-pair-result", peerId: "receiver-1", accepted: true })
+      await flushTasks()
+      const sentBytes = () => dc.sent.reduce((sum, part) => sum + (typeof part === "string" ? 0 : part.byteLength), 0)
+      dc.receive({ revision: dc.fileRevision, type: "download", offset: 0, receiveWindow: mib })
+      await vi.waitFor(() => expect(sentBytes()).toBe(mib))
+      dc.receive({ revision: dc.fileRevision, type: "progress", doneBytes: 0, flowBytes: bytes.length }) // Impossible future credit.
+      await flushTasks()
+      expect(sentBytes()).toBe(mib)
+      dc.receive({ revision: dc.fileRevision, type: "progress", doneBytes: mib, flowBytes: mib })
+      await vi.waitFor(() => expect(sentBytes()).toBe(2 * mib))
+      dc.receive({ type: "pause" })
+      await flushTasks()
+      expect(sentBytes()).toBe(2 * mib)
+      dc.receive({ revision: dc.fileRevision, type: "download", offset: 2 * mib, receiveWindow: mib })
+      await vi.waitFor(() => expect(sentBytes()).toBe(bytes.length))
+      await vi.waitFor(() =>
+        expect(
+          dc.sent.some((part) => typeof part === "string" && (JSON.parse(part) as { type?: string }).type === "done"),
+        ).toBe(true),
+      )
+      expect(onError).not.toHaveBeenCalled()
+    } finally {
+      session.close()
+    }
+  })
+
+  it("publishes the streamed manifest despite immediate credit and bounds subsequent repair sends", async () => {
     const bytes = new Uint8Array(verificationBlockSize + 17)
     bytes.fill(0x5a, 0, verificationBlockSize)
     bytes.fill(0xa5, verificationBlockSize)
@@ -2246,7 +2679,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const dc = MockPeerConnection.instances[0].dataChannel
@@ -2254,7 +2687,21 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({ type: "receiver-pair-result", peerId: "receiver-1", accepted: true })
     await flushTasks()
 
-    dc.receive({ type: "download", offset: 0 })
+    let creditedBytes = 0
+    const send = dc.send.bind(dc)
+    vi.spyOn(dc, "send").mockImplementation((data) => {
+      send(data)
+      if (typeof data !== "string") {
+        creditedBytes += data.byteLength
+        dc.receive({
+          revision: dc.fileRevision,
+          type: "progress",
+          doneBytes: Math.min(bytes.length, creditedBytes),
+          flowBytes: creditedBytes,
+        })
+      }
+    })
+    dc.receive({ revision: dc.fileRevision, type: "download", offset: 0, receiveWindow: 1024 * 1024 })
     await vi.waitFor(() =>
       expect(
         dc.sent.some((part) => typeof part === "string" && (JSON.parse(part) as { type?: string }).type === "done"),
@@ -2279,6 +2726,15 @@ describe("P2P transfer lifecycle", () => {
     expect(slice).toHaveBeenCalledWith(0)
     expect(arrayBuffer).not.toHaveBeenCalled()
     expect(onError).not.toHaveBeenCalled()
+    dc.receive({ type: "repair-request", indices: [0] })
+    await vi.waitFor(() =>
+      expect(
+        dc.sent.some(
+          (part) => typeof part === "string" && (JSON.parse(part) as { type?: string }).type === "repair-end",
+        ),
+      ).toBe(true),
+    )
+    expect(creditedBytes).toBe(bytes.length + verificationBlockSize)
     session.close()
   })
 
@@ -2308,7 +2764,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
@@ -2316,7 +2772,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({ type: "receiver-pair-result", peerId: "receiver-1", accepted: true })
     await flushTasks()
 
-    channel.receive({ type: "download", offset: 0 })
+    channel.receive({ revision: channel.fileRevision, receiveWindow: receiveWindowBytes, type: "download", offset: 0 })
 
     const expectedMessage =
       'Could not read "deleted-during-p2p.bin". It may have been moved, deleted, or changed since it was selected. ' +
@@ -2362,7 +2818,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
@@ -2374,7 +2830,7 @@ describe("P2P transfer lifecycle", () => {
       channel.sent
         .filter((part): part is string => typeof part === "string")
         .map((part) => JSON.parse(part) as { type: string; message?: string })
-    channel.receive({ type: "download", offset: 0 })
+    channel.receive({ revision: channel.fileRevision, receiveWindow: receiveWindowBytes, type: "download", offset: 0 })
     await vi.waitFor(() => expect(controlMessages().some((message) => message.type === "done")).toStrictEqual(true))
 
     unreadable = true
@@ -2432,7 +2888,13 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }, { peerId: "receiver-2" }] },
+      peers: {
+        sender: true,
+        receivers: [
+          { connectionId: "test-connection", peerId: "receiver-1" },
+          { connectionId: "test-connection", peerId: "receiver-2" },
+        ],
+      },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(2))
     const [firstChannel, secondChannel] = MockPeerConnection.instances.map((peer) => peer.dataChannel)
@@ -2442,9 +2904,19 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({ type: "receiver-pair-result", peerId: "receiver-2", accepted: true })
     await flushTasks()
 
-    firstChannel.receive({ type: "download", offset: 0 })
+    firstChannel.receive({
+      revision: firstChannel.fileRevision,
+      receiveWindow: receiveWindowBytes,
+      type: "download",
+      offset: 0,
+    })
     await vi.waitFor(() => expect(firstController).toBeDefined())
-    secondChannel.receive({ type: "download", offset: 0 })
+    secondChannel.receive({
+      revision: secondChannel.fileRevision,
+      receiveWindow: receiveWindowBytes,
+      type: "download",
+      offset: 0,
+    })
     await flushTasks()
     expect(
       secondChannel.sent
@@ -2509,7 +2981,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
@@ -2517,7 +2989,12 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({ type: "receiver-pair-result", peerId: "receiver-1", accepted: true })
     await flushTasks()
 
-    channel.receive({ type: "download", offset: fileSize - 1 })
+    channel.receive({
+      revision: channel.fileRevision,
+      receiveWindow: receiveWindowBytes,
+      type: "download",
+      offset: fileSize - 1,
+    })
     await vi.waitFor(() => expect(verificationSlices).toHaveLength(1))
     session.close()
     resolveFirstBlock(new ArrayBuffer(verificationBlockSize))
@@ -2559,7 +3036,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
@@ -2576,7 +3053,7 @@ describe("P2P transfer lifecycle", () => {
     await flushTasks()
     expect(controlMessages().filter((message) => message.type === "repair-start")).toHaveLength(0)
 
-    channel.receive({ type: "download", offset: 0 })
+    channel.receive({ revision: channel.fileRevision, receiveWindow: receiveWindowBytes, type: "download", offset: 0 })
     await vi.waitFor(() => expect(controlMessages().some((message) => message.type === "done")).toStrictEqual(true))
     await flushTasks()
 
@@ -2606,8 +3083,10 @@ describe("P2P transfer lifecycle", () => {
     const hash = await xxh3Hex([bytes.buffer])
     const onFile = vi.fn<(file: File) => void>()
     const onError = vi.fn<(error: Error) => void>()
+    const onTransferStatusChange = vi.fn<(status: string) => void>()
     const session = startP2PReceiver("room", config, {
       onStatus: vi.fn(),
+      onTransferStatusChange,
       onMeta: vi.fn(),
       onProgress: vi.fn(),
       onPausedChange: vi.fn(),
@@ -2616,14 +3095,27 @@ describe("P2P transfer lifecycle", () => {
     })
 
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { name: "verified.bin", size: bytes.byteLength, type: "", lastModified: 0, verifyTransfer: true },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "verified.bin",
+        size: bytes.byteLength,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: true,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -2638,6 +3130,10 @@ describe("P2P transfer lifecycle", () => {
       .map((part) => (JSON.parse(part) as { type: string }).type)
     expect(sentTypes).toContain("verified")
     expect(sentTypes).toContain("received")
+    expect(onTransferStatusChange.mock.calls.map(([status]) => status)).toEqual(
+      expect.arrayContaining(["DOWNLOADING", "VERIFYING", "DONE"]),
+    )
+    expect(onTransferStatusChange).toHaveBeenLastCalledWith("DONE")
     expect(onError).not.toHaveBeenCalled()
     session.close()
   })
@@ -2654,14 +3150,27 @@ describe("P2P transfer lifecycle", () => {
     })
 
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { name: "verified.bin", size: 4, type: "", lastModified: 0, verifyTransfer: true },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "verified.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: true,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -2685,7 +3194,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const peer = MockPeerConnection.instances[0]
@@ -2700,7 +3209,7 @@ describe("P2P transfer lifecycle", () => {
     expect(peer.onconnectionstatechange).toBeNull()
     expect(peer.dataChannel.onopen).toBeNull()
     expect(peer.dataChannel.onmessage).toBeNull()
-    ws.receive({ type: "peer-joined", role: "receiver", peerId: "receiver-2" })
+    ws.receive({ connectionId: "test-connection", type: "peer-joined", role: "receiver", peerId: "receiver-2" })
     await flushTasks()
     expect(MockPeerConnection.instances).toHaveLength(1)
   })
@@ -2717,7 +3226,12 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const peer = MockPeerConnection.instances[0]
     peer.receiveDataChannel()
@@ -2733,7 +3247,12 @@ describe("P2P transfer lifecycle", () => {
     expect(peer.ondatachannel).toBeNull()
     expect(peer.dataChannel.onopen).toBeNull()
     expect(peer.dataChannel.onmessage).toBeNull()
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "late" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "late" },
+    })
     await flushTasks()
     expect(MockPeerConnection.instances).toHaveLength(1)
   })
@@ -2801,7 +3320,12 @@ describe("P2P transfer lifecycle", () => {
     expect(onStatus).toHaveBeenLastCalledWith("Receiver limit reached. Existing receivers can continue.")
     expect(ws.readyState).toStrictEqual(MockWebSocket.OPEN)
 
-    ws.receive({ type: "peer-joined", role: "receiver", peerId: "receiver-after-limit" })
+    ws.receive({
+      connectionId: "test-connection",
+      type: "peer-joined",
+      role: "receiver",
+      peerId: "receiver-after-limit",
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     session.close()
   })
@@ -2823,14 +3347,27 @@ describe("P2P transfer lifecycle", () => {
     })
 
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
     MockPeerConnection.instances[0].receiveDataChannel(channel)
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
 
@@ -2861,7 +3398,7 @@ describe("P2P transfer lifecycle", () => {
         .filter((part): part is string => typeof part === "string")
         .map((part) => JSON.parse(part) as { type?: string; doneBytes?: number })
         .filter((message) => message.type === "progress"),
-    ).toContainEqual({ type: "progress", doneBytes: 2 })
+    ).toContainEqual({ type: "progress", revision: "test-revision", doneBytes: 2 })
 
     session.resume()
     await vi.waitFor(() => expect(downloadMessages()).toHaveLength(2))
@@ -2884,7 +3421,12 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const socket = MockWebSocket.instances[0]
-    socket.receive({ type: "offer", peerId: "sender", sdp: { type: "offer", sdp: "offer" } })
+    socket.receive({
+      negotiationId: socket.negotiationId("sender"),
+      type: "offer",
+      peerId: "sender",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const firstPeer = MockPeerConnection.instances[0]
     const firstChannel = firstPeer.dataChannel
@@ -2892,7 +3434,15 @@ describe("P2P transfer lifecycle", () => {
     firstChannel.open()
     firstChannel.receive({
       type: "meta",
-      meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()
@@ -2916,7 +3466,15 @@ describe("P2P transfer lifecycle", () => {
     rebuiltChannel.open()
     rebuiltChannel.receive({
       type: "meta",
-      meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        revision: "test-revision",
+        senderBrowser: "Test browser",
+        name: "file.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
 
@@ -2963,6 +3521,7 @@ describe("P2P transfer lifecycle", () => {
   it("stops retained receiver retries after a room availability probe confirms a terminal response", async () => {
     const peerId = "00000000-0000-4000-8000-000000000054"
     writeP2PResumeCheckpoint({
+      storageId: peerId,
       version: 1,
       roomName: "room",
       peerId,
@@ -3047,7 +3606,12 @@ describe("P2P transfer lifecycle", () => {
         }),
       })
       const ws = MockWebSocket.instances[0]
-      ws.receive({ type: "offer", peerId: "sender", sdp: { type: "offer", sdp: "offer" } })
+      ws.receive({
+        negotiationId: ws.negotiationId("sender"),
+        type: "offer",
+        peerId: "sender",
+        sdp: { type: "offer", sdp: "offer" },
+      })
       await vi.advanceTimersByTimeAsync(0)
       const peer = MockPeerConnection.instances[0]
       const channel = peer.dataChannel
@@ -3056,6 +3620,7 @@ describe("P2P transfer lifecycle", () => {
       channel.receive({
         type: "meta",
         meta: {
+          senderBrowser: "Test browser",
           revision: "recovery-revision",
           name: "recovery.bin",
           size: 4,
@@ -3182,7 +3747,7 @@ describe("P2P transfer lifecycle", () => {
       ws.receive({
         type: "ready",
         role: "sender",
-        peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
       })
       await vi.advanceTimersByTimeAsync(0)
       const firstPeer = MockPeerConnection.instances[0]
@@ -3244,7 +3809,7 @@ describe("P2P transfer lifecycle", () => {
       ws.receive({
         type: "ready",
         role: "sender",
-        peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
       })
       await vi.advanceTimersByTimeAsync(0)
       const firstPeer = MockPeerConnection.instances[0]
@@ -3286,6 +3851,7 @@ describe("P2P transfer lifecycle", () => {
       const attemptsAfterFailure = MockPeerConnection.instances.length
       ws.receive({ type: "peer-reconnect-request", peerId: "receiver-1" })
       ws.receive({
+        connectionId: "test-connection",
         type: "peer-signaling-disconnected",
         role: "receiver",
         peerId: "receiver-1",
@@ -3318,7 +3884,7 @@ describe("P2P transfer lifecycle", () => {
       ws.receive({
         type: "ready",
         role: "sender",
-        peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
       })
       await vi.advanceTimersByTimeAsync(0)
       const firstPeer = MockPeerConnection.instances[0]
@@ -3348,6 +3914,7 @@ describe("P2P transfer lifecycle", () => {
 
       ws.receive({ type: "peer-reconnect-request", peerId: "receiver-1" })
       ws.receive({
+        connectionId: "test-connection",
         type: "peer-signaling-disconnected",
         role: "receiver",
         peerId: "receiver-1",
@@ -3358,7 +3925,7 @@ describe("P2P transfer lifecycle", () => {
         connectionPhase: "reconnect-failed",
       })
 
-      ws.receive({ type: "peer-joined", role: "receiver", peerId: "receiver-1" })
+      ws.receive({ connectionId: "test-connection", type: "peer-joined", role: "receiver", peerId: "receiver-1" })
       await vi.advanceTimersByTimeAsync(0)
       expect(MockPeerConnection.instances).toHaveLength(attemptsAfterFailure)
 
@@ -3454,7 +4021,7 @@ describe("P2P transfer lifecycle", () => {
       firstSocket.receive({
         type: "ready",
         role: "sender",
-        peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
       })
       await vi.advanceTimersByTimeAsync(0)
       const peer = MockPeerConnection.instances[0]
@@ -3475,7 +4042,7 @@ describe("P2P transfer lifecycle", () => {
       reconnectedSocket.receive({
         type: "ready",
         role: "sender",
-        peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
       })
       await vi.advanceTimersByTimeAsync(0)
 
@@ -3507,7 +4074,12 @@ describe("P2P transfer lifecycle", () => {
         }),
       })
       const firstSocket = MockWebSocket.instances[0]
-      firstSocket.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+      firstSocket.receive({
+        negotiationId: firstSocket.negotiationId("receiver-1"),
+        type: "offer",
+        peerId: "receiver-1",
+        sdp: { type: "offer", sdp: "offer" },
+      })
       await vi.advanceTimersByTimeAsync(0)
       const peer = MockPeerConnection.instances[0]
       const channel = peer.dataChannel
@@ -3515,7 +4087,15 @@ describe("P2P transfer lifecycle", () => {
       channel.open()
       channel.receive({
         type: "meta",
-        meta: { name: "file.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+        meta: {
+          revision: "test-revision",
+          senderBrowser: "Test browser",
+          name: "file.bin",
+          size: 4,
+          type: "",
+          lastModified: 0,
+          verifyTransfer: false,
+        },
       })
       await vi.advanceTimersByTimeAsync(0)
       session.requestDownload()
@@ -3554,7 +4134,7 @@ describe("P2P transfer lifecycle", () => {
       firstSocket.receive({
         type: "ready",
         role: "sender",
-        peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
       })
       await vi.advanceTimersByTimeAsync(0)
       const peer = MockPeerConnection.instances[0]
@@ -3572,7 +4152,7 @@ describe("P2P transfer lifecycle", () => {
       reconnectedSocket.receive({
         type: "ready",
         role: "sender",
-        peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
       })
       await vi.advanceTimersByTimeAsync(0)
       expect(MockPeerConnection.instances).toHaveLength(2)
@@ -3599,7 +4179,7 @@ describe("P2P transfer lifecycle", () => {
         firstSocket.receive({
           type: "ready",
           role: "sender",
-          peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+          peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
         })
         await vi.advanceTimersByTimeAsync(0)
         const firstPeer = MockPeerConnection.instances[0]
@@ -3616,6 +4196,7 @@ describe("P2P transfer lifecycle", () => {
           firstSocket.onclose?.call(firstSocket as unknown as WebSocket, new CloseEvent("close"))
         } else {
           firstSocket.receive({
+            connectionId: "test-connection",
             type: "peer-signaling-disconnected",
             role: "receiver",
             peerId: "receiver-1",
@@ -3630,9 +4211,9 @@ describe("P2P transfer lifecycle", () => {
             ? {
                 type: "ready",
                 role: "sender",
-                peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+                peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
               }
-            : { type: "peer-joined", role: "receiver", peerId: "receiver-1" },
+            : { connectionId: "test-connection", type: "peer-joined", role: "receiver", peerId: "receiver-1" },
         )
         await vi.advanceTimersByTimeAsync(0)
         expect(MockPeerConnection.instances).toHaveLength(3)
@@ -3729,7 +4310,12 @@ describe("P2P transfer lifecycle", () => {
         }),
       })
       const firstSocket = MockWebSocket.instances[0]
-      firstSocket.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+      firstSocket.receive({
+        negotiationId: firstSocket.negotiationId("receiver-1"),
+        type: "offer",
+        peerId: "receiver-1",
+        sdp: { type: "offer", sdp: "offer" },
+      })
       await vi.advanceTimersByTimeAsync(0)
       const peer = MockPeerConnection.instances[0]
       peer.receiveDataChannel()
@@ -3773,7 +4359,7 @@ describe("P2P transfer lifecycle", () => {
     ws.receive({
       type: "ready",
       role: "sender",
-      peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+      peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
     })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const channel = MockPeerConnection.instances[0].dataChannel
@@ -3815,7 +4401,7 @@ describe("P2P transfer lifecycle", () => {
       ws.receive({
         type: "ready",
         role: "sender",
-        peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
       })
       await vi.advanceTimersByTimeAsync(0)
       const channel = MockPeerConnection.instances[0].dataChannel
@@ -3849,7 +4435,12 @@ describe("P2P transfer lifecycle", () => {
         isWaitingForResume: true,
       })
 
-      reconnectedSocket.receive({ type: "peer-joined", role: "receiver", peerId: "receiver-1" })
+      reconnectedSocket.receive({
+        connectionId: "test-connection",
+        type: "peer-joined",
+        role: "receiver",
+        peerId: "receiver-1",
+      })
       await vi.advanceTimersByTimeAsync(0)
       expect(MockPeerConnection.instances).toHaveLength(2)
       expect(onPeersChange.mock.calls[onPeersChange.mock.calls.length - 1]?.[0]?.[0]).toMatchObject({
@@ -3877,7 +4468,7 @@ describe("P2P transfer lifecycle", () => {
       ws.receive({
         type: "ready",
         role: "sender",
-        peers: { sender: true, receivers: [{ peerId: "receiver-1" }] },
+        peers: { sender: true, receivers: [{ connectionId: "test-connection", peerId: "receiver-1" }] },
       })
       await vi.advanceTimersByTimeAsync(0)
       expect(MockPeerConnection.instances).toHaveLength(1)
@@ -3891,7 +4482,7 @@ describe("P2P transfer lifecycle", () => {
       const superseded = session.updateFile(supersededFile, false)
       session.updateFile(new File(["latest"], "latest.bin"), false)
       await vi.advanceTimersByTimeAsync(30_000)
-      channel.receive({ type: "download", revision: superseded.revision, offset: 0 })
+      channel.receive({ receiveWindow: receiveWindowBytes, type: "download", revision: superseded.revision, offset: 0 })
 
       expect(supersededSlice).not.toHaveBeenCalled()
       expect(
@@ -3938,7 +4529,12 @@ describe("P2P transfer lifecycle", () => {
       }),
     })
     const ws = MockWebSocket.instances[0]
-    ws.receive({ type: "offer", peerId: "receiver-1", sdp: { type: "offer", sdp: "offer" } })
+    ws.receive({
+      negotiationId: ws.negotiationId("receiver-1"),
+      type: "offer",
+      peerId: "receiver-1",
+      sdp: { type: "offer", sdp: "offer" },
+    })
     await vi.waitFor(() => expect(MockPeerConnection.instances).toHaveLength(1))
     const peer = MockPeerConnection.instances[0]
     const channel = peer.dataChannel
@@ -3946,7 +4542,15 @@ describe("P2P transfer lifecycle", () => {
     channel.open()
     channel.receive({
       type: "meta",
-      meta: { revision: "old", name: "old.bin", size: 4, type: "", lastModified: 0, verifyTransfer: false },
+      meta: {
+        senderBrowser: "Test browser",
+        revision: "old",
+        name: "old.bin",
+        size: 4,
+        type: "",
+        lastModified: 0,
+        verifyTransfer: false,
+      },
     })
     await flushTasks()
     session.requestDownload()

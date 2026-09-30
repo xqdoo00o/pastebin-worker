@@ -43,6 +43,7 @@ export class CapturePipeline {
   private lastVideoFrameCopyErrorAt = -Infinity
   private lastReadbackMediaTime = -Infinity
   private currentMode: CaptureMode
+  private currentVideoFrameFormat: string | null = null
 
   constructor({ video, pool, isDone, onModeChange, forceReadback = false }: CapturePipelineOptions) {
     this.video = video
@@ -57,9 +58,17 @@ export class CapturePipeline {
     return this.currentMode
   }
 
+  get backendLabel(): string {
+    const backend = this.currentMode.startsWith("videoframe")
+      ? `${this.currentMode} ${this.currentVideoFrameFormat ?? "format unavailable"}`
+      : this.currentMode
+    return `${backend} capture`
+  }
+
   start(track: MediaStreamTrack): void {
     const generation = ++this.generation
     this.stopVideoFrameCapture()
+    this.currentVideoFrameFormat = null
     this.startPipeline(track, generation)
   }
 
@@ -74,6 +83,7 @@ export class CapturePipeline {
     this.videoFrameCopyErrorStreak = 0
     this.lastVideoFrameCopyErrorAt = -Infinity
     this.currentMode = "readback"
+    this.currentVideoFrameFormat = null
   }
 
   restartWorkerSource(track: MediaStreamTrack): void {
@@ -131,6 +141,10 @@ export class CapturePipeline {
   }
 
   private captureVideoFrame(frame: VideoFrame): void {
+    if (this.currentVideoFrameFormat !== frame.format) {
+      this.currentVideoFrameFormat = frame.format
+      this.onModeChange()
+    }
     if (this.pool.busyCount >= this.pool.size) {
       frame.close()
       return
@@ -191,6 +205,7 @@ export class CapturePipeline {
   private startCanvasCapture(generation: number): void {
     this.lastReadbackMediaTime = -Infinity
     this.currentMode = "readback"
+    this.currentVideoFrameFormat = null
     this.scheduleFrame(generation)
     this.onModeChange()
   }

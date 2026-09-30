@@ -18,9 +18,7 @@ interface ReceiverTransferOptions {
   assembler: MultipartOpticalAssembler
   fountainClient: FountainWorkerClient
   receivedFile: ReceivedFileResource
-  setReceiverPhase: (phase: "receiving") => void
   renderReceiverStatus: () => void
-  showError: (message: string) => void
   offerRetry: (message: string) => void
   teardownReceiver: () => Promise<void>
   suspendReceiver: () => Promise<void>
@@ -47,7 +45,7 @@ export class ReceiverTransferCoordinator {
     if (message.type === "verdict") {
       if (message.message !== null) {
         this.verdictShown = message.message
-        this.options.showError(message.message)
+        this.options.view.showError(message.message)
         if (message.reason === "transfer" && session.mode === "apng") {
           runtime.rejectApngAttempt(new OpticalPartTransferMismatchError(message.message))
         }
@@ -105,7 +103,10 @@ export class ReceiverTransferCoordinator {
   private applySnapshot(snapshot: FountainSnapshot, started: boolean): void {
     const { runtime, view } = this.options
     const streamStarted = runtime.applySnapshot(snapshot, started)
-    if (runtime.phase !== "receiving") this.options.setReceiverPhase("receiving")
+    if (runtime.phase !== "receiving") {
+      runtime.phase = "receiving"
+      this.options.renderReceiverStatus()
+    }
     if (streamStarted) view.patchProgress({ visible: true })
     this.updateProgress()
   }
@@ -132,17 +133,19 @@ export class ReceiverTransferCoordinator {
     })
   }
 
-  private async accumulatePart(file: OpticalFile) {
+  private async accumulatePart(file: OpticalFile, isCurrent: () => boolean) {
     if (file.compression === "zstd-fragment") await ensureZstdDecoderReady()
+    if (!isCurrent()) return
     await ensureXXHashReady()
+    if (!isCurrent()) return
     const completed = await this.options.assembler.accept(file)
-    this.renderPartStatus()
+    if (isCurrent()) this.renderPartStatus()
     return completed
   }
 
   private async finish(container: Uint8Array, part: OpticalPart, seconds: number): Promise<void> {
     const { assembler, receivedFile, releaseDecodeWorkers, resetReceiver, runtime, session, view } = this.options
-    session.complete()
+    const isCurrent = session.complete()
     const progressCompleted = this.waitForProgressCompletion()
     const unpacked = unpackFile(container, part, ensureZstdDecoderReady).then(
       (file) => ({ ok: true as const, file }),
@@ -155,18 +158,22 @@ export class ReceiverTransferCoordinator {
       eta: `${formatDuration(seconds)} total`,
     })
     await progressCompleted
+    if (!isCurrent()) return
     view.patch({ previewVisible: false })
     await this.options.suspendReceiver()
+    if (!isCurrent()) return
 
     let file: OpticalFile
     try {
       const unpackResult = await unpacked
+      if (!isCurrent()) return
       if (!unpackResult.ok) throw unpackResult.error
       file = unpackResult.file
     } catch (error) {
+      if (!isCurrent()) return
       releaseDecodeWorkers()
       view.patchProgress({ error: true, eta: "Transfer failed" })
-      this.options.showError(errorMessage(error))
+      view.showError(errorMessage(error))
       view.patch({ result: { kind: "failure" } })
       return
     }
@@ -178,14 +185,18 @@ export class ReceiverTransferCoordinator {
       session.markDelivered()
       receivedFile.release()
       resetReceiver()
-      this.options.showError(error.message)
+      view.showError(error.message)
       return
     }
 
     if (file.part.count !== 0) {
       session.markDelivered()
       try {
-        const stored = await this.accumulatePart(file)
+        const stored = await this.accumulatePart(file, isCurrent)
+        if (!isCurrent()) {
+          await stored?.cleanup().catch(() => undefined)
+          return
+        }
         if (!stored) {
           resetReceiver()
           return
@@ -206,17 +217,18 @@ export class ReceiverTransferCoordinator {
           },
         })
       } catch (error) {
+        if (!isCurrent()) return
         if (error instanceof OpticalPartTransferMismatchError) {
           receivedFile.release()
           resetReceiver()
-          this.options.showError(error.message)
+          view.showError(error.message)
           return
         }
         releaseDecodeWorkers()
         receivedFile.release()
         this.resetParts()
         view.patchProgress({ error: true, eta: "Transfer failed" })
-        this.options.showError(errorMessage(error))
+        view.showError(errorMessage(error))
         view.patch({ result: { kind: "failure" } })
       }
       return

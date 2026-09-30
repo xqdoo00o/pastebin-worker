@@ -1,6 +1,28 @@
 import { describe, it, expect } from "vitest"
 
-import { timingSafeEqual } from "../common.js"
+import { jsonResponse, timingSafeEqual } from "../common.js"
+
+describe("jsonResponse", () => {
+  it.each([
+    { etag: '"uploaded"' },
+    new Headers({ etag: '"uploaded"' }),
+    [["etag", '"uploaded"']] as [string, string][],
+  ])("preserves response headers for every HeadersInit representation", async (headers) => {
+    const response = jsonResponse({ ok: true }, { headers, status: 201 })
+    expect(response.status).toBe(201)
+    expect(response.headers.get("etag")).toBe('"uploaded"')
+    expect(response.headers.get("content-type")).toBe("application/json;charset=UTF-8")
+    expect(await response.json()).toEqual({ ok: true })
+  })
+
+  it("preserves an explicit content type without mutating the supplied headers", () => {
+    const headers = new Headers({ "Content-Type": "application/problem+json" })
+    expect(jsonResponse({}, { headers }).headers.get("content-type")).toBe("application/problem+json")
+    const empty = new Headers()
+    jsonResponse({}, { headers: empty })
+    expect(empty.has("content-type")).toBe(false)
+  })
+})
 
 describe("timingSafeEqual", () => {
   it("returns true for equal strings", () => {

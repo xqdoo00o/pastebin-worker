@@ -1,0 +1,319 @@
+diff --git a/core/src/qrcode/QRBitMatrixParser.cpp b/core/src/qrcode/QRBitMatrixParser.cpp
+--- a/core/src/qrcode/QRBitMatrixParser.cpp
++++ b/core/src/qrcode/QRBitMatrixParser.cpp
+@@ -39,40 +39,8 @@
+ 	return nullptr;
+ }
+ 
+-FormatInformation ReadFormatInformation(const BitMatrix& bitMatrix)
+-{
+-	if (Version::HasValidSize(bitMatrix, Type::Micro)) {
+-		// Read top-left format info bits
+-		int formatInfoBits = 0;
+-		for (int x = 1; x < 9; x++)
+-			AppendBit(formatInfoBits, getBit(bitMatrix, x, 8));
+-		for (int y = 7; y >= 1; y--)
+-			AppendBit(formatInfoBits, getBit(bitMatrix, 8, y));
+-
+-		return FormatInformation::DecodeMQR(formatInfoBits);
+-	}
+-	if (Version::HasValidSize(bitMatrix, Type::rMQR)) {
+-		// Read top-left format info bits
+-		uint32_t formatInfoBits1 = 0;
+-		for (int y = 3; y >= 1; y--)
+-			AppendBit(formatInfoBits1, getBit(bitMatrix, 11, y));
+-		for (int x = 10; x >= 8; x--)
+-			for (int y = 5; y >= 1; y--)
+-				AppendBit(formatInfoBits1, getBit(bitMatrix, x, y));
+-
+-		// Read bottom-right format info bits
+-		uint32_t formatInfoBits2 = 0;
+-		const int width = bitMatrix.width();
+-		const int height = bitMatrix.height();
+-		for (int x = 3; x <= 5; x++)
+-			AppendBit(formatInfoBits2, getBit(bitMatrix, width - x, height - 6));
+-		for (int x = 6; x <= 8; x++)
+-			for (int y = 2; y <= 6; y++)
+-				AppendBit(formatInfoBits2, getBit(bitMatrix, width - x, height - y));
+-
+-		return FormatInformation::DecodeRMQR(formatInfoBits1, formatInfoBits2);
+-	}
+-
++static std::pair<uint32_t, uint32_t> ReadQRFormatBits(const BitMatrix& bitMatrix)
++{
+ 	// Read top-left format info bits
+ 	int formatInfoBits1 = 0;
+ 	for (int x = 0; x < 6; x++)
+@@ -95,9 +63,53 @@
+ 	for (int x = dimension - 8; x < dimension; x++)
+ 		AppendBit(formatInfoBits2, getBit(bitMatrix, x, 8));
+ 
+-	return FormatInformation::DecodeQR(formatInfoBits1, formatInfoBits2);
+-}
+-
++	return {formatInfoBits1, formatInfoBits2};
++}
++
++FormatInformation ReadFormatInformation(const BitMatrix& bitMatrix)
++{
++	if (Version::HasValidSize(bitMatrix, Type::Micro)) {
++		// Read top-left format info bits
++		int formatInfoBits = 0;
++		for (int x = 1; x < 9; x++)
++			AppendBit(formatInfoBits, getBit(bitMatrix, x, 8));
++		for (int y = 7; y >= 1; y--)
++			AppendBit(formatInfoBits, getBit(bitMatrix, 8, y));
++
++		return FormatInformation::DecodeMQR(formatInfoBits);
++	}
++	if (Version::HasValidSize(bitMatrix, Type::rMQR)) {
++		// Read top-left format info bits
++		uint32_t formatInfoBits1 = 0;
++		for (int y = 3; y >= 1; y--)
++			AppendBit(formatInfoBits1, getBit(bitMatrix, 11, y));
++		for (int x = 10; x >= 8; x--)
++			for (int y = 5; y >= 1; y--)
++				AppendBit(formatInfoBits1, getBit(bitMatrix, x, y));
++
++		// Read bottom-right format info bits
++		uint32_t formatInfoBits2 = 0;
++		const int width = bitMatrix.width();
++		const int height = bitMatrix.height();
++		for (int x = 3; x <= 5; x++)
++			AppendBit(formatInfoBits2, getBit(bitMatrix, width - x, height - 6));
++		for (int x = 6; x <= 8; x++)
++			for (int y = 2; y <= 6; y++)
++				AppendBit(formatInfoBits2, getBit(bitMatrix, width - x, height - y));
++
++		return FormatInformation::DecodeRMQR(formatInfoBits1, formatInfoBits2);
++	}
++
++	const auto [first, second] = ReadQRFormatBits(bitMatrix);
++	return FormatInformation::DecodeQR(first, second);
++}
++
++FormatInformation ReadTransferFormatInformation(const BitMatrix& bitMatrix)
++{
++	const auto [first, second] = ReadQRFormatBits(bitMatrix);
++	return FormatInformation::DecodeQRMask3(first, second);
++}
++
+ static ByteArray ReadQRCodewords(const BitMatrix& bitMatrix, const Version& version, const FormatInformation& formatInfo)
+ {
+ 	BitMatrix functionPattern = version.buildFunctionPattern();
+@@ -285,10 +297,18 @@
+ 	case Type::Micro: return ReadMQRCodewords(bitMatrix, version, formatInfo);
+ 	case Type::rMQR: return ReadRMQRCodewords(bitMatrix, version, formatInfo);
+ 	case Type::Model1: return ReadQRCodewordsModel1(bitMatrix, version, formatInfo);
+ 	case Type::Model2: return ReadQRCodewords(bitMatrix, version, formatInfo);
+ 	}
+ 
+ 	return {};
+ }
+ 
++ByteArray ReadTransferCodewords(const BitMatrix& bitMatrix, const Version& version, bool isMirrored)
++{
++	FormatInformation formatInfo;
++	formatInfo.dataMask = 3;
++	formatInfo.isMirrored = isMirrored;
++	return ReadQRCodewords(bitMatrix, version, formatInfo);
++}
++
+ } // namespace ZXing::QRCode
+diff --git a/core/src/qrcode/QRBitMatrixParser.h b/core/src/qrcode/QRBitMatrixParser.h
+--- a/core/src/qrcode/QRBitMatrixParser.h
++++ b/core/src/qrcode/QRBitMatrixParser.h
+@@ -31,11 +31,17 @@
+  */
+ FormatInformation ReadFormatInformation(const BitMatrix& bitMatrix);
+ 
++/** Model 2-only format reader constrained to the sender's fixed mask 3. */
++FormatInformation ReadTransferFormatInformation(const BitMatrix& bitMatrix);
++
+ /**
+  * @brief Reads the codewords from the BitMatrix.
+  * @return bytes encoded within the QR Code or empty array if the exact number of bytes expected is not read
+  */
+ ByteArray ReadCodewords(const BitMatrix& bitMatrix, const Version& version, const FormatInformation& formatInfo);
+ 
++/** Read Model 2 codewords using the sender's fixed mask 3. */
++ByteArray ReadTransferCodewords(const BitMatrix& bitMatrix, const Version& version, bool isMirrored);
++
+ } // QRCode
+ } // ZXing
+diff --git a/core/src/qrcode/QRDecoder.cpp b/core/src/qrcode/QRDecoder.cpp
+--- a/core/src/qrcode/QRDecoder.cpp
++++ b/core/src/qrcode/QRDecoder.cpp
+@@ -293,6 +293,38 @@
+ 		.setStructuredAppend(structuredAppend);
+ }
+ 
++static DecoderResult DecodeTransferBitStream(ByteArray&& bytes, const Version& version)
++{
++	BitSource bits(bytes);
++	Content result;
++
++	try {
++		if (bits.readBits(4) != static_cast<int>(CodecMode::BYTE))
++			return FormatError("Transfer payload is not a byte segment");
++		const int count = bits.readBits(CharacterCountBits(CodecMode::BYTE, version));
++		if (count > bits.available() / 8)
++			return FormatError("Truncated transfer byte segment");
++
++		result.reserve(count);
++		for (int i = 0; i < count; ++i)
++			result.push_back(bits.readBits(8));
++
++		const int terminatorBits = std::min(4, bits.available());
++		if (terminatorBits && bits.readBits(terminatorBits) != 0)
++			return FormatError("Transfer payload has another segment");
++		const int alignmentBits = bits.available() & 7;
++		if (alignmentBits && bits.readBits(alignmentBits) != 0)
++			return FormatError("Invalid transfer byte alignment");
++		for (int pad = 0xEC; bits.available() >= 8; pad ^= 0xEC ^ 0x11)
++			if (bits.readBits(8) != pad)
++				return FormatError("Invalid transfer padding");
++	} catch (const std::out_of_range&) {
++		return FormatError("Truncated transfer bit stream");
++	}
++
++	return DecoderResult(std::move(result));
++}
++
+ DecoderResult Decode(const BitMatrix& bits)
+ {
+ 	if (!Version::HasValidSize(bits))
+@@ -356,4 +388,40 @@
+ 	return ret;
+ }
+ 
++DecoderResult DecodeTransfer(const BitMatrix& bits)
++{
++	if (!Version::HasValidSize(bits, Type::Model2))
++		return FormatError("Invalid transfer symbol size");
++
++	auto formatInfo = ReadTransferFormatInformation(bits);
++	if (!formatInfo.isValid() || formatInfo.dataMask != 3)
++		return FormatError("Invalid transfer format information");
++
++	const Version* pversion = ReadVersion(bits, Type::Model2);
++	if (!pversion)
++		return FormatError("Invalid transfer version");
++	const Version& version = *pversion;
++
++	ByteArray codewords = ReadTransferCodewords(bits, version, formatInfo.isMirrored);
++	if (codewords.empty())
++		return FormatError("Failed to read transfer codewords");
++
++	std::vector<DataBlock> dataBlocks = DataBlock::GetDataBlocks(codewords, version, formatInfo.ecLevel);
++	if (dataBlocks.empty())
++		return FormatError("Failed to get transfer data blocks");
++
++	const auto op = [](auto totalBytes, const auto& dataBlock) { return totalBytes + dataBlock.numDataCodewords(); };
++	ByteArray resultBytes(Reduce(dataBlocks, int{}, op));
++	auto resultIterator = resultBytes.begin();
++	for (auto& dataBlock : dataBlocks) {
++		ByteArray& codewordBytes = dataBlock.codewords();
++		const int numDataCodewords = dataBlock.numDataCodewords();
++		if (!ReedSolomonDecode(RSField::QRCode, codewordBytes, Size(codewordBytes) - numDataCodewords))
++			return ChecksumError();
++		resultIterator = std::copy_n(codewordBytes.begin(), numDataCodewords, resultIterator);
++	}
++
++	return DecodeTransferBitStream(std::move(resultBytes), version);
++}
++
+ } // namespace ZXing::QRCode
+diff --git a/core/src/qrcode/QRDecoder.h b/core/src/qrcode/QRDecoder.h
+--- a/core/src/qrcode/QRDecoder.h
++++ b/core/src/qrcode/QRDecoder.h
+@@ -15,5 +15,9 @@
+ 
+ DecoderResult Decode(const BitMatrix& bits);
+ 
++/** Decode the Pastebin Worker transfer profile: Model 2, mask 3, and one
++ * binary byte segment. Version and error-correction level remain dynamic. */
++DecoderResult DecodeTransfer(const BitMatrix& bits);
++
+ } // QRCode
+ } // ZXing
+diff --git a/core/src/qrcode/QRFormatInformation.cpp b/core/src/qrcode/QRFormatInformation.cpp
+--- a/core/src/qrcode/QRFormatInformation.cpp
++++ b/core/src/qrcode/QRFormatInformation.cpp
+@@ -101,20 +101,46 @@
+ * @param formatInfoBits1 format info indicator, with mask still applied
+ * @param formatInfoBits2 second copy of same info; both are checked at the same time to establish best match
+ */
+-FormatInformation FormatInformation::DecodeQR(uint32_t formatInfoBits1, uint32_t formatInfoBits2)
++static FormatInformation DecodeQRFormat(uint32_t formatInfoBits1, uint32_t formatInfoBits2,
++                                        const std::vector<uint32_t>& masks)
+ {
+-	// marks out the 'Dark Module' for mirrored and non-mirrored case (see Figure 25 in ISO/IEC 18004:2015)
++	// Remove the Dark Module separately for the normal and mirrored copies.
+ 	uint32_t mirroredFormatInfoBits2 = MirrorBits(((formatInfoBits2 >> 1) & 0b111111110000000) | (formatInfoBits2 & 0b1111111));
+ 	formatInfoBits2 = ((formatInfoBits2 >> 1) & 0b111111100000000) | (formatInfoBits2 & 0b11111111);
+-	// Some (Model2) QR codes apparently do not apply the XOR mask. Try with (standard) and without (quirk) masking.
+-	auto fi = FindBestFormatInfo({FORMAT_INFO_MASK_MODEL2, 0, FORMAT_INFO_MASK_MODEL1},
+-								 {formatInfoBits1, formatInfoBits2, MirrorBits(formatInfoBits1), mirroredFormatInfoBits2});
+-
+-	// Use bits 3/4 for error correction, and 0-2 for mask.
++	auto fi = FindBestFormatInfo(masks,
++		{formatInfoBits1, formatInfoBits2, MirrorBits(formatInfoBits1), mirroredFormatInfoBits2});
+ 	fi.ecLevel = ECLevelFromBits((fi.data >> 3) & 0x03);
+ 	fi.dataMask = static_cast<uint8_t>(fi.data & 0x07);
+ 	fi.isMirrored = fi.bitsIndex > 1;
++	return fi;
++}
+ 
++FormatInformation FormatInformation::DecodeQR(uint32_t formatInfoBits1, uint32_t formatInfoBits2)
++{
++	// Preserve the general decoder's unmasked-Model-2 and Model-1 compatibility.
++	return DecodeQRFormat(formatInfoBits1, formatInfoBits2, {FORMAT_INFO_MASK_MODEL2, 0, FORMAT_INFO_MASK_MODEL1});
++}
++
++FormatInformation FormatInformation::DecodeQRMask3(uint32_t formatInfoBits1, uint32_t formatInfoBits2)
++{
++	// Table C.1 entries whose low three data bits are mask 3, in ECC-bit order.
++	constexpr uint32_t MASK3_PATTERNS[] = {0x5B4B, 0x789D, 0x19D0, 0x3A06};
++	uint32_t mirroredFormatInfoBits2 = MirrorBits(((formatInfoBits2 >> 1) & 0b111111110000000) | (formatInfoBits2 & 0b1111111));
++	formatInfoBits2 = ((formatInfoBits2 >> 1) & 0b111111100000000) | (formatInfoBits2 & 0b11111111);
++	const uint32_t copies[] = {formatInfoBits1, formatInfoBits2, MirrorBits(formatInfoBits1), mirroredFormatInfoBits2};
++
++	FormatInformation fi;
++	for (int bitsIndex = 0; bitsIndex < 4; ++bitsIndex)
++		for (int ecBits = 0; ecBits < 4; ++ecBits)
++			if (int distance = std::popcount(copies[bitsIndex] ^ MASK3_PATTERNS[ecBits]); distance < fi.hammingDistance) {
++				fi.mask = FORMAT_INFO_MASK_MODEL2;
++				fi.data = static_cast<uint8_t>((ecBits << 3) | 3);
++				fi.hammingDistance = distance;
++				fi.bitsIndex = bitsIndex;
++			}
++	fi.ecLevel = ECLevelFromBits((fi.data >> 3) & 0x03);
++	fi.dataMask = static_cast<uint8_t>(fi.data & 0x07);
++	fi.isMirrored = fi.bitsIndex > 1;
+ 	return fi;
+ }
+ 
+diff --git a/core/src/qrcode/QRFormatInformation.h b/core/src/qrcode/QRFormatInformation.h
+--- a/core/src/qrcode/QRFormatInformation.h
++++ b/core/src/qrcode/QRFormatInformation.h
+@@ -35,6 +35,7 @@
+ 	FormatInformation() = default;
+ 
+ 	static FormatInformation DecodeQR(uint32_t formatInfoBits1, uint32_t formatInfoBits2);
++	static FormatInformation DecodeQRMask3(uint32_t formatInfoBits1, uint32_t formatInfoBits2);
+ 	static FormatInformation DecodeMQR(uint32_t formatInfoBits);
+ 	static FormatInformation DecodeRMQR(uint32_t formatInfoBits1, uint32_t formatInfoBits2);
+ 
+diff --git a/core/src/qrcode/QRReader.cpp b/core/src/qrcode/QRReader.cpp
+--- a/core/src/qrcode/QRReader.cpp
++++ b/core/src/qrcode/QRReader.cpp
+@@ -166,7 +166,7 @@
+ 
+ 		logFPSet(fpSet);
+ 		for (auto&& detectorResult : SampleQR(*binImg, fpSet)) {
+-			auto decoderResult = Decode(detectorResult.bits());
++			auto decoderResult = DecodeTransfer(detectorResult.bits());
+ 			if (!decoderResult.isValid())
+ 				continue;
+ 

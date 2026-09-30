@@ -2,9 +2,41 @@ import { maxP2PControlMessageLength, type DataMessage } from "./protocol.js"
 
 export const chunkSize = 64 * 1024
 export const progressUpdateIntervalMs = 500
+export const receiveWindowBytes = 4 * 1024 * 1024
+export const receiveAckIntervalBytes = 1024 * 1024
 const maxQueuedBytes = 1024 * 1024
 const resumeQueuedBytes = 512 * 1024
 const defaultP2PControlMessageLength = 256 * 1024
+
+/** Application-level credit includes bytes waiting for receiver hashing/disk I/O. */
+export class P2PSendWindow {
+  private sent = 0
+  private acknowledged = 0
+  private wakeWaiter?: () => void
+
+  constructor(private readonly capacity: number) {}
+
+  acknowledge(bytes: number): void {
+    if (!Number.isSafeInteger(bytes) || bytes < this.acknowledged || bytes > this.sent) return
+    this.acknowledged = bytes
+    this.wake()
+  }
+
+  wake(): void {
+    this.wakeWaiter?.()
+    this.wakeWaiter = undefined
+  }
+
+  async reserve(bytes: number, shouldContinue: () => boolean): Promise<void> {
+    if (bytes > this.capacity) throw new Error("P2P chunk exceeds the receiver window.")
+    while (shouldContinue() && this.sent + bytes - this.acknowledged > this.capacity) {
+      await new Promise<void>((resolve) => {
+        this.wakeWaiter = resolve
+      })
+    }
+    if (shouldContinue()) this.sent += bytes
+  }
+}
 
 export interface SpeedTracker {
   lastMeasuredAt: number
@@ -87,6 +119,7 @@ interface StreamBlobToDataChannelOptions {
   shouldContinue: () => boolean
   onReaderChange?: (reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>, active: boolean) => void
   onChunkSent?: (chunk: Uint8Array<ArrayBuffer>) => void | Promise<void>
+  beforeChunk?: (size: number) => Promise<void>
   mapReadError?: (cause: unknown) => Error
   yieldIntervalMs?: number
 }
@@ -98,6 +131,7 @@ export async function streamBlobToDataChannel({
   shouldContinue,
   onReaderChange,
   onChunkSent,
+  beforeChunk,
   mapReadError,
   yieldIntervalMs = 8,
 }: StreamBlobToDataChannelOptions): Promise<boolean> {
@@ -126,6 +160,7 @@ export async function streamBlobToDataChannel({
         if (!shouldContinue() || channel.readyState !== "open") return false
         const chunk = value.subarray(offset, offset + chunkSize)
         await waitForBufferedAmount(channel)
+        if (beforeChunk) await beforeChunk(chunk.byteLength)
         if (!shouldContinue() || channel.readyState !== "open") return false
         channel.send(chunk)
         await onChunkSent?.(chunk)

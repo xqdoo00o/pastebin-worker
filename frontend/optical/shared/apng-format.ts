@@ -1,18 +1,16 @@
-import { gridDims, TRANSFER_QR_MARGIN } from "./qr.js"
+import { gridDims, isSupportedQrVersion, TRANSFER_QR_MARGIN } from "./qr.js"
 
 export const PNG_SIGNATURE = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10)
 
-export const OPTICAL_APNG_FORMAT_VERSION = 1
 export const OPTICAL_APNG_METADATA_KEYWORD = "qr-transfer"
 const OPTICAL_APNG_GRID_CODES = [1, 2, 4, 6, 9] as const
 
 export interface OpticalApngMetadata {
-  format: typeof OPTICAL_APNG_FORMAT_VERSION
   /** Physical PNG pixels per QR module. */
   scale: number
   /** Number of QR symbols in the complete rectangular grid. */
   grid: number
-  /** ISO/IEC 18004 QR version shared by every symbol. */
+  /** Supported QR version shared by every symbol, including transfer v48. */
   qr: number
 }
 
@@ -32,19 +30,15 @@ export function validateOpticalApngMetadata(value: unknown): OpticalApngMetadata
   }
   const metadata = value as Partial<OpticalApngMetadata>
   if (
-    metadata.format !== OPTICAL_APNG_FORMAT_VERSION ||
     !Number.isInteger(metadata.scale) ||
     metadata.scale! < 1 ||
     metadata.scale! > 4 ||
     !OPTICAL_APNG_GRID_CODES.includes(metadata.grid as (typeof OPTICAL_APNG_GRID_CODES)[number]) ||
-    !Number.isInteger(metadata.qr) ||
-    metadata.qr! < 1 ||
-    metadata.qr! > 40
+    !isSupportedQrVersion(metadata.qr!)
   ) {
     throw new Error("The APNG QR metadata is invalid.")
   }
   return {
-    format: OPTICAL_APNG_FORMAT_VERSION,
     scale: metadata.scale!,
     grid: metadata.grid!,
     qr: metadata.qr!,

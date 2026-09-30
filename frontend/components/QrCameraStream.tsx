@@ -1,7 +1,15 @@
 import { useEffect, useState } from "react"
 import type { OpticalTransferSettings } from "../optical/shared/settings.js"
-import { Button, CircularProgress, Input, NativeSelectField, PanelLoadingState, StatusBanner } from "./ui/index.js"
-import { DownloadIcon, XIcon } from "./icons.js"
+import {
+  Button,
+  CircularProgress,
+  Input,
+  NativeSelectField,
+  PanelLoadingState,
+  StatusBanner,
+  Tooltip,
+} from "./ui/index.js"
+import { DownloadIcon, ExitFullscreenIcon, FullscreenIcon, XIcon } from "./icons.js"
 import { InfoTooltip } from "./InfoTooltip.js"
 import { APNG_QR_SCALE_OPTIONS, DEFAULT_EXPORT_EXTRA_PERCENT, defaultQrScale } from "../optical/shared/fountain.js"
 import type { ApngQrScale } from "../optical/shared/fountain.js"
@@ -205,6 +213,31 @@ function ApngExportControls({
  * Shared by the full transfer panel and standalone sender page.
  */
 function QrCameraStream({ stream, settings }: QrCameraStreamProps) {
+  const [browserFullscreen, setBrowserFullscreen] = useState(false)
+  const [fullscreenError, setFullscreenError] = useState<string | undefined>()
+  const { resizeDisplay, stageRef } = stream
+  useEffect(() => {
+    const syncFullscreen = () => {
+      setBrowserFullscreen(document.fullscreenElement === stageRef.current)
+      resizeDisplay()
+    }
+    document.addEventListener("fullscreenchange", syncFullscreen)
+    return () => document.removeEventListener("fullscreenchange", syncFullscreen)
+  }, [resizeDisplay, stageRef])
+
+  const toggleBrowserFullscreen = async () => {
+    const stage = stream.stageRef.current
+    if (!stage) return
+    try {
+      if (document.fullscreenElement === stage) await document.exitFullscreen()
+      else if (stage.requestFullscreen) await stage.requestFullscreen()
+      else throw new Error("Browser fullscreen is unavailable.")
+      setFullscreenError(undefined)
+    } catch {
+      setFullscreenError("Browser fullscreen is unavailable in this browser or context.")
+    }
+  }
+
   const zstdSavingsPercent =
     stream.preparedFile?.compression === "zstd" && stream.preparedFile.originalSize > 0
       ? Math.max(0, Math.min(100, (1 - stream.preparedFile.transmittedSize / stream.preparedFile.originalSize) * 100))
@@ -226,28 +259,65 @@ function QrCameraStream({ stream, settings }: QrCameraStreamProps) {
 
   return (
     <>
-      {stream.error ? (
-        <StatusBanner role="alert" tone="danger" className="mb-3">
-          {stream.error}
-        </StatusBanner>
-      ) : (
-        <StatusBanner className="mb-3">{stream.status}</StatusBanner>
-      )}
+      <StatusBanner
+        role={stream.error ? "alert" : undefined}
+        tone={stream.error ? "danger" : "primary"}
+        className="mb-3"
+      >
+        {stream.error || stream.status}
+      </StatusBanner>
       {stream.partCount > 1 && <SegmentNavBar stream={stream} />}
       <div
         ref={stream.stageRef}
         hidden={stream.error !== undefined}
         className={
           stream.isFullscreen
-            ? "fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-content1"
+            ? "fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center overflow-hidden bg-content1"
             : `flex w-full min-w-0 max-w-full justify-center overflow-hidden rounded-xl p-2 ${
                 stream.streamReady ? "cursor-zoom-in" : "cursor-default"
               }`
         }
         onClick={() => {
-          if (stream.streamReady || stream.isFullscreen) stream.setIsFullscreen((current) => !current)
+          if (!stream.streamReady && !stream.isFullscreen) return
+          if (stream.isFullscreen && document.fullscreenElement === stream.stageRef.current) {
+            void document.exitFullscreen().catch(() => undefined)
+          }
+          stream.setIsFullscreen((current) => !current)
         }}
       >
+        {stream.isFullscreen && (
+          <div className="absolute right-3 top-3 z-10">
+            <Tooltip
+              content={browserFullscreen ? "Exit browser fullscreen" : "Enter browser fullscreen"}
+              placement="bottom"
+            >
+              <Button
+                type="button"
+                isIconOnly
+                size="sm"
+                variant="light"
+                className="cursor-pointer text-default-600 transition-colors"
+                aria-label={browserFullscreen ? "Exit browser fullscreen" : "Enter browser fullscreen"}
+                aria-pressed={browserFullscreen}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  void toggleBrowserFullscreen()
+                }}
+              >
+                {browserFullscreen ? (
+                  <ExitFullscreenIcon className="size-6 inline" />
+                ) : (
+                  <FullscreenIcon className="size-6 inline" />
+                )}
+              </Button>
+            </Tooltip>
+          </div>
+        )}
+        {stream.isFullscreen && fullscreenError && (
+          <StatusBanner role="alert" tone="danger" className="absolute right-3 top-16 z-10 max-w-64">
+            {fullscreenError}
+          </StatusBanner>
+        )}
         {!stream.streamReady && (
           <PanelLoadingState className="min-h-48">
             <CircularProgress aria-label="Generating first QR frame" />
@@ -256,11 +326,13 @@ function QrCameraStream({ stream, settings }: QrCameraStreamProps) {
         )}
         <canvas
           ref={stream.canvasRef}
+          className="shrink-0"
           hidden={!stream.streamReady || stream.rendererBackend !== "webgl2"}
           aria-label={stream.rendererBackend === "webgl2" ? "Animated multi-code QR data stream" : undefined}
         />
         <canvas
           ref={stream.fallbackCanvasRef}
+          className="shrink-0"
           hidden={!stream.streamReady || stream.rendererBackend !== "2d"}
           aria-label={stream.rendererBackend === "2d" ? "Animated multi-code QR data stream" : undefined}
         />

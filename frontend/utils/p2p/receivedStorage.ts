@@ -1,19 +1,18 @@
-import { OPFS_LARGE_FILE_THRESHOLD_BYTES, OPFS_REQUIRED_SPACE_MULTIPLIER } from "../../../shared/constants.js"
+import { OPFS_LARGE_FILE_THRESHOLD_BYTES } from "../../../shared/constants.js"
 import { verificationBlockSize, type P2PFileMeta } from "./protocol.js"
-import { sliceArrayBuffer } from "./verification.js"
+import type { VerificationPart } from "./verification.js"
 import { uuid } from "./transfer.js"
 import {
-  acquireOPFSFileLease,
+  createOPFSWritableFile,
   cleanupOPFSTemporaryFilesOnce,
   deleteOwnedOPFSFile,
   queueOPFSFileDeletion,
   type OPFSFileLease,
+  type OPFSStorageManager,
 } from "../opfs.js"
 import { P2PPersistentReceiveStore } from "../p2pReceiveStore.js"
 
 export const MAX_MEMORY_P2P_BYTES = 1024 * 1024 * 1024
-
-type OPFSStorageManager = StorageManager & { getDirectory?: () => Promise<FileSystemDirectoryHandle> }
 
 interface OPFSReceivedFile {
   root: FileSystemDirectoryHandle
@@ -32,7 +31,7 @@ export interface ReceivedStore {
   replaceBlock(index: number, parts: ArrayBuffer[]): Promise<void>
   checkpoint(): Promise<void>
   file(meta: P2PFileMeta): Promise<File>
-  verificationParts(index: number): readonly ArrayBuffer[] | undefined
+  verificationParts(index: number): readonly VerificationPart[] | undefined
   preserve(): Promise<void>
   queueDeletion(): void
   discard(): Promise<void>
@@ -40,7 +39,7 @@ export interface ReceivedStore {
 
 class MemoryReceivedStore implements ReceivedStore {
   readonly kind = "memory" as const
-  private blocks: ArrayBuffer[][] = []
+  private blocks: VerificationPart[][] = []
 
   append(position: number, chunk: ArrayBuffer): Promise<void> {
     let chunkOffset = 0
@@ -49,7 +48,7 @@ class MemoryReceivedStore implements ReceivedStore {
       const blockIndex = Math.floor(writePosition / verificationBlockSize)
       const blockOffset = writePosition % verificationBlockSize
       const takeBytes = Math.min(verificationBlockSize - blockOffset, chunk.byteLength - chunkOffset)
-      const part = sliceArrayBuffer(chunk, chunkOffset, chunkOffset + takeBytes)
+      const part = new Uint8Array(chunk, chunkOffset, takeBytes)
       this.blocks[blockIndex] ??= []
       this.blocks[blockIndex].push(part)
       writePosition += part.byteLength
@@ -73,7 +72,7 @@ class MemoryReceivedStore implements ReceivedStore {
     return Promise.resolve(file)
   }
 
-  verificationParts(index: number): readonly ArrayBuffer[] | undefined {
+  verificationParts(index: number): readonly VerificationPart[] | undefined {
     return this.blocks[index]
   }
 
@@ -228,37 +227,17 @@ export class P2PReceiveStorageFactory {
     if (meta.size < OPFS_LARGE_FILE_THRESHOLD_BYTES || typeof this.storageManager?.getDirectory !== "function") {
       return undefined
     }
-    const estimate = await this.storageManager.estimate().catch(() => undefined)
-    if (estimate?.quota !== undefined) {
-      const availableBytes = Math.max(0, estimate.quota - (estimate.usage ?? 0))
-      if (availableBytes < meta.size * OPFS_REQUIRED_SPACE_MULTIPLIER) return undefined
-    }
-
-    let root: FileSystemDirectoryHandle | undefined
     const filename = `p2p-${Date.now()}-${this.peerId}-${uuid()}.tmp`
-    let lease: OPFSFileLease | undefined
     try {
-      root = await this.opfsRootPromise
+      const root = await this.opfsRootPromise
       if (!root) return undefined
-      const leaseRequest = acquireOPFSFileLease(filename)
-      const acquiredLease = leaseRequest ? await leaseRequest : undefined
-      if (acquiredLease === null) return undefined
-      lease = acquiredLease
-      const handle = await root.getFileHandle(filename, { create: true })
-      const writable = await handle.createWritable({ keepExistingData: false })
       return {
-        root,
-        filename,
-        handle,
-        writable,
+        ...(await createOPFSWritableFile(meta.size, filename, root)),
         writePosition: 0,
         pendingParts: [],
         pendingBytes: 0,
-        lease,
       }
     } catch {
-      if (root) await root.removeEntry(filename).catch(() => undefined)
-      lease?.release()
       return undefined
     }
   }

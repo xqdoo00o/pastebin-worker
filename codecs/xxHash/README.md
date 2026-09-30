@@ -2,7 +2,7 @@
 
 This directory builds the official `Cyan4973/xxHash` C implementation into
 SIMD128 and scalar WebAssembly variants. The source checkout is pinned to the
-v0.8.3 release and kept under the ignored `third_party/` directory.
+v0.8.4 release and kept under the ignored `third_party/` directory.
 
 Run `pnpm build:xxhash` after configuring the shared Emscripten toolchain with
 `pnpm setup:emscripten`. Generated browser artifacts are written to

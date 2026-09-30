@@ -1,30 +1,17 @@
-import createNanoRQCodec, { type NanoRQCodecModule, type NanoRQCodecOptions } from "../nanorq-codec/nanorq_codec.js"
-import { createRetryableLoader } from "../../utils/wasm.js"
+import createNanoRQCodec, { type NanoRQCodecModule } from "../nanorq-codec/nanorq_codec.js"
+import { createRetryableLoader, instantiateEmscriptenModule, type WasmInitInput } from "../../utils/wasm.js"
 import { RAPTORQ_PAYLOAD_ID_BYTES } from "./wire.js"
-import type { QrBitmap, QrErrorCorrection } from "./qr.js"
-
-type NanoRQInitInput = ArrayBuffer | Uint8Array | WebAssembly.Module
+import { isSupportedQrVersion, QR_VERSION_MAX, TRANSFER_QR_MASK, type QrBitmap, type QrErrorCorrection } from "./qr.js"
 
 let module: NanoRQCodecModule | undefined
 
-const initializeModule = createRetryableLoader(async (moduleOrBytes: NanoRQInitInput) => {
-  let options: NanoRQCodecOptions
-  if (moduleOrBytes instanceof WebAssembly.Module) {
-    options = {
-      instantiateWasm(imports, done) {
-        const instance = new WebAssembly.Instance(moduleOrBytes, imports)
-        done(instance, moduleOrBytes)
-        return instance.exports
-      },
-    }
-  } else {
-    options = { wasmBinary: moduleOrBytes }
-  }
-  return (module = await createNanoRQCodec(options))
-})
+const initializeModule = createRetryableLoader(
+  async (source: WasmInitInput) =>
+    (module = await instantiateEmscriptenModule(source, () => Promise.resolve(createNanoRQCodec))),
+)
 
 /** Initialize the shared Emscripten module once in the current worker. */
-export function initializeNanoRQ(moduleOrBytes: NanoRQInitInput): Promise<NanoRQCodecModule> {
+export function initializeNanoRQ(moduleOrBytes: WasmInitInput): Promise<NanoRQCodecModule> {
   return initializeModule(moduleOrBytes)
 }
 
@@ -35,9 +22,6 @@ function initializedModule(): NanoRQCodecModule {
 
 const QR_ECC: Readonly<Record<QrErrorCorrection, number>> = { L: 0, M: 1, Q: 2, H: 3 }
 const QR_VERSION_MIN = 1
-const QR_VERSION_MAX = 40
-const TRANSFER_QR_MASK = 3
-
 /** Generate fixed-mask binary QR symbols inside the NanoRQ WASM module.
  * Returned matrices remain valid until this generator encodes the next symbol. */
 export class WasmNanoRQQrGenerator {
@@ -45,6 +29,7 @@ export class WasmNanoRQQrGenerator {
   private handle = 0
   private inputPointer = 0
   private packedPointer = 0
+  private packedView: Uint8Array | undefined
   private readonly inputCapacity: number
 
   constructor() {
@@ -62,6 +47,7 @@ export class WasmNanoRQQrGenerator {
 
   encode(bytes: Uint8Array, ecc: QrErrorCorrection, version?: number): QrBitmap {
     if (!this.handle) throw new Error("NanoRQ QR generator has been freed.")
+    if (version !== undefined && !isSupportedQrVersion(version)) throw new Error(`Invalid QR version: ${version}`)
     if (bytes.length > this.inputCapacity) throw new Error("QR generation failed: Too much data")
     const minVersion = version ?? QR_VERSION_MIN
     const maxVersion = version ?? QR_VERSION_MAX
@@ -76,10 +62,15 @@ export class WasmNanoRQQrGenerator {
     )
     if (!size) throw new Error("QR generation failed: Too much data")
 
-    const packed = new Uint8Array(this.codec.HEAPU8.buffer, this.packedPointer, Math.ceil((size * size) / 8))
+    const buffer = this.codec.HEAPU8.buffer
+    const packedLength = Math.ceil((size * size) / 8)
+    // Memory growth replaces the buffer; version changes can change its view length.
+    if (this.packedView?.buffer !== buffer || this.packedView.length !== packedLength) {
+      this.packedView = new Uint8Array(buffer, this.packedPointer, packedLength)
+    }
     return {
       size,
-      packed,
+      packed: this.packedView,
     }
   }
 
@@ -88,6 +79,7 @@ export class WasmNanoRQQrGenerator {
     this.handle = 0
     this.inputPointer = 0
     this.packedPointer = 0
+    this.packedView = undefined
   }
 }
 

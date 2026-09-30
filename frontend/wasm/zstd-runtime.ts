@@ -114,41 +114,54 @@ function checkStatus(module: ZstdModuleBase, status: number): void {
   if (status !== 0) throw codecError(module, status)
 }
 
-function copyOutput(module: ZstdModuleBase, pointer: number, size: number): Uint8Array {
-  if (size === 0) return new Uint8Array()
-  if (pointer === 0 || pointer + size > module.HEAPU8.byteLength) {
+function outputView(module: ZstdModuleBase, pointer: number, size: number): Uint8Array {
+  if (size !== 0 && (pointer === 0 || pointer + size > module.HEAPU8.byteLength)) {
     throw new Error("zstd codec: invalid WebAssembly output")
   }
-  return module.HEAPU8.slice(pointer, pointer + size)
+  return module.HEAPU8.subarray(pointer, pointer + size)
 }
 
-/** Compress a whole buffer into one standard zstd frame. */
-export async function compressZstd(bytes: Uint8Array, level: number = ZSTD_LEVEL): Promise<Uint8Array> {
-  validateCompressionLevel(level)
-  const module = await encoder()
-  validateUint32(bytes.byteLength, "zstd input size")
-  const outputCapacity = module._pw_zstd_compress_bound(bytes.byteLength)
-  if (outputCapacity === 0) throw new RangeError("zstd input is too large to compress in WebAssembly.")
+function copyOutput(module: ZstdModuleBase, pointer: number, size: number): Uint8Array {
+  return outputView(module, pointer, size).slice()
+}
 
-  let input = 0
-  let output = 0
-  let written = 0
+/** Input is already staged in WASM. Each borrowed block must be consumed before
+ * advancing the iterator or calling the codec again. */
+function* decompressBlocks(
+  module: ZstdDecoderModule,
+  context: () => number,
+  input: number,
+  length: number,
+): IterableIterator<Uint8Array> {
+  const progress = allocateWasm(module, 8, "zstd codec")
   try {
-    input = allocateWasm(module, bytes.byteLength, "zstd codec")
-    output = allocateWasm(module, outputCapacity, "zstd codec")
-    written = allocateWasm(module, Uint32Array.BYTES_PER_ELEMENT, "zstd codec")
-    module.HEAPU8.set(bytes, input)
-    checkStatus(module, module._pw_zstd_compress(input, bytes.byteLength, output, outputCapacity, level, written))
-    const outputSize = new DataView(module.HEAPU8.buffer).getUint32(written, true)
-    return copyOutput(module, output, outputSize)
+    let offset = 0
+    let more = true
+    while (more) {
+      const current = context()
+      if (!current) throw new Error("zstd decoder has been freed")
+      checkStatus(module, module._pw_zstd_decompressor_step(current, input + offset, length - offset, progress))
+      const view = new DataView(module.HEAPU8.buffer)
+      const consumed = view.getUint32(progress, true)
+      more = view.getUint32(progress + 4, true) !== 0
+      const block = outputView(
+        module,
+        module._pw_zstd_decompressor_output(current),
+        module._pw_zstd_decompressor_output_size(current),
+      )
+      if (consumed > length - offset || (more && consumed === 0 && block.length === 0)) {
+        throw new Error("zstd decoder made invalid progress")
+      }
+      offset += consumed
+      if (block.length) yield block
+    }
   } finally {
-    if (written !== 0) module._free(written)
-    if (output !== 0) module._free(output)
-    if (input !== 0) module._free(input)
+    module._free(progress)
   }
 }
 
 export interface StreamingCompressor {
+  /** Owned output bytes; later codec calls and free() do not invalidate them. */
   push(input: Uint8Array): Uint8Array
   finish(): Uint8Array
   free(): void
@@ -156,6 +169,8 @@ export interface StreamingCompressor {
 
 export interface StreamingDecompressor {
   push(input: Uint8Array): Uint8Array
+  /** Owned output blocks of at most 128 KiB. Consume fully before the next push. */
+  pushChunks(input: Uint8Array): IterableIterator<Uint8Array>
   finish(): void
   free(): void
 }
@@ -212,6 +227,7 @@ class OfficialStreamingCompressor implements StreamingCompressor {
 class OfficialStreamingDecompressor implements StreamingDecompressor {
   private context: number
   private readonly input: ReusableWasmInput
+  private draining = false
 
   constructor(
     private readonly module: ZstdDecoderModule,
@@ -223,6 +239,7 @@ class OfficialStreamingDecompressor implements StreamingDecompressor {
   }
 
   push(input: Uint8Array): Uint8Array {
+    if (this.draining || !this.context) throw new Error("zstd decoder is busy or freed")
     validateUint32(input.byteLength, "zstd input size")
     return this.input.withBytes(input, (pointer) => {
       checkStatus(this.module, this.module._pw_zstd_decompressor_push(this.context, pointer, input.byteLength))
@@ -230,7 +247,23 @@ class OfficialStreamingDecompressor implements StreamingDecompressor {
     })
   }
 
+  *pushChunks(input: Uint8Array): IterableIterator<Uint8Array> {
+    if (this.draining || !this.context) throw new Error("zstd decoder is busy or freed")
+    validateUint32(input.byteLength, "zstd input size")
+    if (input.byteLength === 0) return
+    this.draining = true
+    try {
+      const pointer = this.input.withBytes(input, (pointer) => pointer)
+      for (const block of decompressBlocks(this.module, () => this.context, pointer, input.byteLength)) {
+        yield block.slice()
+      }
+    } finally {
+      this.draining = false
+    }
+  }
+
   finish(): void {
+    if (this.draining || !this.context) throw new Error("zstd decoder is busy or freed")
     checkStatus(this.module, this.module._pw_zstd_decompressor_finish(this.context))
   }
 
@@ -272,33 +305,48 @@ export async function decompressZstd(bytes: Uint8Array, maxBytes: number): Promi
   validateUint32(bytes.byteLength, "zstd input size")
   validateUint32(maxBytes, "maximum decompressed size")
   const module = await decoder()
-  const direct = tryDecompressZstd(module, bytes, maxBytes)
-  if (direct !== undefined) return direct
-
-  const decompressor = new OfficialStreamingDecompressor(module, maxBytes)
-  try {
-    const pushed = decompressor.push(bytes)
-    decompressor.finish()
-    return pushed
-  } finally {
-    decompressor.free()
-  }
-}
-
-function tryDecompressZstd(module: ZstdDecoderModule, bytes: Uint8Array, maxBytes: number): Uint8Array | undefined {
   let input = 0
   let capacityPointer = 0
   let output = 0
   let written = 0
+  let streamingContext = 0
   try {
     input = allocateWasm(module, bytes.byteLength, "zstd codec")
     capacityPointer = allocateWasm(module, Uint32Array.BYTES_PER_ELEMENT, "zstd codec")
     module.HEAPU8.set(bytes, input)
     const capacityStatus = module._pw_zstd_decompress_capacity(input, bytes.byteLength, maxBytes, capacityPointer)
-    if (capacityStatus === PW_ZSTD_STREAMING_REQUIRED) return undefined
+    if (capacityStatus === PW_ZSTD_STREAMING_REQUIRED) {
+      // The probe already copied the complete input into WASM. Feed that same
+      // allocation to the streaming decoder instead of staging it a second time.
+      streamingContext = module._pw_zstd_decompressor_new(maxBytes)
+      if (streamingContext === 0) throw new Error("zstd codec: WebAssembly context allocation failed")
+      checkStatus(module, module._pw_zstd_decompressor_push(streamingContext, input, bytes.byteLength))
+      const pushed = copyOutput(
+        module,
+        module._pw_zstd_decompressor_output(streamingContext),
+        module._pw_zstd_decompressor_output_size(streamingContext),
+      )
+      checkStatus(module, module._pw_zstd_decompressor_finish(streamingContext))
+      return pushed
+    }
     checkStatus(module, capacityStatus)
 
     const outputCapacity = new DataView(module.HEAPU8.buffer).getUint32(capacityPointer, true)
+    // Large single-part optical files still need an owned JS result, but need
+    // not also retain a whole-file allocation in the shared decoder's WASM heap.
+    if (outputCapacity > 4 * 1024 * 1024) {
+      const result = new Uint8Array(outputCapacity)
+      streamingContext = module._pw_zstd_decompressor_new(maxBytes)
+      if (streamingContext === 0) throw new Error("zstd codec: WebAssembly context allocation failed")
+      let outputOffset = 0
+      for (const block of decompressBlocks(module, () => streamingContext, input, bytes.byteLength)) {
+        result.set(block, outputOffset)
+        outputOffset += block.length
+      }
+      checkStatus(module, module._pw_zstd_decompressor_finish(streamingContext))
+      if (outputOffset !== outputCapacity) throw new Error("zstd codec: invalid WebAssembly output")
+      return result
+    }
     output = allocateWasm(module, outputCapacity, "zstd codec")
     written = allocateWasm(module, Uint32Array.BYTES_PER_ELEMENT, "zstd codec")
     checkStatus(module, module._pw_zstd_decompress(input, bytes.byteLength, output, outputCapacity, written))
@@ -308,6 +356,7 @@ function tryDecompressZstd(module: ZstdDecoderModule, bytes: Uint8Array, maxByte
     }
     return copyOutput(module, output, outputSize)
   } finally {
+    if (streamingContext !== 0) module._pw_zstd_decompressor_free(streamingContext)
     if (written !== 0) module._free(written)
     if (output !== 0) module._free(output)
     if (capacityPointer !== 0) module._free(capacityPointer)

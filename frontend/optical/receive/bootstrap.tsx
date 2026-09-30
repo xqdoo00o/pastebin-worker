@@ -2,8 +2,7 @@ import { useEffect, useRef, useState } from "react"
 import { createRoot } from "react-dom/client"
 
 import { DarkModeToggle, useDarkModeSelection } from "../../components/DarkModeToggle.js"
-import { QrCodeTooltip } from "../../components/QrCodeTooltip.js"
-import { WebShareButton } from "../../components/WebShareButton.js"
+import { PageTopbarActions } from "../../components/PageTopbarActions.js"
 import { HljsProvider } from "../../utils/highlight-client.js"
 import { ChevronDownIcon, HomeIcon, RefreshIcon } from "../../components/icons.js"
 import {
@@ -12,7 +11,6 @@ import {
   PageContainer,
   PageShell,
   PageTopbar,
-  Tooltip,
   actionControlClassName,
   iconControlClassName,
 } from "../../components/ui/index.js"
@@ -39,7 +37,11 @@ import "../../styles/highlight-theme.css"
 import "../../optical-receive.css"
 
 const MODE_BUTTON_CLASS = "mode-button rounded-lg border-0 bg-transparent px-3 py-2 text-sm text-foreground"
-const HELP_TEXT_CLASS = "-mt-1 text-sm text-default-500"
+const MODE_HELP_TEXT: Record<ReceiveMode, string> = {
+  camera: "Point this camera at the QR stream on the sending screen.",
+  screen: "Share the sender window or screen to decode its QR stream.",
+  apng: "Choose an APNG exported by the sender to decode it locally.",
+}
 const TOPBAR_ICON_LINK_CLASS = iconControlClassName
 const DISALLOWED_MIME_TYPES = __WRANGLER_CONFIG__.DISALLOWED_MIME_FOR_PASTE
 
@@ -96,20 +98,7 @@ function OpticalReceivePage() {
               <span className="truncate">QR Receiver</span>
             </>
           }
-          actions={
-            <>
-              <ReceiverThemeToggle />
-              <QrCodeTooltip
-                value={receiverUrl}
-                placement="bottom"
-                tooltip="Show QR code"
-                className={TOPBAR_ICON_LINK_CLASS}
-              />
-              <Tooltip content="Share this page" placement="bottom">
-                <WebShareButton title="QR Receiver" url={receiverUrl} className={TOPBAR_ICON_LINK_CLASS} plain />
-              </Tooltip>
-            </>
-          }
+          actions={<PageTopbarActions title="QR Receiver" url={receiverUrl} themeToggle={<ReceiverThemeToggle />} />}
         />
 
         <section className="rounded-xl bg-default-100 p-3" aria-label="QR receiver">
@@ -140,15 +129,7 @@ function OpticalReceivePage() {
                   APNG file
                 </ModeButton>
               </div>
-              {ui.mode === "camera" && (
-                <p className={HELP_TEXT_CLASS}>Point this camera at the QR stream on the sending screen.</p>
-              )}
-              {ui.mode === "screen" && (
-                <p className={HELP_TEXT_CLASS}>Share the sender window or screen to decode its QR stream.</p>
-              )}
-              {ui.mode === "apng" && (
-                <p className={HELP_TEXT_CLASS}>Choose an APNG exported by the sender to decode it locally.</p>
-              )}
+              <p className="-mt-1 text-sm text-default-500">{MODE_HELP_TEXT[ui.mode]}</p>
               <div
                 className={`hint status-line rounded-lg bg-primary-50 px-3 py-2 text-center text-primary${ui.statusError ? " error" : ""}`}
               >
@@ -305,6 +286,23 @@ function OpticalReceivePage() {
                       <option key={index + 1}>{index + 1}</option>
                     ))}
                   </NativeSelectField>
+                  {ui.mode === "camera" && ui.isoAvailable && (
+                    <label className="flex min-w-0 flex-col gap-1.5">
+                      <span className="inline-flex w-fit items-center pl-1 text-sm text-default-600">
+                        ISO: {ui.iso}
+                      </span>
+                      <input
+                        aria-label="ISO"
+                        className="h-10 w-full touch-pan-y accent-primary"
+                        type="range"
+                        min={ui.isoRange.min}
+                        max={ui.isoRange.max}
+                        step={ui.isoRange.step}
+                        value={ui.iso}
+                        onChange={(event) => controller.current?.updateIso(Number(event.currentTarget.value))}
+                      />
+                    </label>
+                  )}
                 </div>
                 {ui.mode !== "apng" && (
                   <p className="hint settings-actual mt-3 border-t border-divider pt-3">{ui.cameraActual}</p>

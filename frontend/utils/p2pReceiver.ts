@@ -8,17 +8,14 @@ import {
   rtcConfig,
   type P2PIceMode,
 } from "./p2p/rtc.js"
-import { maxVerificationRepairAttempts, verificationBlockByteLength } from "./p2p/verification.js"
 import {
   type P2PConnectionRoute,
   type P2PFileMeta,
   type P2PProgress,
   type P2PReceiverCallbacks,
   type P2PReceiverSession,
-  type P2PVerificationManifest,
   type SignalMessage,
   parseP2PDataMessage,
-  verificationBlockSize,
 } from "./p2p/protocol.js"
 import {
   createP2PSignalingTransport,
@@ -27,7 +24,7 @@ import {
   type P2PSignalingTransport,
 } from "./p2p/signalingTransport.js"
 import { P2PWakeLock } from "./p2p/wakeLock.js"
-import { createSpeedTracker, measureSpeed, progressUpdateIntervalMs, sendData } from "./p2p/transfer.js"
+import { receiveWindowBytes, sendData } from "./p2p/transfer.js"
 import { ensureXXHashReady } from "../wasm/xxhash-loader.js"
 import { acquireP2PReceiverRoomLock, p2pResumeMetaMatches, setP2PSessionRecoveryRetryToken } from "./p2pReceiveStore.js"
 import { MAX_MEMORY_P2P_BYTES } from "./p2p/receivedStorage.js"
@@ -38,12 +35,11 @@ import {
   rotateReceiverSessionPeer,
 } from "./p2p/receiverSession.js"
 import { ReceiverConnectionRecovery } from "./p2p/receiverRecovery.js"
-import { ReceiverStorageCoordinator } from "./p2p/receiverStorageCoordinator.js"
+import { P2PReceiveStorageError, ReceiverStorageCoordinator } from "./p2p/receiverStorageCoordinator.js"
 import { ReceiverVerificationState } from "./p2p/receiverVerification.js"
 import { ReceiverDataChannel } from "./p2p/receiverDataChannel.js"
+import { ReceiverDataSession } from "./p2p/receiverDataSession.js"
 import type { WebLockLease } from "./webLock.js"
-
-const maxIncompleteTransferRetries = 3
 
 export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2PReceiverCallbacks): P2PReceiverSession {
   const receiverIdentity = createReceiverSessionIdentity(name)
@@ -60,17 +56,15 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
   let iceServers: P2PIceServer[] | undefined
   let meta: P2PFileMeta | undefined
   let pendingUpdateMeta: P2PFileMeta | undefined
-  let receivedBytes = 0
   const transfer = new ReceiverTransferLifecycle()
+  let reconnecting = false
   let senderLeft = false
   let isClosed = false
   let hasCompletedTransfer = false
   let closeCleanupStarted = false
   let downloadRequestedChannel: RTCDataChannel | undefined
-  let speedTracker = createSpeedTracker(0)
   const iceCandidates = new P2PIceCandidateBuffer()
   let negotiationId: string | undefined
-  let lastProgressAt = 0
   const verificationState = new ReceiverVerificationState()
   let forceMemoryStorage = false
   let roomLock: WebLockLease | undefined
@@ -94,26 +88,34 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
   const isPaused = () => transfer.isPaused()
   const isPausePending = () => transfer.isPausePending()
   const restartAfterStop = () => transfer.shouldRestartAfterStop()
-  const transitionTransfer = (next: ReceiverTransferState) => transfer.transition(next)
+  const emitTransferStatus = () => callbacks.onTransferStatusChange?.(transfer.status(reconnecting))
+  const transitionTransfer = (next: ReceiverTransferState) => {
+    transfer.transition(next)
+    emitTransferStatus()
+  }
 
   const clearPauseState = () => {
-    if (transfer.isPaused() || transfer.isPausePending()) transfer.transition({ kind: "idle" })
+    if (transfer.isPaused() || transfer.isPausePending()) transitionTransfer({ kind: "idle" })
     callbacks.onPausedChange(false)
     callbacks.onPausePendingChange?.(false)
   }
 
   const confirmPause = () => {
     if (!transfer.isPausePending() || transfer.isComplete() || transfer.isDiscarding()) return
-    transfer.transition({ kind: "paused" })
+    transitionTransfer({ kind: "paused" })
     callbacks.onPausePendingChange?.(false)
     callbacks.onPausedChange(true)
     callbacks.onStatus("Paused.")
     if (meta) {
-      callbacks.onProgress({ doneBytes: receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
+      callbacks.onProgress({ doneBytes: dataSession.receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
       if (dataChannel.current?.readyState === "open") {
-        sendData(dataChannel.current, { type: "progress", doneBytes: receivedBytes, revision: meta.revision })
+        sendData(dataChannel.current, {
+          type: "progress",
+          doneBytes: dataSession.receivedBytes,
+          revision: meta.revision,
+        })
       }
-      void storageCoordinator.enqueue(() => checkpointReceivedData(true)).catch(callbacks.onError)
+      void dataSession.checkpoint(true).catch(callbacks.onError)
     }
     void wakeLock.stop()
   }
@@ -150,7 +152,11 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
         : "Peer connection interrupted. Waiting for signaling to reconnect...",
     sendSignal: sendReceiverSignal,
     onStatus: callbacks.onStatus,
-    onRecoveringChange: (recovering) => callbacks.onReconnectingChange?.(recovering),
+    onRecoveringChange: (recovering) => {
+      reconnecting = recovering
+      emitTransferStatus()
+      callbacks.onReconnectingChange?.(recovering)
+    },
     onRetryTokenChange: (token) => setP2PSessionRecoveryRetryToken(name, peerId, token),
   })
 
@@ -160,82 +166,24 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
     pc?.connectionState !== "failed" &&
     pc?.connectionState !== "disconnected"
 
-  const clearReceivedData = () => {
-    receivedBytes = 0
-    lastProgressAt = 0
-    verificationState.clear()
-  }
+  const clearReceivedData = () => dataSession.clear()
 
-  const resetReceivedData = () => storageCoordinator.reset(clearReceivedData)
+  const resetReceivedData = () => dataSession.discard()
 
   const beginStoppedTransferCleanup = () => {
     stoppedTransferCleanup ??= resetReceivedData()
     return stoppedTransferCleanup
   }
 
-  const prepareReceivedStorage = async () => {
-    if (meta) {
-      await storageCoordinator.prepare(meta, forceMemoryStorage, () => receivedBytes === 0, clearReceivedData)
-    }
-  }
-
-  const appendReceivedBlockData = async (chunk: ArrayBuffer) => {
-    await storageCoordinator.enqueue(async () => {
-      if (!meta) return
-      await storageCoordinator.initialize(meta, forceMemoryStorage)
-      // Persistent storage transfers this buffer to its worker, which detaches it.
-      // Capture the length first so the durable receive offset cannot move backwards.
-      const chunkByteLength = chunk.byteLength
-      await verificationState.appendFileChunk(chunk)
-      await storageCoordinator.append(receivedBytes, chunk)
-      receivedBytes += chunkByteLength
-      await checkpointReceivedData()
-    })
-  }
-
-  const checkpointReceivedData = async (force = false) => {
+  const notifyTransferComplete = (file: File, status: string) => {
     if (!meta) return
-    await storageCoordinator.checkpointData(
-      { meta, receivedBytes, completedHashes: verificationState.completedHashes() },
-      force,
-    )
-  }
-
-  const replaceReceivedBlock = (index: number, parts: ArrayBuffer[]) => storageCoordinator.replaceBlock(index, parts)
-
-  const createReceivedFile = (fileMeta: P2PFileMeta): Promise<File> => storageCoordinator.file(fileMeta)
-
-  const verifyReceivedBlocks = async (
-    manifest: P2PVerificationManifest,
-    indicesToVerify?: Iterable<number>,
-    isCurrent: () => boolean = () => true,
-  ): Promise<number[]> => {
-    return await verificationState.mismatches(
-      manifest,
-      (index) => storageCoordinator.verificationParts(index),
-      indicesToVerify,
-      isCurrent,
-    )
-  }
-
-  const finishVerifiedTransfer = async (status = "Transfer complete.", isCurrent: () => boolean = () => !isClosed) => {
-    if (!meta) return
-    const file = await createReceivedFile(meta)
-    if (!isCurrent()) return
-    if (file.size !== meta.size) {
-      const message = `Stored P2P file size mismatch: expected ${meta.size} bytes, got ${file.size} bytes.`
-      await failVerifiedTransfer(message, isCurrent)
-      if (isCurrent()) callbacks.onError(new Error(message))
-      return
-    }
-    verificationState.resetIncompleteRetries()
     hasCompletedTransfer = true
     transitionTransfer({ kind: "complete" })
     downloadRequestedChannel = undefined
     callbacks.onProgress({
       doneBytes: meta.size,
       totalBytes: meta.size,
-      speedBytesPerSecond: measureSpeed(speedTracker, meta.size, true),
+      speedBytesPerSecond: dataSession.speed(meta.size, true),
     })
     clearPauseState()
     callbacks.onStatus(status)
@@ -247,55 +195,39 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
     signalingTransport.reconsiderReconnect()
   }
 
-  const failVerifiedTransfer = async (message: string, isCurrent: () => boolean = () => !isClosed) => {
+  const handleTransferFailure = async (message: string, isCurrent: () => boolean) => {
     transitionTransfer({ kind: "idle" })
     downloadRequestedChannel = undefined
     await resetReceivedData()
     if (!isCurrent()) return
-    speedTracker = createSpeedTracker(0)
     callbacks.onProgress(undefined)
     clearPauseState()
     callbacks.onStatus(`${message} Receive the file again to retry.`)
     void wakeLock.stop()
   }
 
-  const emitRepairProgress = () => {
-    if (!meta) return
-    const repairBytes = verificationState.repairBytes(meta.size)
-    const doneBytes = Math.max(0, meta.size - repairBytes)
-    callbacks.onProgress({ doneBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
-    if (dataChannel.current) sendData(dataChannel.current, { type: "progress", doneBytes, revision: meta.revision })
-  }
-
-  const verifyOrRequestRepair = async (
-    manifest: P2PVerificationManifest,
-    indicesToVerify?: Iterable<number>,
-    isCurrent: () => boolean = () => true,
-  ) => {
-    const mismatches = await verifyReceivedBlocks(manifest, indicesToVerify, isCurrent)
-    if (!isCurrent()) return
-    if (mismatches.length === 0) {
-      if (dataChannel.current) sendData(dataChannel.current, { type: "verified" })
-      await finishVerifiedTransfer("File received and verified. Saving should start automatically.", isCurrent)
-      return
-    }
-
-    if (!verificationState.beginRepair(mismatches, maxVerificationRepairAttempts)) {
-      const message = `Transfer verification failed after ${maxVerificationRepairAttempts} repair attempts.`
-      await failVerifiedTransfer(message, isCurrent)
-      if (!isCurrent()) return
-      callbacks.onError(new Error(message))
-      return
-    }
-
-    transitionTransfer({ kind: "repairing" })
-    emitRepairProgress()
-    callbacks.onStatus(`Repairing ${mismatches.length} block${mismatches.length === 1 ? "" : "s"}...`)
-    if (dataChannel.current) sendData(dataChannel.current, { type: "repair-request", indices: mismatches })
-  }
+  const dataSession = new ReceiverDataSession({
+    meta: () => meta,
+    forceMemoryStorage: () => forceMemoryStorage,
+    transfer,
+    storage: storageCoordinator,
+    verification: verificationState,
+    callbacks,
+    send: (message) => {
+      if (dataChannel.current) sendData(dataChannel.current, message)
+    },
+    transition: transitionTransfer,
+    onComplete: notifyTransferComplete,
+    onFailure: handleTransferFailure,
+  })
 
   const preserveOrDisposeReceivedStorage = async (discardCompleted = false) => {
-    await storageCoordinator.preserveOrDispose(receivedBytes, isComplete(), clearReceivedData, discardCompleted)
+    await storageCoordinator.preserveOrDispose(
+      dataSession.receivedBytes,
+      isComplete(),
+      clearReceivedData,
+      discardCompleted,
+    )
   }
 
   interface FinishReceiverRuntimeOptions {
@@ -350,23 +282,25 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
     if (closeCleanupStarted) return
     closeCleanupStarted = true
     const preserveCurrent =
-      storageCoordinator.kind === "persistent" &&
+      receivedStorage.kind === "persistent" &&
       storageCoordinator.checkpoint !== undefined &&
-      receivedBytes > 0 &&
+      dataSession.receivedBytes > 0 &&
       !isComplete()
     sendReceiverSignal({ type: "receiver-leave", resumable: preserveCurrent })
-    storageCoordinator.queueDeletion(preserveCurrent)
+    receivedStorage.queueDeletion(preserveCurrent)
     finishReceiverRuntime({ pauseState: "keep", preserveRetryToken: connectionRecovery.retryToken !== undefined })
     if (ownsRoomSession) void preserveOrDisposeReceivedStorage(true).finally(releaseRoomLock)
   }
 
   const stopUnavailableRoom = async () => {
     if (isClosed) return
-    await storageCoordinator.enqueue(() => checkpointReceivedData(true)).catch(() => undefined)
+    await dataSession.checkpoint(true).catch(() => undefined)
     downloadRequestedChannel = undefined
     finishReceiverRuntime({
       transferState: { kind: "paused" },
-      progress: meta ? { doneBytes: receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 } : undefined,
+      progress: meta
+        ? { doneBytes: dataSession.receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 }
+        : undefined,
       pauseState: "paused",
     })
     callbacks.onStatus(
@@ -390,7 +324,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
     downloadRequestedChannel = channel
     void wakeLock.start()
     if (meta.verifyTransfer) await ensureXXHashReady()
-    await prepareReceivedStorage()
+    await dataSession.prepare()
     if (
       channel !== dataChannel.current ||
       channel.readyState !== "open" ||
@@ -398,15 +332,21 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
       isClosed
     )
       return
-    if (receivedBytes === 0 && meta?.verifyTransfer) {
+    if (dataSession.receivedBytes === 0 && meta?.verifyTransfer) {
       verificationState.startHash()
     }
-    lastProgressAt = performance.now()
-    speedTracker = createSpeedTracker(receivedBytes)
+    dataSession.reset()
     clearPauseState()
-    callbacks.onProgress(meta ? { doneBytes: receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 } : undefined)
-    sendData(channel, { type: "progress", doneBytes: receivedBytes, revision: meta.revision })
-    sendData(channel, { type: "download", offset: receivedBytes, revision: meta.revision })
+    callbacks.onProgress(
+      meta ? { doneBytes: dataSession.receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 } : undefined,
+    )
+    sendData(channel, { type: "progress", doneBytes: dataSession.receivedBytes, revision: meta.revision })
+    sendData(channel, {
+      type: "download",
+      offset: dataSession.receivedBytes,
+      revision: meta.revision,
+      receiveWindow: receiveWindowBytes,
+    })
   }
 
   const requestDownload = () => {
@@ -430,13 +370,13 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
     if (!nextMeta) return false
     // Completed OPFS-backed files must remain on disk while their transfer-history
     // cards can still preview or download them. Session close performs the cleanup.
-    if (isComplete()) storageCoordinator.archiveCurrent()
+    if (isComplete()) receivedStorage.archiveCurrent()
     if (resetCurrentData) await resetReceivedData()
     meta = nextMeta
     pendingUpdateMeta = undefined
     transitionTransfer({ kind: "idle" })
     downloadRequestedChannel = undefined
-    speedTracker = createSpeedTracker(0)
+    dataSession.reset()
     callbacks.onUpdateAvailable?.(undefined)
     callbacks.onMeta(nextMeta)
     callbacks.onProgress(undefined)
@@ -455,7 +395,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
     await cleanup
     if (stoppedTransferCleanup === cleanup) stoppedTransferCleanup = undefined
     if (!isCurrent()) return
-    speedTracker = createSpeedTracker(0)
+    dataSession.reset()
     callbacks.onProgress(undefined)
     clearPauseState()
     if (shouldRestart) {
@@ -482,7 +422,8 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
   const acceptUpdate = () => {
     if (isClosed || !pendingUpdateMeta) return
     const channel = dataChannel.current
-    const hasActiveTransfer = !isComplete() && (wantsDownload() || isPaused() || isPausePending() || receivedBytes > 0)
+    const hasActiveTransfer =
+      !isComplete() && (wantsDownload() || isPaused() || isPausePending() || dataSession.receivedBytes > 0)
     if (channel?.readyState === "open" && hasActiveTransfer) {
       transitionTransfer({ kind: "stopping", restartAfterStop: true })
       downloadRequestedChannel = undefined
@@ -510,7 +451,8 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
     downloadRequestedChannel = undefined
     callbacks.onPausePendingChange?.(true)
     callbacks.onStatus("Pausing...")
-    if (meta) callbacks.onProgress({ doneBytes: receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
+    if (meta)
+      callbacks.onProgress({ doneBytes: dataSession.receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
     if (isPeerTransportUsable() && channel) {
       sendData(channel, { type: "pause" })
       return
@@ -567,7 +509,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
           if (
             meta &&
             !p2pResumeMetaMatches(meta, message.meta) &&
-            (receivedBytes > 0 || wantsDownload() || isPaused() || isComplete())
+            (dataSession.receivedBytes > 0 || wantsDownload() || isPaused() || isComplete())
           ) {
             pendingUpdateMeta = message.meta
             callbacks.onUpdateAvailable?.(message.meta)
@@ -578,21 +520,31 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
           meta = message.meta
           callbacks.onMeta(meta)
           if (isPaused()) {
-            callbacks.onProgress({ doneBytes: receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
-            sendData(channel, { type: "progress", doneBytes: receivedBytes, revision: meta.revision })
+            callbacks.onProgress({
+              doneBytes: dataSession.receivedBytes,
+              totalBytes: meta.size,
+              speedBytesPerSecond: 0,
+            })
+            sendData(channel, { type: "progress", doneBytes: dataSession.receivedBytes, revision: meta.revision })
             sendData(channel, { type: "pause" })
             callbacks.onStatus("Paused.")
             return
           }
           callbacks.onStatus(
-            wantsDownload() && receivedBytes > 0
+            wantsDownload() && dataSession.receivedBytes > 0
               ? "File details received. Resuming transfer..."
               : "File details received. Ready to receive.",
           )
           if (wantsDownload()) await requestDownloadFromCurrentOffset()
         } else if (message.type === "file-update") {
-          if (message.meta.revision && message.meta.revision === meta?.revision) return
-          if (!isComplete() && receivedBytes === 0 && !wantsDownload() && !isPaused() && !isPausePending()) {
+          if (message.meta.revision === meta?.revision) return
+          if (
+            !isComplete() &&
+            dataSession.receivedBytes === 0 &&
+            !wantsDownload() &&
+            !isPaused() &&
+            !isPausePending()
+          ) {
             meta = message.meta
             callbacks.onMeta(meta)
             callbacks.onProgress(undefined)
@@ -609,39 +561,10 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
         } else if (message.type === "verification-chunk") {
           verificationState.appendManifest(message.startIndex, message.hashes)
         } else if (message.type === "done") {
-          if (!meta) return
-          if (isDiscarding()) return
-          if (receivedBytes < meta.size) {
-            verificationState.clearManifestAssembly()
-            const retry = verificationState.nextIncompleteRetry(maxIncompleteTransferRetries)
-            if (retry === undefined) {
-              const errorMessage = `P2P transfer remained incomplete after ${maxIncompleteTransferRetries} retries.`
-              await failVerifiedTransfer(errorMessage, isCurrentChannel)
-              if (isCurrentChannel()) callbacks.onError(new Error(errorMessage))
-              return
-            }
+          if ((await dataSession.finishTransfer(message.verification, isCurrentChannel)) && isCurrentChannel()) {
             downloadRequestedChannel = undefined
-            callbacks.onStatus(
-              `Transfer ended early at ${receivedBytes} of ${meta.size} bytes. Requesting the missing data ` +
-                `(retry ${retry}/${maxIncompleteTransferRetries})...`,
-            )
-            callbacks.onProgress({ doneBytes: receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
             await requestDownloadFromCurrentOffset()
-            return
           }
-          if (meta.verifyTransfer) {
-            const result = verificationState.finishManifest(message.verification, meta.size)
-            if ("error" in result) {
-              callbacks.onError(new Error(result.error))
-              return
-            }
-            const manifest = result.manifest
-            transitionTransfer({ kind: "verifying" })
-            callbacks.onStatus("Verifying transfer...")
-            await verifyOrRequestRepair(manifest, undefined, isCurrentChannel)
-            return
-          }
-          await finishVerifiedTransfer("Transfer complete.", isCurrentChannel)
         } else if (message.type === "error") {
           callbacks.onError(new Error(message.message))
         } else if (message.type === "paused") {
@@ -650,65 +573,14 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
           const shouldRestart = restartAfterStop()
           await finishStoppedTransfer(shouldRestart, isCurrentChannel)
         } else if (message.type === "repair-start") {
-          if (!verificationState.manifest || message.index >= verificationState.manifest.hashes.length) {
-            throw new Error("Invalid P2P repair block index.")
-          }
-          const expectedSize = verificationBlockByteLength(message.index, meta?.size ?? 0)
-          if (message.size !== expectedSize) throw new Error("P2P repair block size mismatch.")
-          verificationState.startRepairBlock(message.index, message.size)
-          callbacks.onStatus(`Repairing block ${message.index + 1}...`)
+          dataSession.startRepair(message.index, message.size)
         } else if (message.type === "repair-end") {
-          try {
-            const completedRepair = verificationState.finishRepairBlock(message.index)
-            if (completedRepair) {
-              await replaceReceivedBlock(message.index, completedRepair.parts)
-              if (!isCurrentChannel()) return
-              const indicesToVerify = verificationState.completeRepair(message.index, completedRepair.repairedHash)
-              emitRepairProgress()
-              if (indicesToVerify && verificationState.manifest) {
-                callbacks.onStatus("Verifying repaired blocks...")
-                transitionTransfer({ kind: "verifying" })
-                await verifyOrRequestRepair(verificationState.manifest, indicesToVerify, isCurrentChannel)
-              }
-            }
-          } catch (error) {
-            callbacks.onError(asError(error))
-          }
+          await dataSession.finishRepair(message.index, isCurrentChannel)
         }
         return
       }
 
-      if (!meta) return
-      const isExpectedFileData = wantsDownload() || isPausePending()
-      const isExpectedRepairData = transfer.isRepairing() && verificationState.hasRepairBlock
-      if (isDiscarding()) return
-      if (!isExpectedFileData && !isExpectedRepairData) {
-        throw new Error("Unexpected P2P binary data for the current transfer state.")
-      }
-      const chunk = data instanceof Blob ? await data.arrayBuffer() : (data as ArrayBuffer)
-      if (!(chunk instanceof ArrayBuffer)) throw new Error("Invalid P2P binary data.")
-      if (!isCurrentChannel()) return
-      if (verificationState.hasRepairBlock) {
-        await verificationState.appendRepairChunk(chunk)
-        return
-      }
-      if (receivedBytes > meta.size || chunk.byteLength > meta.size - receivedBytes) {
-        throw new Error("P2P transfer exceeds the declared file size.")
-      }
-      await appendReceivedBlockData(chunk)
-      if (!isCurrentChannel()) return
-      const now = performance.now()
-      if (meta && (now - lastProgressAt >= progressUpdateIntervalMs || receivedBytes >= meta.size)) {
-        lastProgressAt = now
-        if (dataChannel.current) {
-          sendData(dataChannel.current, { type: "progress", doneBytes: receivedBytes, revision: meta.revision })
-        }
-        callbacks.onProgress({
-          doneBytes: receivedBytes,
-          totalBytes: meta.size,
-          speedBytesPerSecond: measureSpeed(speedTracker, receivedBytes),
-        })
-      }
+      await dataSession.receive(data, isCurrentChannel)
     }
 
     dataChannel.attach(channel, {
@@ -726,7 +598,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
         callbacks.onStatus(
           isPaused()
             ? "Paused. Waiting for file details..."
-            : wantsDownload() && receivedBytes > 0
+            : wantsDownload() && dataSession.receivedBytes > 0
               ? "Reconnected. Resuming transfer..."
               : "Connected. Waiting for file details...",
         )
@@ -735,26 +607,20 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
       onMessage: (data, _activeChannel, isCurrentChannel) => handleDataMessage(data, isCurrentChannel),
       onMessageError: async (receivedError, activeChannel) => {
         if (
-          (storageCoordinator.kind === "opfs" || storageCoordinator.kind === "persistent") &&
-          (meta?.size ?? 0) <= MAX_MEMORY_P2P_BYTES
+          receivedError instanceof P2PReceiveStorageError &&
+          (receivedStorage.kind === "opfs" || receivedStorage.kind === "persistent")
         ) {
-          forceMemoryStorage = true
+          const canRetryInMemory = (meta?.size ?? 0) <= MAX_MEMORY_P2P_BYTES
+          if (canRetryInMemory) forceMemoryStorage = true
           transitionTransfer({ kind: "stopping", restartAfterStop: false })
           downloadRequestedChannel = undefined
           callbacks.onProgress(undefined)
           clearPauseState()
-          callbacks.onStatus("Disk storage failed. Stopping transfer...")
-          sendData(activeChannel, { type: "stop" })
-          await beginStoppedTransferCleanup()
-          callbacks.onError(new Error(`Unable to write the P2P temporary file: ${receivedError.message}`))
-          return
-        }
-        if (storageCoordinator.kind === "opfs" || storageCoordinator.kind === "persistent") {
-          transitionTransfer({ kind: "stopping", restartAfterStop: false })
-          downloadRequestedChannel = undefined
-          callbacks.onProgress(undefined)
-          clearPauseState()
-          callbacks.onStatus("Disk storage failed and the file is too large for memory fallback.")
+          callbacks.onStatus(
+            canRetryInMemory
+              ? "Disk storage failed. Stopping transfer..."
+              : "Disk storage failed and the file is too large for memory fallback.",
+          )
           sendData(activeChannel, { type: "stop" })
           await beginStoppedTransferCleanup()
           callbacks.onError(new Error(`Unable to write the P2P temporary file: ${receivedError.message}`))
@@ -768,7 +634,10 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
     })
   }
 
-  function ensurePeerConnection(iceMode: P2PIceMode = "all"): RTCPeerConnection | undefined {
+  function ensurePeerConnection(
+    connectionNegotiationId: string,
+    iceMode: P2PIceMode = "all",
+  ): RTCPeerConnection | undefined {
     if (isClosed) return undefined
     if (pc) return pc
     const connection = new RTCPeerConnection(rtcConfig(iceServers, { mode: iceMode }))
@@ -776,7 +645,12 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
     const refreshCurrentConnectionRoute = () => refreshConnectionRoute(connection)
     connection.onicecandidate = (event) => {
       if (!isClosed && pc === connection && event.candidate) {
-        sendReceiverSignal({ type: "candidate", peerId, candidate: event.candidate.toJSON(), negotiationId })
+        sendReceiverSignal({
+          type: "candidate",
+          peerId,
+          candidate: event.candidate.toJSON(),
+          negotiationId: connectionNegotiationId,
+        })
       }
     }
     connection.oniceconnectionstatechange = () => {
@@ -840,34 +714,24 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
   const restoreSavedTransfer = async () => {
     const checkpoint = storageCoordinator.checkpoint
     if (!checkpoint) return
-    if (!storageCoordinator.canRestore()) {
+    if (!receivedStorage.canRestore()) {
       storageCoordinator.clearCheckpoint()
       return
     }
 
     callbacks.onStatus("Restoring saved transfer...")
     try {
-      const completedHashBytes = checkpoint.meta.verifyTransfer
-        ? checkpoint.completedHashes.length * verificationBlockSize
-        : checkpoint.receivedBytes
-      const restoredTail = await storageCoordinator.restore(checkpoint.receivedBytes, completedHashBytes)
+      await dataSession.restore(checkpoint)
       meta = checkpoint.meta
-      receivedBytes = checkpoint.receivedBytes
       transitionTransfer({ kind: "paused" })
-      if (meta.verifyTransfer) {
-        await ensureXXHashReady()
-        verificationState.startHash(checkpoint.completedHashes.slice())
-        await verificationState.appendFileChunk(restoredTail)
-      }
-      speedTracker = createSpeedTracker(receivedBytes)
       callbacks.onMeta(meta)
-      callbacks.onProgress({ doneBytes: receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
+      callbacks.onProgress({ doneBytes: dataSession.receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
       callbacks.onPausePendingChange?.(false)
       callbacks.onPausedChange(true)
       callbacks.onStatus("Saved transfer restored and paused. Looking for the sender...")
     } catch {
       storageCoordinator.clearCheckpoint()
-      storageCoordinator.rotateId()
+      receivedStorage.rotateId()
       meta = undefined
       clearReceivedData()
       callbacks.onStatus("Saved transfer was unavailable. Restarting from the beginning...")
@@ -891,7 +755,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
               ? "Paused. Signaling reconnected..."
               : "Paused. Looking for the sender..."
             : isReconnect
-              ? receivedBytes > 0
+              ? dataSession.receivedBytes > 0
                 ? "Signaling reconnected. Waiting to resume transfer..."
                 : "Signaling reconnected. Looking for the sender..."
               : "Looking for the sender...",
@@ -914,7 +778,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
         callbacks.onStatus("Sender left.")
         return
       }
-      if (!isPeerTransportUsable() && (wantsDownload() || isPaused() || receivedBytes > 0)) {
+      if (!isPeerTransportUsable() && (wantsDownload() || isPaused() || dataSession.receivedBytes > 0)) {
         connectionRecovery.begin()
       }
       callbacks.onStatus(
@@ -924,7 +788,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
             : "P2P signaling disconnected. Transfer continues."
           : isPaused()
             ? "Paused. Reconnecting to the sender..."
-            : wantsDownload() || receivedBytes > 0
+            : wantsDownload() || dataSession.receivedBytes > 0
               ? "Connection lost. Reconnecting to resume transfer..."
               : "P2P signaling closed. Reconnecting...",
       )
@@ -938,7 +802,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
         isPeerTransportUsable() ||
         connectionRecovery.active ||
         storageCoordinator.checkpoint !== undefined ||
-        receivedBytes > 0 ||
+        dataSession.receivedBytes > 0 ||
         isPaused() ||
         wantsDownload()
       ) {
@@ -998,7 +862,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
           callbacks.onStatus(
             isPaused()
               ? "Paused. Waiting for WebRTC pairing..."
-              : wantsDownload() || receivedBytes > 0
+              : wantsDownload() || dataSession.receivedBytes > 0
                 ? "Reconnected. Waiting for WebRTC pairing..."
                 : "Sender found. Pairing...",
           )
@@ -1011,7 +875,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
         resetPeerConnection({ preserveConnectionRoute: true })
         negotiationId = message.negotiationId
         if (!isCurrentSocket()) return
-        const connection = ensurePeerConnection(message.directOnly === true ? "direct" : "all")
+        const connection = ensurePeerConnection(message.negotiationId, message.directOnly === true ? "direct" : "all")
         if (!connection) return
         await connection.setRemoteDescription(message.sdp)
         if (!isCurrentSocket() || pc !== connection) return
@@ -1021,7 +885,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
         if (!isCurrentSocket() || pc !== connection) return
         await connection.setLocalDescription(answer)
         if (!isCurrentSocket() || pc !== connection) return
-        signalingTransport.send({ type: "answer", peerId, sdp: answer, negotiationId })
+        signalingTransport.send({ type: "answer", peerId, sdp: answer, negotiationId: message.negotiationId })
       }
       if (message.type === "peer-signaling-disconnected" && message.role === "sender") {
         senderSignalingAvailable = false
@@ -1037,7 +901,7 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
         )
       }
       if (message.type === "candidate") {
-        if (message.negotiationId && negotiationId && message.negotiationId !== negotiationId) return
+        if (negotiationId && message.negotiationId !== negotiationId) return
         const connection = pc
         if (connection) {
           await iceCandidates.addOrBuffer(connection, message.candidate, () => isCurrentSocket() && pc === connection)
@@ -1067,9 +931,13 @@ export function startP2PReceiver(name: string, config: PublicEnv, callbacks: P2P
           callbacks.onPausePendingChange?.(false)
           callbacks.onPausedChange(true)
           if (meta) {
-            callbacks.onProgress({ doneBytes: receivedBytes, totalBytes: meta.size, speedBytesPerSecond: 0 })
+            callbacks.onProgress({
+              doneBytes: dataSession.receivedBytes,
+              totalBytes: meta.size,
+              speedBytesPerSecond: 0,
+            })
           }
-          void storageCoordinator.enqueue(() => checkpointReceivedData(true)).catch(callbacks.onError)
+          void dataSession.checkpoint(true).catch(callbacks.onError)
           void wakeLock.stop()
           callbacks.onStatus("Connection recovery failed. Resume to retry.")
         }

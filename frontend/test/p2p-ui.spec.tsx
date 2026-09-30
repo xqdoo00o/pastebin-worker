@@ -5,7 +5,13 @@ import { DisplayPaste } from "../pages/DisplayPaste.js"
 import { PasteBin } from "../pages/PasteBin.js"
 import { P2PTransferPanel } from "../components/P2PTransferPanel.js"
 import * as ContentUtils from "../utils/content.js"
-import type { P2PFileMeta, P2PProgress, P2PReceiverSession, P2PSenderPeerInfo } from "../utils/p2p/protocol.js"
+import type {
+  P2PFileMeta,
+  P2PProgress,
+  P2PReceiverSession,
+  P2PSenderPeerInfo,
+  P2PTransferStatus,
+} from "../utils/p2p/protocol.js"
 import type { PublicEnv } from "../../shared/interfaces.js"
 import { stubBrowserFunctions, unStubBrowserFunctions } from "./testUtils.js"
 import { MAX_P2P_AUTO_PREVIEW_BYTES } from "../../shared/constants.js"
@@ -14,6 +20,7 @@ import "@testing-library/jest-dom/vitest"
 
 interface ReceiverCallbacks {
   onStatus: (status: string) => void
+  onTransferStatusChange: (status: P2PTransferStatus) => void
   onMeta: (meta: P2PFileMeta) => void
   onUpdateAvailable?: (meta: P2PFileMeta | undefined) => void
   onProgress: (progress: P2PProgress | undefined) => void
@@ -106,6 +113,7 @@ vi.mock("../utils/p2pSender.js", () => ({
 }))
 
 const fileMeta: P2PFileMeta = {
+  revision: "test-revision",
   name: "archive.zip",
   size: 1024,
   type: "application/zip",
@@ -372,6 +380,7 @@ describe("DisplayPaste P2P receiver", () => {
 
   it("keeps hidden transfer statistics in the layout while paused", async () => {
     await renderP2PDisplay()
+    act(() => receiverSessions[0].callbacks.onTransferStatusChange("DOWNLOADING"))
 
     act(() => receiverSessions[0].callbacks.onMeta(fileMeta))
     act(() =>
@@ -386,6 +395,7 @@ describe("DisplayPaste P2P receiver", () => {
     expect(screen.getByText("00:01")).toBeInTheDocument()
 
     act(() => receiverSessions[0].callbacks.onPausedChange(true))
+    act(() => receiverSessions[0].callbacks.onTransferStatusChange("PAUSED"))
     expect(screen.getByText("Paused")).toBeInTheDocument()
     expect(screen.getByText("0.5 KB/s").parentElement).toHaveClass("invisible")
     expect(screen.getByText("00:01")).toBeInTheDocument()
@@ -403,6 +413,7 @@ describe("DisplayPaste P2P receiver", () => {
       }),
     )
     act(() => receiverSessions[0].callbacks.onReconnectingChange?.(true))
+    act(() => receiverSessions[0].callbacks.onTransferStatusChange("RECONNECTING"))
 
     expect(screen.getByText("Reconnecting")).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "Pause" })).toBeEnabled()
@@ -431,6 +442,7 @@ describe("DisplayPaste P2P receiver", () => {
     act(() => receiverSessions[0].callbacks.onMeta(fileMeta))
     act(() => receiverSessions[0].callbacks.onProgress({ doneBytes: fileMeta.size, totalBytes: fileMeta.size }))
     act(() => receiverSessions[0].callbacks.onStatus("File received and verified. Saving should start automatically."))
+    act(() => receiverSessions[0].callbacks.onTransferStatusChange("DONE"))
     await act(async () => {
       await receiverSessions[0].callbacks.onFile(
         new File([new Uint8Array([0])], fileMeta.name, { type: fileMeta.type }),
@@ -750,11 +762,16 @@ describe("DisplayPaste P2P receiver", () => {
     act(() =>
       receiverSessions[0].callbacks.onProgress({ doneBytes: 512, totalBytes: fileMeta.size, speedBytesPerSecond: 0 }),
     )
-    act(() => receiverSessions[0].callbacks.onStatus("Repairing 3 blocks..."))
+    act(() => {
+      receiverSessions[0].callbacks.onTransferStatusChange("REPAIRING")
+      receiverSessions[0].callbacks.onStatus("Recovering damaged data...")
+    })
 
     expect(screen.getByText("REPAIRING")).toBeInTheDocument()
     expect(screen.getByText("512 Bytes / 1.00 KB")).toBeInTheDocument()
     expect(screen.getByText("0 KB/s")).toBeInTheDocument()
+    act(() => receiverSessions[0].callbacks.onTransferStatusChange("VERIFYING"))
+    expect(screen.queryByText("REPAIRING")).not.toBeInTheDocument()
   })
 })
 
@@ -883,15 +900,11 @@ describe("P2PTransferPanel", () => {
     expect(text.indexOf("new.bin")).toBeLessThan(text.indexOf("Safari 18"))
     expect(screen.getAllByText("old.bin")).toHaveLength(1)
     expect(screen.getAllByText("new.bin")).toHaveLength(1)
-    expect(screen.getByText("old.bin")).toHaveClass("block", "truncate")
-    expect(screen.getByText("old.bin").parentElement).toHaveClass("overflow-hidden", "font-semibold")
+    expect(screen.getByText("old.bin")).toHaveClass("truncate", "font-semibold")
     expect(screen.getByText("old.bin")).toHaveAttribute("title", "old.bin")
     expect(container.querySelectorAll("hr")).toHaveLength(3)
     for (const filename of ["old.bin", "new.bin"]) {
-      expect(screen.getByText(filename).parentElement?.previousElementSibling).toHaveClass(
-        "border-t-1",
-        "border-default-200",
-      )
+      expect(screen.getByText(filename).previousElementSibling).toHaveClass("border-t-1", "border-default-200")
     }
   })
 
@@ -905,7 +918,7 @@ describe("P2PTransferPanel", () => {
       />,
     )
 
-    expect(screen.getByText("new.bin").parentElement).toHaveClass("text-foreground")
+    expect(screen.getByText("new.bin")).toHaveClass("text-foreground")
     expect(screen.queryByText("old.bin")).not.toBeInTheDocument()
   })
 
@@ -1113,11 +1126,7 @@ describe("PasteBin P2P update", () => {
     await userEvent.click(screen.getByRole("button", { name: "Update P2P" }))
 
     await vi.waitFor(() => expect(p2pMocks.updateFile).toHaveBeenCalledTimes(1))
-    expect(p2pMocks.updateRoomOptions).toHaveBeenCalledWith(
-      __WRANGLER_CONFIG__.DEFAULT_P2P_EXPIRATION,
-      String(__WRANGLER_CONFIG__.DEFAULT_P2P_TRANSFERS),
-      expect.any(AbortSignal),
-    )
+    expect(p2pMocks.updateRoomOptions).not.toHaveBeenCalled()
     const updatedFile = p2pMocks.updateFile.mock.calls[0][0]
     expect(await updatedFile.text()).toStrictEqual("second version")
     expect(screen.getByRole("textbox", { name: "Pair URL" })).toHaveValue("https://example.com/p/room")

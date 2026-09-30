@@ -1,3 +1,4 @@
+import { benchmarkBytes, median } from "../benchmark-utils.mjs"
 import { readFile } from "node:fs/promises"
 import { resolve, join } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -31,24 +32,27 @@ function parseOptions(args) {
   return result
 }
 
-function sourceBytes(length) {
-  let state = 0x9e3779b9
-  return Uint8Array.from({ length }, () => {
-    state ^= state << 13
-    state ^= state >>> 17
-    state ^= state << 5
-    return state & 0xff
-  })
+function drawQr(lum, width, qr, scale, left, top) {
+  for (let y = 0; y < qr.size; y++) {
+    for (let x = 0; x < qr.size; x++) {
+      const value = qr.get(x, y) ? 18 : 244
+      const pixelX = left + x * scale
+      const pixelY = top + y * scale
+      for (let yy = 0; yy < scale; yy++) {
+        lum.fill(value, (pixelY + yy) * width + pixelX, (pixelY + yy) * width + pixelX + scale)
+      }
+    }
+  }
 }
 
 function makeFixture() {
-  const payload = sourceBytes(PAYLOAD_SIZE)
+  const payload = benchmarkBytes(PAYLOAD_SIZE)
   const qr = generate(mode.bytes(payload), {
     minCorrectionLevel: correction.M,
     maxCorrectionLevel: correction.M,
     minVersion: QR_VERSION,
     maxVersion: QR_VERSION,
-    mask: 4,
+    mask: 3,
   })
   const rasterSize = (qr.size + 2 * QR_MARGIN) * QR_SCALE
   const origin = Math.floor((IMAGE_SIZE - rasterSize) / 2)
@@ -61,16 +65,7 @@ function makeFixture() {
   lum.fill(244)
   blank.fill(244)
   blankPacked.fill(244)
-  for (let y = 0; y < qr.size; y++) {
-    for (let x = 0; x < qr.size; x++) {
-      const value = qr.get(x, y) ? 18 : 244
-      const left = codeOrigin + x * QR_SCALE
-      const top = codeOrigin + y * QR_SCALE
-      for (let yy = 0; yy < QR_SCALE; yy++) {
-        lum.fill(value, (top + yy) * IMAGE_SIZE + left, (top + yy) * IMAGE_SIZE + left + QR_SCALE)
-      }
-    }
-  }
+  drawQr(lum, IMAGE_SIZE, qr, QR_SCALE, codeOrigin, codeOrigin)
   for (let index = 0; index < lum.length; index++) {
     const dark = lum[index] < 128
     const [red, green, blue] = dark ? [8, 20, 32] : [238, 247, 252]
@@ -96,6 +91,38 @@ function makeFixture() {
     }
   }
 
+  // The camera path requests up to nine symbols. Keep that path measurable
+  // separately from the historical single-symbol fixture and flat miss.
+  const cameraPayloads = Array.from({ length: 9 }, (_, index) =>
+    Uint8Array.from({ length: 80 }, (__, offset) => (offset * 31 + index * 17) & 0xff),
+  )
+  const cameraLum = new Uint8Array(lum.length).fill(244)
+  const cameraVersion = 7
+  // Keep the four histogram sample rows inside QR data rather than quiet zones.
+  const cameraScale = 4
+  const cameraQrSize = 17 + 4 * cameraVersion
+  const cameraCell = (cameraQrSize + 2 * QR_MARGIN) * cameraScale
+  const cameraOrigin = Math.floor((IMAGE_SIZE - cameraCell * 3) / 2)
+  for (let index = 0; index < cameraPayloads.length; index++) {
+    const code = generate(mode.bytes(cameraPayloads[index]), {
+      minCorrectionLevel: correction.M,
+      maxCorrectionLevel: correction.M,
+      minVersion: cameraVersion,
+      maxVersion: cameraVersion,
+      mask: 3,
+    })
+    const left = cameraOrigin + (index % 3) * cameraCell + QR_MARGIN * cameraScale
+    const top = cameraOrigin + Math.floor(index / 3) * cameraCell + QR_MARGIN * cameraScale
+    drawQr(cameraLum, IMAGE_SIZE, code, cameraScale, left, top)
+  }
+
+  const texturedMiss = new Uint8Array(lum.length)
+  for (let y = 0; y < IMAGE_SIZE; y++) {
+    for (let x = 0; x < IMAGE_SIZE; x++) {
+      texturedMiss[y * IMAGE_SIZE + x] = ((x >> 2) ^ (y >> 2)) & 1 ? 18 : 244
+    }
+  }
+
   return {
     payload,
     lum,
@@ -103,6 +130,9 @@ function makeFixture() {
     bgrx,
     blank,
     blankPacked,
+    cameraLum,
+    cameraPayloads,
+    texturedMiss,
     apngMono1,
     blankApngMono1,
     apngSize,
@@ -147,6 +177,8 @@ function prepare(codec, fixture) {
   const bgrxPtr = codec._malloc(fixture.bgrx.length)
   const blankPtr = codec._malloc(fixture.blank.length)
   const blankPackedPtr = codec._malloc(fixture.blankPacked.length)
+  const cameraPtr = codec._malloc(fixture.cameraLum.length)
+  const texturedMissPtr = codec._malloc(fixture.texturedMiss.length)
   const apngMono1Ptr = codec._malloc(fixture.apngMono1.length)
   const blankApngMono1Ptr = codec._malloc(fixture.blankApngMono1.length)
   codec.HEAPU8.set(fixture.lum, lumPtr)
@@ -154,6 +186,8 @@ function prepare(codec, fixture) {
   codec.HEAPU8.set(fixture.bgrx, bgrxPtr)
   codec.HEAPU8.set(fixture.blank, blankPtr)
   codec.HEAPU8.set(fixture.blankPacked, blankPackedPtr)
+  codec.HEAPU8.set(fixture.cameraLum, cameraPtr)
+  codec.HEAPU8.set(fixture.texturedMiss, texturedMissPtr)
   codec.HEAPU8.set(fixture.apngMono1, apngMono1Ptr)
   codec.HEAPU8.set(fixture.blankApngMono1, blankApngMono1Ptr)
   const full = (kind) => {
@@ -161,8 +195,8 @@ function prepare(codec, fixture) {
       kind === "lum"
         ? codec.readFullLum(lumPtr, fixture.width, fixture.height, 1)
         : kind === "bgrx"
-            ? codec.readFullBGRX(bgrxPtr, fixture.width, fixture.height, 1)
-            : codec.readFull(rgbaPtr, fixture.width, fixture.height, 1),
+          ? codec.readFullBGRX(bgrxPtr, fixture.width, fixture.height, 1)
+          : codec.readFull(rgbaPtr, fixture.width, fixture.height, 1),
     )
     const valid = symbols.length === 1 && equalBytes(symbols[0], fixture.payload)
     if (!valid) throw new Error(`readFull${kind === "lum" ? "Lum" : ""} failed the benchmark fixture`)
@@ -172,6 +206,26 @@ function prepare(codec, fixture) {
     const symbols = takeSymbols(codec.readFullLum(blankPtr, fixture.width, fixture.height, 1))
     const valid = symbols.length === 0
     if (!valid) throw new Error("readFullLum unexpectedly decoded the blank fixture")
+  }
+
+  const cameraSingle = () => {
+    const symbols = takeSymbols(codec.readFullLum(lumPtr, fixture.width, fixture.height, 9))
+    if (symbols.length !== 1 || !equalBytes(symbols[0], fixture.payload)) {
+      throw new Error("Nine-symbol camera search failed the single-symbol fixture")
+    }
+  }
+
+  const cameraGrid = () => {
+    const symbols = takeSymbols(codec.readFullLum(cameraPtr, fixture.width, fixture.height, 9))
+    const matched = fixture.cameraPayloads.filter((expected) => symbols.some((actual) => equalBytes(actual, expected)))
+    if (symbols.length !== fixture.cameraPayloads.length || matched.length !== fixture.cameraPayloads.length) {
+      throw new Error(`Nine-symbol camera search found ${symbols.length} symbols, ${matched.length} expected`)
+    }
+  }
+
+  const cameraTexturedMiss = () => {
+    const symbols = takeSymbols(codec.readFullLum(texturedMissPtr, fixture.width, fixture.height, 9))
+    if (symbols.length !== 0) throw new Error("Textured camera miss unexpectedly decoded a symbol")
   }
 
   const packedMiss = (kind) => {
@@ -191,9 +245,7 @@ function prepare(codec, fixture) {
           const symbols = takeSymbols(
             codec.readModuleGridMono1(ptr, fixture.apngSize, fixture.apngSize, QR_VERSION, 1, 1),
           )
-          const valid = blank
-            ? symbols.length === 0
-            : symbols.length === 1 && equalBytes(symbols[0], fixture.payload)
+          const valid = blank ? symbols.length === 0 : symbols.length === 1 && equalBytes(symbols[0], fixture.payload)
           if (!valid) throw new Error(`APNG direct-grid ${blank ? "miss" : "decode"} failed the benchmark fixture`)
         }
       : undefined
@@ -201,19 +253,20 @@ function prepare(codec, fixture) {
   return {
     cases: [
       { name: "readFullLum", iterations: 8, run: () => full("lum") },
-      ...(apngGridDirect
-        ? [{ name: "readModuleGridMono1", iterations: 20, run: () => apngGridDirect() }]
-        : []),
+      { name: "readFullLumCameraSingle", iterations: 8, run: cameraSingle },
+      { name: "readFullLumCameraGrid", iterations: 4, run: cameraGrid },
+      { name: "readFullLumCameraTexturedMiss", iterations: 8, run: cameraTexturedMiss },
+      ...(apngGridDirect ? [{ name: "readModuleGridMono1", iterations: 20, run: () => apngGridDirect() }] : []),
       { name: "readFullRGBA", iterations: 8, run: () => full("rgba") },
       { name: "readFullBGRX", iterations: 8, run: () => full("bgrx") },
       { name: "readFullLumMiss", iterations: 12, run: fullMiss },
-      ...(apngGridDirect
-        ? [{ name: "readModuleGridMono1Miss", iterations: 30, run: () => apngGridDirect(true) }]
-        : []),
+      ...(apngGridDirect ? [{ name: "readModuleGridMono1Miss", iterations: 30, run: () => apngGridDirect(true) }] : []),
       { name: "readFullRGBAMiss", iterations: 12, run: () => packedMiss("rgba") },
       { name: "readFullBGRXMiss", iterations: 12, run: () => packedMiss("bgrx") },
     ],
     dispose() {
+      codec._free(texturedMissPtr)
+      codec._free(cameraPtr)
       codec._free(blankApngMono1Ptr)
       codec._free(apngMono1Ptr)
       codec._free(blankPtr)
@@ -223,11 +276,6 @@ function prepare(codec, fixture) {
       codec._free(lumPtr)
     },
   }
-}
-
-function median(values) {
-  const sorted = [...values].sort((left, right) => left - right)
-  return sorted[Math.floor(sorted.length / 2)]
 }
 
 function measure(test) {

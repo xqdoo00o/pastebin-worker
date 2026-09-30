@@ -5,6 +5,7 @@ import {
   fitsInOneStream,
   isOpticalCompressionCandidate,
   MAX_SOURCE_SYMBOLS,
+  opticalPartPayloadSize,
   smallestSufficientFrameSize,
   sourceSymbolCount,
 } from "../../optical/shared/protocol.js"
@@ -35,14 +36,20 @@ interface OpticalStreamOptions {
 }
 
 export function useOpticalStream({ file, highlightLanguage, settings, onError }: OpticalStreamOptions) {
-  const [preparedFile, setPreparedFile] = useState<PreparedOpticalFile>()
+  const [payload, setPayload] = useState<{ source: File; mediaType: string }>()
+  const partitionRequestRef = useRef(0)
+  const [prepared, setPrepared] = useState<{
+    source: File
+    mediaType: string
+    partPayloadSize: number
+    summary: PreparedOpticalFile
+  }>()
   const [error, setError] = useState<string>()
   const [status, setStatus] = useState("Preparing QR camera stream...")
   const [streamInfo, setStreamInfo] = useState<OpticalStreamInfo>()
   const [streamReady, setStreamReady] = useState(false)
   const [rendererBackend, setRendererBackend] = useState<"webgl2" | "2d">("webgl2")
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const [partCount, setPartCount] = useState(1)
   const [currentPart, setCurrentPart] = useState(0)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const fallbackCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -59,6 +66,14 @@ export function useOpticalStream({ file, highlightLanguage, settings, onError }:
   const lastCodecRef = useRef<string | undefined>(undefined)
   const switchPartRef = useRef<(part: number) => void>(() => undefined)
   const mediaType = withHighlightLanguage(file.type, highlightLanguage ?? inferHighlightLanguage(file.name))
+  const partPayloadSize = opticalPartPayloadSize(settings.frameBytes)
+  // Hide old parts immediately when the source or partition changes, before
+  // effects run, so playback/export cannot combine different preparations.
+  const preparedFile =
+    prepared?.source === file && prepared.mediaType === mediaType && prepared.partPayloadSize === partPayloadSize
+      ? prepared.summary
+      : undefined
+  const partCount = preparedFile?.partCount ?? 1
   const requestPreparedPart = useCallback((requestId: number, part: number): boolean => {
     const worker = senderWorkerRef.current
     if (!worker) return false
@@ -78,9 +93,11 @@ export function useOpticalStream({ file, highlightLanguage, settings, onError }:
   })
   const cancelApng = apngController.cancel
   const handlePreparedPart = apngController.handlePreparedPart
+  const handlePreparedPartError = apngController.handlePreparedPartError
 
   /** Stable handle for the segment navigation bar; routes to the live stream. */
   const switchPart = useCallback((part: number) => switchPartRef.current(part), [])
+  const resizeDisplay = useCallback(() => resizeDisplayRef.current?.(), [])
 
   useEffect(() => {
     if (!error) {
@@ -94,7 +111,8 @@ export function useOpticalStream({ file, highlightLanguage, settings, onError }:
 
   useEffect(() => {
     let current = true
-    setPreparedFile(undefined)
+    setPayload(undefined)
+    setPrepared(undefined)
     setError(undefined)
     setStreamInfo(undefined)
     setStreamReady(false)
@@ -111,15 +129,20 @@ export function useOpticalStream({ file, highlightLanguage, settings, onError }:
     worker.onmessage = (event: MessageEvent<SenderWorkerOutput>) => {
       if (!current) return
       const message = event.data
-      if (message.type === "prepared") {
-        setPartCount(message.file.partCount)
+      if (message.type === "payloadReady") {
+        setPayload({ source: file, mediaType })
+      } else if (message.type === "prepared") {
+        if (message.requestId !== partitionRequestRef.current) return
         setCurrentPart(0)
         activePartRef.current = 0
-        setPreparedFile(message.file)
+        setPrepared({ source: file, mediaType, partPayloadSize: message.partPayloadSize, summary: message.file })
       } else if (message.type === "error" && message.session === undefined) {
+        if (message.requestId !== undefined && message.requestId !== partitionRequestRef.current) return
         setError(message.message)
       } else if (message.type === "preparedPart") {
         handlePreparedPart(message.requestId, message.part)
+      } else if (message.type === "preparedPartError") {
+        handlePreparedPartError(message.requestId, message.message)
       } else {
         streamMessageRef.current?.(message)
       }
@@ -186,7 +209,24 @@ export function useOpticalStream({ file, highlightLanguage, settings, onError }:
         terminate()
       }
     }
-  }, [file, handlePreparedPart, mediaType])
+  }, [file, handlePreparedPart, handlePreparedPartError, mediaType])
+
+  useEffect(() => {
+    if (payload?.source !== file || payload.mediaType !== mediaType) return
+    const worker = senderWorkerRef.current
+    if (!worker) return
+    const requestId = ++partitionRequestRef.current
+    setPrepared(undefined)
+    setError(undefined)
+    setStreamInfo(undefined)
+    setStreamReady(false)
+    setStatus("Preparing QR camera stream...")
+    worker.postMessage({ type: "partition", requestId, partPayloadSize })
+    return () => {
+      // Invalidate replies even when the budget changes back to an older value.
+      partitionRequestRef.current = requestId + 1
+    }
+  }, [file, mediaType, partPayloadSize, payload])
 
   useEffect(() => {
     fullscreenRef.current = isFullscreen
@@ -304,6 +344,7 @@ export function useOpticalStream({ file, highlightLanguage, settings, onError }:
     partCount,
     preparedFile,
     rendererBackend,
+    resizeDisplay,
     setIsFullscreen,
     stageRef,
     status,

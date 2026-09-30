@@ -322,11 +322,11 @@ describe("defaultOpticalTransferSettings", () => {
     expect(
       defaultOpticalTransferSettings({
         DEFAULT_QR_TX_FPS: 24,
-        DEFAULT_QR_FRAME_BYTES: 1465,
+        DEFAULT_QR_FRAME_BYTES: 1450,
         DEFAULT_QR_ECC: "q",
         DEFAULT_QR_LAYOUT: 4,
       }),
-    ).toStrictEqual({ txFps: 24, frameBytes: 1465, ecc: "Q", gridCodes: 4 })
+    ).toStrictEqual({ txFps: 24, frameBytes: 1450, ecc: "Q", gridCodes: 4 })
   })
 
   it("falls back when Wrangler QR defaults are unsupported", () => {
@@ -342,7 +342,7 @@ describe("defaultOpticalTransferSettings", () => {
 
   it("normalizes a Wrangler frame size that the selected ECC cannot encode", () => {
     expect(defaultOpticalTransferSettings({ DEFAULT_QR_FRAME_BYTES: 2953, DEFAULT_QR_ECC: "H" })).toMatchObject({
-      frameBytes: 1000,
+      frameBytes: 1450,
       ecc: "H",
     })
   })

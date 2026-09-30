@@ -1,17 +1,17 @@
 import { isUuid } from "../../shared/verify.js"
 import type { P2PIceServer } from "../../shared/interfaces.js"
 
-export const ROOM_TTL_MS = 60 * 60 * 1000
-export const CREATED_AT_KEY = "createdAt"
 export const EXPIRES_AT_KEY = "expiresAt"
 export const ICE_SERVERS_KEY = "iceServers"
 export const ICE_SERVERS_EXPIRES_AT_KEY = "iceServersExpiresAt"
 export const MAX_TRANSFERS_KEY = "maxTransfers"
-export const PAIRED_RECEIVER_IDS_KEY = "pairedReceiverIds"
-export const RESUMABLE_RECEIVER_IDS_KEY = "resumableReceiverIds"
-export const SUCCESSFUL_RECEIVER_IDS_KEY = "successfulReceiverIds"
 export const SENDER_TOKEN_KEY = "senderToken"
 export const RECEIVER_CLEANUP_AT_KEY = "receiverCleanupAt"
+export const PAIRED_RECEIVER_COUNT_KEY = "pairedReceiverCount"
+export const SUCCESSFUL_RECEIVER_COUNT_KEY = "successfulReceiverCount"
+
+const RECEIVER_STATE_KEY_PREFIX = "receiverState:"
+type ReceiverMembershipState = "paired" | "resumable" | "successful"
 
 export interface P2PRoomStatus {
   active: boolean
@@ -23,9 +23,9 @@ export interface P2PRoomStatus {
 export interface P2PRoomInit {
   iceServers?: P2PIceServer[]
   iceServersExpiresAt?: number
-  senderToken?: string
-  expiresAt?: number
-  maxTransfers?: number
+  senderToken: string
+  expiresAt: number
+  maxTransfers: number
 }
 
 export interface P2PRoomUpdate {
@@ -33,10 +33,6 @@ export interface P2PRoomUpdate {
   expiresAt: number
   expirationSeconds: number
   maxTransfers: number
-}
-
-export function storedStringIds(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : []
 }
 
 export function storedReceiverDeadlines(value: unknown): Record<string, number> {
@@ -48,64 +44,123 @@ export function storedReceiverDeadlines(value: unknown): Record<string, number> 
 
 export function storedRoomExpiresAt(stored: Map<string, unknown>): number {
   const expiresAt = stored.get(EXPIRES_AT_KEY)
-  if (typeof expiresAt === "number" && Number.isFinite(expiresAt)) return expiresAt
-  const createdAt = stored.get(CREATED_AT_KEY)
-  return (typeof createdAt === "number" && Number.isFinite(createdAt) ? createdAt : 0) + ROOM_TTL_MS
+  return typeof expiresAt === "number" && Number.isFinite(expiresAt) ? expiresAt : 0
 }
 
-export function canAddReceiverFromStorage(stored: Map<string, unknown>, peerId?: string): boolean {
-  const successfulReceiverIds = storedStringIds(stored.get(SUCCESSFUL_RECEIVER_IDS_KEY))
-  if (peerId && successfulReceiverIds.includes(peerId)) return false
-  const pairedReceiverIds = storedStringIds(stored.get(PAIRED_RECEIVER_IDS_KEY))
-  if (peerId && pairedReceiverIds.includes(peerId)) {
-    return storedStringIds(stored.get(RESUMABLE_RECEIVER_IDS_KEY)).includes(peerId)
-  }
-  const maxTransfersValue = stored.get(MAX_TRANSFERS_KEY)
-  const maxTransfers = typeof maxTransfersValue === "number" ? maxTransfersValue : 0
-  return maxTransfers === 0 || pairedReceiverIds.length < maxTransfers
-}
-
-export interface P2PRoomMembership {
+interface MembershipSnapshot {
   maxTransfers: number
-  pairedReceiverIds: string[]
-  resumableReceiverIds: string[]
-  successfulReceiverIds: string[]
+  pairedCount: number
+  successfulCount: number
+  peerState?: ReceiverMembershipState
 }
 
-type P2PRoomMembershipChanges = Partial<
-  Pick<P2PRoomMembership, "pairedReceiverIds" | "resumableReceiverIds" | "successfulReceiverIds">
->
+function storedCount(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0
+}
 
+function receiverStateKey(peerId: string): string {
+  return `${RECEIVER_STATE_KEY_PREFIX}${peerId}`
+}
+
+/** Constant-size counts and one key per receiver. */
 export class P2PRoomMembershipStore {
   constructor(private readonly storage: DurableObjectStorage) {}
 
-  async load(): Promise<P2PRoomMembership> {
+  private async snapshot(peerId?: string): Promise<MembershipSnapshot> {
     const stored = await this.storage.get([
       MAX_TRANSFERS_KEY,
-      PAIRED_RECEIVER_IDS_KEY,
-      RESUMABLE_RECEIVER_IDS_KEY,
-      SUCCESSFUL_RECEIVER_IDS_KEY,
+      PAIRED_RECEIVER_COUNT_KEY,
+      SUCCESSFUL_RECEIVER_COUNT_KEY,
+      ...(peerId ? [receiverStateKey(peerId)] : []),
     ])
-    const maxTransfersValue = stored.get(MAX_TRANSFERS_KEY)
+    const maxTransfers = storedCount(stored.get(MAX_TRANSFERS_KEY))
+    const state = peerId ? stored.get(receiverStateKey(peerId)) : undefined
     return {
-      maxTransfers: typeof maxTransfersValue === "number" ? maxTransfersValue : 0,
-      pairedReceiverIds: storedStringIds(stored.get(PAIRED_RECEIVER_IDS_KEY)),
-      resumableReceiverIds: storedStringIds(stored.get(RESUMABLE_RECEIVER_IDS_KEY)),
-      successfulReceiverIds: storedStringIds(stored.get(SUCCESSFUL_RECEIVER_IDS_KEY)),
+      maxTransfers,
+      pairedCount: storedCount(stored.get(PAIRED_RECEIVER_COUNT_KEY)),
+      successfulCount: storedCount(stored.get(SUCCESSFUL_RECEIVER_COUNT_KEY)),
+      peerState: state === "paired" || state === "resumable" || state === "successful" ? state : undefined,
     }
   }
 
-  async save(changes: P2PRoomMembershipChanges): Promise<void> {
-    const entries: Record<string, string[]> = {}
-    if (changes.pairedReceiverIds !== undefined) {
-      entries[PAIRED_RECEIVER_IDS_KEY] = changes.pairedReceiverIds
+  private async setPeerState(
+    snapshot: MembershipSnapshot,
+    peerId: string,
+    nextState: ReceiverMembershipState | undefined,
+  ): Promise<void> {
+    if (snapshot.peerState === nextState) return
+    const pairedDelta = Number(nextState !== undefined) - Number(snapshot.peerState !== undefined)
+    const successfulDelta = Number(nextState === "successful") - Number(snapshot.peerState === "successful")
+    if (nextState === undefined) await this.storage.delete(receiverStateKey(peerId))
+    const updates: Record<string, number | ReceiverMembershipState> = {}
+    if (nextState !== undefined) updates[receiverStateKey(peerId)] = nextState
+    if (pairedDelta !== 0) updates[PAIRED_RECEIVER_COUNT_KEY] = snapshot.pairedCount + pairedDelta
+    if (successfulDelta !== 0) updates[SUCCESSFUL_RECEIVER_COUNT_KEY] = snapshot.successfulCount + successfulDelta
+    if (Object.keys(updates).length > 0) await this.storage.put(updates)
+  }
+
+  async summary(): Promise<{ maxTransfers: number; pairedReceivers: number; successfulReceivers: number }> {
+    const snapshot = await this.snapshot()
+    return {
+      maxTransfers: snapshot.maxTransfers,
+      pairedReceivers: snapshot.pairedCount,
+      successfulReceivers: snapshot.successfulCount,
     }
-    if (changes.resumableReceiverIds !== undefined) {
-      entries[RESUMABLE_RECEIVER_IDS_KEY] = changes.resumableReceiverIds
+  }
+
+  async admission(peerId: string): Promise<{ successful: boolean; resumable: boolean; canAdd: boolean }> {
+    const snapshot = await this.snapshot(peerId)
+    const { peerState, maxTransfers, pairedCount } = snapshot
+    return {
+      successful: peerState === "successful",
+      resumable: peerState === "resumable",
+      canAdd:
+        peerState === "resumable" || (peerState === undefined && (maxTransfers === 0 || pairedCount < maxTransfers)),
     }
-    if (changes.successfulReceiverIds !== undefined) {
-      entries[SUCCESSFUL_RECEIVER_IDS_KEY] = changes.successfulReceiverIds
+  }
+
+  async recordPaired(peerId: string): Promise<boolean> {
+    const snapshot = await this.snapshot(peerId)
+    if (snapshot.peerState === "successful") return false
+    if (snapshot.peerState !== undefined) return true
+    if (snapshot.maxTransfers > 0 && snapshot.pairedCount >= snapshot.maxTransfers) return false
+    await this.setPeerState(snapshot, peerId, "paired")
+    return true
+  }
+
+  async recordSuccessful(peerId: string, isConnected: boolean): Promise<{ accepted: boolean; limitReached: boolean }> {
+    const snapshot = await this.snapshot(peerId)
+    const limitReached = snapshot.maxTransfers > 0 && snapshot.pairedCount >= snapshot.maxTransfers
+    if (snapshot.peerState === "successful") return { accepted: true, limitReached }
+    if (snapshot.peerState === undefined && (!isConnected || limitReached)) {
+      return { accepted: false, limitReached: !isConnected ? false : limitReached }
     }
-    if (Object.keys(entries).length > 0) await this.storage.put(entries)
+    await this.setPeerState(snapshot, peerId, "successful")
+    return {
+      accepted: true,
+      limitReached:
+        snapshot.maxTransfers > 0 &&
+        snapshot.pairedCount + Number(snapshot.peerState === undefined) >= snapshot.maxTransfers,
+    }
+  }
+
+  async recordResumable(peerId: string): Promise<boolean> {
+    const snapshot = await this.snapshot(peerId)
+    if (snapshot.peerState !== "paired" && snapshot.peerState !== "resumable") return false
+    await this.setPeerState(snapshot, peerId, "resumable")
+    return true
+  }
+
+  async clearResumable(peerId: string): Promise<void> {
+    const snapshot = await this.snapshot(peerId)
+    if (snapshot.peerState === "resumable") await this.setPeerState(snapshot, peerId, "paired")
+  }
+
+  async release(peerId: string, force = false): Promise<boolean> {
+    const snapshot = await this.snapshot(peerId)
+    if (snapshot.peerState === "successful") return false
+    if (!force && snapshot.peerState === "resumable") return true
+    if (snapshot.peerState !== undefined) await this.setPeerState(snapshot, peerId, undefined)
+    return false
   }
 }

@@ -10,6 +10,7 @@ import {
 import { zlibSync } from "fflate"
 
 const EMPTY = new Uint8Array(0)
+const DEFAULT_CHUNK_BATCH_BYTES = 1024 * 1024
 const textEncoder = new TextEncoder()
 const CHUNK_TYPES = {
   IHDR: textEncoder.encode("IHDR"),
@@ -74,10 +75,9 @@ interface DeflatedChunks {
 }
 
 /** Append one image-data PNG chunk without coalescing or recopying the
- * deflater output. Blob preserves part order when finish() snapshots
- * the completed animation. */
+ * deflater output. Both the in-memory and streaming paths keep part order. */
 function appendImageDataChunk(
-  parts: BlobPart[],
+  parts: Uint8Array<ArrayBuffer>[],
   name: "IDAT" | "fdAT",
   compressed: DeflatedChunks,
   sequence?: number,
@@ -214,8 +214,9 @@ function frameControl(sequence: number, width: number, height: number, fps: numb
 
 /** Minimal 1-bit indexed (palette), full-frame APNG encoder with native compression and an fflate fallback. */
 export class ApngEncoder {
-  private readonly parts: BlobPart[]
+  private parts: Uint8Array<ArrayBuffer>[]
   private readonly filteredScratch: Uint8Array<ArrayBuffer>
+  private bufferedBytes: number
   private sequence = 0
   private addedFrames = 0
   private addingFrame = false
@@ -227,6 +228,8 @@ export class ApngEncoder {
     readonly fps: number,
     readonly metadata: OpticalApngMetadata,
     plays = 0,
+    private readonly writeChunks?: (chunks: Uint8Array<ArrayBuffer>[]) => Promise<void>,
+    private readonly chunkBatchBytes = DEFAULT_CHUNK_BATCH_BYTES,
   ) {
     if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
       throw new Error("APNG dimensions must be positive integers.")
@@ -235,16 +238,28 @@ export class ApngEncoder {
       throw new Error("APNG frame count is out of range.")
     }
     if (!Number.isInteger(fps) || fps < 1 || fps > 0xffff) throw new Error("APNG frame rate is out of range.")
+    if (!Number.isSafeInteger(chunkBatchBytes) || chunkBatchBytes < 1) {
+      throw new Error("The APNG chunk batch size is invalid.")
+    }
     this.metadata = validateOpticalApngMetadata(metadata)
     apngFrameGeometry(width, height, this.metadata)
     this.parts = [
-      PNG_SIGNATURE,
+      PNG_SIGNATURE.slice(),
       chunk("IHDR", imageHeader(width, height)),
       chunk("PLTE", palette()),
       chunk("iTXt", opticalQrMetadataText(this.metadata)),
       chunk("acTL", animationControl(frameCount, plays)),
     ]
+    this.bufferedBytes = this.parts.reduce((total, part) => total + part.byteLength, 0)
     this.filteredScratch = new Uint8Array((monochromeStride(width) + 1) * height)
+  }
+
+  private async flush(): Promise<void> {
+    if (!this.writeChunks || this.parts.length === 0) return
+    const parts = this.parts
+    this.parts = []
+    this.bufferedBytes = 0
+    await this.writeChunks(parts)
   }
 
   async addFrame(pixels: Uint8Array): Promise<void> {
@@ -253,22 +268,35 @@ export class ApngEncoder {
     this.addingFrame = true
     try {
       const compressed = await deflate(filterMonochrome(pixels, this.width, this.height, this.filteredScratch))
+      const start = this.parts.length
       this.parts.push(chunk("fcTL", frameControl(this.sequence++, this.width, this.height, this.fps)))
       if (this.addedFrames === 0) {
         appendImageDataChunk(this.parts, "IDAT", compressed)
       } else {
         appendImageDataChunk(this.parts, "fdAT", compressed, this.sequence++)
       }
+      for (let index = start; index < this.parts.length; index++) this.bufferedBytes += this.parts[index].byteLength
       this.addedFrames += 1
+      if (this.bufferedBytes >= this.chunkBatchBytes) await this.flush()
     } finally {
       this.addingFrame = false
     }
   }
 
   finish(): Blob {
+    if (this.writeChunks) throw new Error("A streaming APNG must be completed asynchronously.")
     if (this.addedFrames !== this.frameCount) {
       throw new Error(`APNG expected ${this.frameCount} frames but received ${this.addedFrames}.`)
     }
     return new Blob([...this.parts, chunk("IEND")], { type: "image/png" })
+  }
+
+  async complete(): Promise<void> {
+    if (!this.writeChunks) throw new Error("The APNG has no streaming output.")
+    if (this.addedFrames !== this.frameCount) {
+      throw new Error(`APNG expected ${this.frameCount} frames but received ${this.addedFrames}.`)
+    }
+    this.parts.push(chunk("IEND"))
+    await this.flush()
   }
 }

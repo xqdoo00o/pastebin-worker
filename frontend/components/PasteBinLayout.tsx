@@ -2,15 +2,19 @@ import type { ReactNode } from "react"
 import type { PublicEnv } from "../../shared/interfaces.js"
 import { getMaxExpirationReadable } from "../utils/utils.js"
 import { Link } from "./ui/index.js"
+import { PwaInstallButton } from "./PwaInstallButton.js"
 
 export function PasteInfoHeader({ config, themeToggle }: { config: PublicEnv; themeToggle: ReactNode }) {
   return (
     <div className="mx-4 lg:mx-0 lg:px-4">
       <div className="mt-8 mb-4 flex items-center justify-between">
         <h1 className="text-3xl">{config.INDEX_PAGE_TITLE}</h1>
-        {themeToggle}
+        <div className="flex shrink-0 items-center gap-1">
+          <PwaInstallButton />
+          {themeToggle}
+        </div>
       </div>
-      <p className="my-2">A pastebin running on Cloudflare Workers.</p>
+      <p className="my-2">A pastebin running on Cloudflare Worker.</p>
       <p className="my-2">
         <b>Usage</b>: Paste text, drop a file, choose your mode—Upload, direct P2P, or offline QR transfer. Share via
         the generated URL <Link href={`${config.DEPLOY_URL}/doc/curl`}>curl</Link>

@@ -190,6 +190,8 @@ const server = createServer((request, response) => {
     response.end('<!doctype html><pre id="result"></pre><script type="module" src="/benchmark-page.mjs"></script>')
   } else if (url.pathname === "/benchmark-page.mjs") {
     void serveFile(response, browserScript)
+  } else if (url.pathname === "/benchmark-utils.mjs") {
+    void serveFile(response, resolve(import.meta.dirname, "../benchmark-utils.mjs"))
   } else if (url.pathname.startsWith("/baseline/")) {
     void serveFile(response, safeFile(options.baseline, url.pathname.slice("/baseline/".length)))
   } else if (url.pathname.startsWith("/candidate/")) {

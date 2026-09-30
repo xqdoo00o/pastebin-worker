@@ -33,6 +33,35 @@ export const ListboxPopover = forwardRef<HTMLDivElement, ListboxPopoverProps>(
 
 ListboxPopover.displayName = "ListboxPopover"
 
+export function ListboxOption({
+  value,
+  focused,
+  size,
+  onSelect,
+  children,
+  className = "",
+}: {
+  value: string
+  focused: boolean
+  size: FieldSize
+  onSelect: (value: string) => void
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <button
+      data-key={value}
+      type="button"
+      tabIndex={-1}
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={() => onSelect(value)}
+      className={`w-full px-3 text-left transition-colors ${fieldControlSizeClass[size]} ${focused ? "bg-default-100" : "hover:bg-default-100"} ${className}`}
+    >
+      {children}
+    </button>
+  )
+}
+
 export function InputClearButton({ className = "", ...props }: ButtonHTMLAttributes<HTMLButtonElement>) {
   return (
     <button

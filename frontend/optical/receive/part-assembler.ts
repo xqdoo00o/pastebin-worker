@@ -4,6 +4,8 @@ import { createOPFSTemporaryFile, type CompletedOPFSTemporaryFile, type OPFSTemp
 import type { CompressionMode, OpticalFile } from "../shared/protocol.js"
 import type { ExpectedOpticalTransfer } from "../shared/fountain.js"
 import { asArrayBufferView } from "../../../shared/bytes.js"
+import { STREAMING_FILE_READ_CHUNK_BYTES } from "../../../shared/constants.js"
+import { blobByteSource, readByteSourceChunks, type RandomAccessByteSource } from "../../utils/byteSource.js"
 
 export interface StoredOpticalTransfer extends CompletedOPFSTemporaryFile {
   transmittedSize: number
@@ -28,6 +30,21 @@ interface TransferIdentity {
   decompressedSize: number | undefined
 }
 
+interface Assembly {
+  identity: TransferIdentity
+  controller: AbortController
+  received: Set<number>
+  /** Only disk-backed Files and cleanup handles survive accept(). */
+  pending: Map<number, CompletedOPFSTemporaryFile>
+  temporary?: OPFSTemporaryFile
+  decoder?: StreamingDecompressor
+  hasher?: StreamingXXH3
+  nextIndex: number
+  written: number
+  expectedRawSize: number
+  transmittedSize: number
+}
+
 /** A valid multipart container that belongs to another file. The current
  * assembly remains intact so the receiver can continue with the expected part. */
 export class OpticalPartTransferMismatchError extends Error {
@@ -37,20 +54,12 @@ export class OpticalPartTransferMismatchError extends Error {
   }
 }
 
-/** Incremental owner of one multi-part receive. As soon as a contiguous part
- * is available it is decoded and appended to OPFS, then its source buffer is
- * released. Out-of-order parts wait only until their predecessor. */
+/** In-order parts go straight to the output. Out-of-order parts are staged
+ * in OPFS, then read back in bounded chunks and deleted as gaps are filled. */
 export class MultipartOpticalAssembler {
-  private identity: TransferIdentity | undefined
-  private readonly received = new Set<number>()
-  private readonly pending = new Map<number, OpticalFile>()
-  private temporary: OPFSTemporaryFile | undefined
-  private decoder: StreamingDecompressor | undefined
-  private hasher: StreamingXXH3 | undefined
-  private nextIndex = 0
-  private written = 0
-  private expectedRawSize = 0
-  private transmittedSize = 0
+  private assembly: Assembly | undefined
+  private generation = 0
+  private work: Promise<void> = Promise.resolve()
 
   constructor(
     private readonly createTemporaryFile: TemporaryFileFactory = createOPFSTemporaryFile,
@@ -58,94 +67,119 @@ export class MultipartOpticalAssembler {
   ) {}
 
   progress(): MultipartOpticalProgress | undefined {
-    const identity = this.identity
-    if (!identity) return undefined
-    const missing: number[] = []
-    for (let index = 0; index <= identity.count; index++) {
-      if (!this.received.has(index)) missing.push(index + 1)
-    }
-    return { received: this.received.size, total: identity.count + 1, missing }
+    const expected = this.expectedTransfer()
+    if (!expected) return undefined
+    const total = expected.count + 1
+    return { received: total - expected.missing.length, total, missing: expected.missing.map((index) => index + 1) }
   }
 
   expectedTransfer(): ExpectedOpticalTransfer | undefined {
-    const identity = this.identity
-    if (!identity) return undefined
+    const state = this.assembly
+    if (!state) return undefined
     const missing: number[] = []
-    for (let index = 0; index <= identity.count; index++) {
-      if (!this.received.has(index)) missing.push(index)
+    for (let index = 0; index <= state.identity.count; index++) {
+      if (!state.received.has(index)) missing.push(index)
     }
-    return { transferId: identity.transferId, count: identity.count, missing }
+    return { transferId: state.identity.transferId, count: state.identity.count, missing }
   }
 
   /** Reject input that cannot belong to the multipart transfer in progress. */
   assertCompatibleTransfer(file: OpticalFile): void {
-    if (!this.identity) return
+    const identity = this.assembly?.identity
+    if (!identity) return
     if (file.part.count === 0 || file.part.transferId === undefined) {
       throw new OpticalPartTransferMismatchError(
         "This standalone optical file does not belong to the multipart transfer in progress.",
       )
     }
-    if (this.identity.transferId !== file.part.transferId) {
-      throw new OpticalPartTransferMismatchError()
-    }
+    if (identity.transferId !== file.part.transferId) throw new OpticalPartTransferMismatchError()
   }
 
-  async accept(file: OpticalFile): Promise<StoredOpticalTransfer | undefined> {
+  accept(file: OpticalFile): Promise<StoredOpticalTransfer | undefined> {
+    const generation = this.generation
+    const pending = this.work.then(() => {
+      if (generation !== this.generation) throw new DOMException("Optical assembly was reset.", "AbortError")
+      return this.acceptPart(file)
+    })
+    // A rejected input must not poison the next receive or reset.
+    this.work = pending.then(
+      () => undefined,
+      () => undefined,
+    )
+    return pending
+  }
+
+  private async acceptPart(file: OpticalFile): Promise<StoredOpticalTransfer | undefined> {
     this.assertCompatibleTransfer(file)
     if (file.part.count === 0 || file.part.transferId === undefined) {
       throw new Error("A standalone optical file cannot enter the multi-part assembler.")
     }
-    this.identity ??= {
-      transferId: file.part.transferId,
-      count: file.part.count,
-      name: file.name,
-      type: file.type,
-      compression: file.compression,
-      decompressedSize: file.decompressedSize,
-    }
+    const state = (this.assembly ??= {
+      identity: {
+        transferId: file.part.transferId,
+        count: file.part.count,
+        name: file.name,
+        type: file.type,
+        compression: file.compression,
+        decompressedSize: file.decompressedSize,
+      },
+      controller: new AbortController(),
+      received: new Set<number>(),
+      pending: new Map<number, CompletedOPFSTemporaryFile>(),
+      nextIndex: 0,
+      written: 0,
+      expectedRawSize: 0,
+      transmittedSize: 0,
+    })
     try {
-      this.validatePart(file)
-    } catch (error) {
-      await this.fail()
-      throw error
-    }
-    if (this.received.has(file.part.index)) return undefined
+      this.validatePart(state, file)
+      if (state.received.has(file.part.index)) return undefined
+      state.transmittedSize += file.transmittedSize
+      if (file.compression !== "zstd-fragment") state.expectedRawSize += file.bytes.length
+      if (!Number.isSafeInteger(state.transmittedSize) || !Number.isSafeInteger(state.expectedRawSize)) {
+        throw new RangeError("The optical transfer is too large.")
+      }
 
-    this.received.add(file.part.index)
-    this.pending.set(file.part.index, file)
-    this.transmittedSize += file.transmittedSize
-    if (file.compression !== "zstd-fragment") this.expectedRawSize += file.bytes.length
-    if (!Number.isSafeInteger(this.transmittedSize) || !Number.isSafeInteger(this.expectedRawSize)) {
-      await this.fail()
-      throw new RangeError("The optical transfer is too large.")
-    }
-
-    try {
-      if (!this.temporary && this.pending.has(0)) await this.startOutput()
-      await this.flushContiguousParts()
-      if (this.received.size !== this.identity.count + 1) return undefined
-      if (this.nextIndex !== this.identity.count + 1 || this.pending.size !== 0) {
+      if (file.part.index === state.nextIndex) {
+        if (!state.temporary) await this.startOutput(state, file.bytes.length)
+        await this.append(state, {
+          size: file.bytes.length,
+          read: (start, end) => asArrayBufferView(file.bytes.subarray(start, end)),
+        })
+        state.nextIndex++
+        await this.flushContiguousParts(state)
+      } else {
+        await this.stagePart(state, file)
+      }
+      state.controller.signal.throwIfAborted()
+      // Only persisted parts count as received.
+      state.received.add(file.part.index)
+      if (state.received.size !== state.identity.count + 1) return undefined
+      if (state.nextIndex !== state.identity.count + 1 || state.pending.size !== 0) {
         throw new Error("The optical transfer is missing parts.")
       }
-      return await this.complete()
+      return await this.complete(state)
     } catch (error) {
-      await this.fail()
+      if (this.assembly === state) this.assembly = undefined
+      await this.dispose(state)
       throw error
     }
   }
 
-  async reset(): Promise<void> {
-    // Reset is also used from a synchronous UI action. Detach and clear the
-    // current transfer before waiting for OPFS cleanup so an immediate render
-    // (or a new receive attempt) cannot observe the abandoned part progress.
-    const temporary = this.temporary
-    this.temporary = undefined
-    this.clear()
-    if (temporary) await temporary.abort()
+  reset(): Promise<void> {
+    const state = this.assembly
+    this.assembly = undefined
+    this.generation++
+    state?.controller.abort()
+    // Progress disappears synchronously. Let any in-flight write/finish settle
+    // before deleting its resources, and serialize the next transfer behind it.
+    const cleanup = this.work.then(() => (state ? this.dispose(state) : undefined))
+    this.work = cleanup
+    return cleanup
   }
 
-  private validatePart(file: OpticalFile): void {
-    const identity = this.identity!
+  private validatePart(state: Assembly, file: OpticalFile): void {
+    const identity = state.identity
     if (file.part.index < 0 || file.part.index > identity.count) {
       throw new Error("The optical part index is invalid.")
     }
@@ -163,56 +197,78 @@ export class MultipartOpticalAssembler {
     }
   }
 
-  private async startOutput(): Promise<void> {
-    const identity = this.identity!
-    const first = this.pending.get(0)!
+  private async stagePart(state: Assembly, part: OpticalFile): Promise<void> {
+    const temporary = await this.createTemporaryFile(part.bytes.length, "optical")
+    try {
+      state.controller.signal.throwIfAborted()
+      await temporary.write(asArrayBufferView(part.bytes))
+      state.controller.signal.throwIfAborted()
+      const stored = await temporary.finish(`part-${part.part.index}.bin`, "application/octet-stream")
+      state.pending.set(part.part.index, stored)
+      state.controller.signal.throwIfAborted()
+      if (stored.file.size !== part.bytes.length) throw new Error("The stored optical part has an invalid size.")
+    } catch (error) {
+      await temporary.abort()
+      throw error
+    }
+  }
+
+  private async startOutput(state: Assembly, firstPartSize: number): Promise<void> {
+    const identity = state.identity
     const expectedSize =
-      identity.compression === "zstd-fragment"
-        ? (identity.decompressedSize ?? 0)
-        : first.bytes.length * (identity.count + 1)
+      identity.compression === "zstd-fragment" ? (identity.decompressedSize ?? 0) : firstPartSize * (identity.count + 1)
     if (!Number.isSafeInteger(expectedSize) || expectedSize <= 0) {
       throw new Error("The optical transfer has an invalid output size.")
     }
-    this.temporary = await this.createTemporaryFile(expectedSize, "optical")
-    this.hasher = await createStreamingXXH3()
-    if (identity.compression === "zstd-fragment") this.decoder = await this.createDecoder(expectedSize)
+    state.temporary = await this.createTemporaryFile(expectedSize, "optical")
+    state.controller.signal.throwIfAborted()
+    state.hasher = await createStreamingXXH3()
+    state.controller.signal.throwIfAborted()
+    if (identity.compression === "zstd-fragment") state.decoder = await this.createDecoder(expectedSize)
+    state.controller.signal.throwIfAborted()
   }
 
-  private async flushContiguousParts(): Promise<void> {
-    while (this.temporary) {
-      const part = this.pending.get(this.nextIndex)
-      if (!part) return
-      await this.write(this.decoder ? this.decoder.push(part.bytes) : part.bytes)
-      this.pending.delete(this.nextIndex)
-      this.nextIndex += 1
+  private async flushContiguousParts(state: Assembly): Promise<void> {
+    while (state.temporary) {
+      const stored = state.pending.get(state.nextIndex)
+      if (!stored) return
+      await this.append(state, blobByteSource(stored.file))
+      await stored.cleanup()
+      state.pending.delete(state.nextIndex)
+      state.controller.signal.throwIfAborted()
+      state.nextIndex++
     }
   }
 
-  private async write(bytes: Uint8Array): Promise<void> {
-    if (bytes.length === 0) return
-    const declaredSize = this.identity?.decompressedSize
-    if (declaredSize !== undefined && this.written + bytes.length > declaredSize) {
-      throw new Error("The decompressed file exceeds its declared size.")
+  private async append(state: Assembly, source: RandomAccessByteSource): Promise<void> {
+    for await (const chunk of readByteSourceChunks(source, STREAMING_FILE_READ_CHUNK_BYTES, state.controller.signal)) {
+      const outputs = state.decoder ? state.decoder.pushChunks(chunk) : [chunk]
+      for (const bytes of outputs) {
+        if (bytes.length === 0) continue
+        const declaredSize = state.identity.decompressedSize
+        if (declaredSize !== undefined && state.written + bytes.length > declaredSize) {
+          throw new Error("The decompressed file exceeds its declared size.")
+        }
+        await state.temporary!.write(asArrayBufferView(bytes))
+        state.controller.signal.throwIfAborted()
+        state.hasher!.update(bytes)
+        state.written += bytes.length
+      }
     }
-    await this.temporary!.write(asArrayBufferView(bytes))
-    this.hasher!.update(bytes)
-    this.written += bytes.length
   }
 
-  private async complete(): Promise<StoredOpticalTransfer> {
-    const identity = this.identity!
-    this.decoder?.finish()
-    const expectedSize = identity.compression === "zstd-fragment" ? identity.decompressedSize! : this.expectedRawSize
-    if (this.written !== expectedSize) throw new Error("The reassembled file does not match its declared size.")
-    const temporary = this.temporary!
-    const completed = await temporary.finish(identity.name, identity.type)
-    this.temporary = undefined
-    if (completed.file.size !== expectedSize) {
-      await completed.cleanup()
-      throw new Error("The stored optical file does not match its declared size.")
-    }
+  private async complete(state: Assembly): Promise<StoredOpticalTransfer> {
+    const identity = state.identity
+    state.decoder?.finish()
+    const expectedSize = identity.compression === "zstd-fragment" ? identity.decompressedSize! : state.expectedRawSize
+    if (state.written !== expectedSize) throw new Error("The reassembled file does not match its declared size.")
+    const completed = await state.temporary!.finish(identity.name, identity.type)
+    state.temporary = undefined
     try {
-      if (this.hasher!.digest() !== identity.transferId) {
+      state.controller.signal.throwIfAborted()
+      if (completed.file.size !== expectedSize)
+        throw new Error("The stored optical file does not match its declared size.")
+      if (state.hasher!.digest() !== identity.transferId) {
         throw new Error("The reassembled file does not match its transfer id.")
       }
     } catch (error) {
@@ -221,34 +277,25 @@ export class MultipartOpticalAssembler {
     }
     const result = {
       ...completed,
-      transmittedSize: this.transmittedSize,
+      transmittedSize: state.transmittedSize,
       wasCompressed: identity.compression === "zstd-fragment",
     }
-    this.clear()
+    if (this.assembly === state) this.assembly = undefined
+    await this.dispose(state)
     return result
   }
 
-  private async fail(): Promise<void> {
-    const temporary = this.temporary
-    this.temporary = undefined
-    try {
-      if (temporary) await temporary.abort()
-    } finally {
-      this.clear()
-    }
-  }
-
-  private clear(): void {
-    this.decoder?.free()
-    this.decoder = undefined
-    this.hasher?.free()
-    this.hasher = undefined
-    this.identity = undefined
-    this.received.clear()
-    this.pending.clear()
-    this.nextIndex = 0
-    this.written = 0
-    this.expectedRawSize = 0
-    this.transmittedSize = 0
+  private async dispose(state: Assembly): Promise<void> {
+    const temporary = state.temporary
+    const pending = [...state.pending.values()]
+    state.temporary = undefined
+    state.pending.clear()
+    state.decoder?.free()
+    state.decoder = undefined
+    state.hasher?.free()
+    state.hasher = undefined
+    // Attempt every cleanup even when one file fails. OPFS also queues failed
+    // deletions for its existing later cleanup pass.
+    await Promise.allSettled([...(temporary ? [temporary.abort()] : []), ...pending.map((part) => part.cleanup())])
   }
 }

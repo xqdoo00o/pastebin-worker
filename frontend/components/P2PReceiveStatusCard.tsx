@@ -1,4 +1,5 @@
-import { useEffect, useState, type ReactNode } from "react"
+import type { ReactNode } from "react"
+import { useObjectUrl } from "../utils/useObjectUrl.js"
 
 import { itemCountLabel } from "../../shared/format.js"
 import type { P2PConnectionRoute, P2PFileMeta, P2PProgress, P2PTransferHistoryItem } from "../utils/p2p/protocol.js"
@@ -69,19 +70,7 @@ export function P2PTransferHistoryCard({
   transfer: P2PTransferHistoryItem
   className?: string
 }) {
-  const [downloadUrl, setDownloadUrl] = useState("")
-
-  useEffect(() => {
-    if (!transfer.file || typeof window === "undefined" || !URL.createObjectURL) {
-      setDownloadUrl("")
-      return
-    }
-    const url = URL.createObjectURL(transfer.file)
-    setDownloadUrl(url)
-    return () => {
-      if (URL.revokeObjectURL) URL.revokeObjectURL(url)
-    }
-  }, [transfer.file])
+  const downloadUrl = useObjectUrl(transfer.file)
 
   return (
     <P2PReceiveStatusCard

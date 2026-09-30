@@ -124,20 +124,6 @@ export function qrMonochrome(qr: QrBitmap, margin: number, reusable?: Uint8Array
   return { width, height, data }
 }
 
-/** Expand packed pixels into an existing native-endian RGBA32 scratch buffer. */
-export function expandMonochromeRgba(
-  source: Uint8Array,
-  width: number,
-  height: number,
-  target: Uint32Array,
-  lookup: Uint32Array,
-): void {
-  if (target.length !== width * height) {
-    throw new Error("The monochrome and RGBA image dimensions do not match.")
-  }
-  expandMonochromeRgbaRegion(source, width, height, target, width, 0, 0, lookup)
-}
-
 /** Expand packed pixels into a rectangular region of an RGBA32 target. */
 export function expandMonochromeRgbaRegion(
   source: Uint8Array,

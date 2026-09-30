@@ -15,6 +15,7 @@ export interface ZstdDecoderModule {
   _pw_zstd_decompressor_new(maxOutput: number): number
   _pw_zstd_decompressor_free(context: number): void
   _pw_zstd_decompressor_push(context: number, input: number, inputSize: number): number
+  _pw_zstd_decompressor_step(context: number, input: number, inputSize: number, progress: number): number
   _pw_zstd_decompressor_finish(context: number): number
   _pw_zstd_decompressor_output(context: number): number
   _pw_zstd_decompressor_output_size(context: number): number

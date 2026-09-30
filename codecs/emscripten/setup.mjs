@@ -30,13 +30,11 @@ import {
 
 const projectDir = projectRoot
 const cmakeMetadataPath = join(toolsDir, "cmake.json")
-const { configuredBy, configuredSdkDir, sdkDir } = emsdkLocation()
+const { configuredBy, sdkDir } = emsdkLocation()
 const sdkRepository = "https://github.com/emscripten-core/emsdk.git"
 const sdkVersion = emscriptenVersion
 const git = toolOverride("GIT").value || "git"
 const curl = toolOverride("CURL").value || "curl"
-const emcc = toolOverride("EMCC").value || "emcc"
-const emcmake = toolOverride("EMCMAKE").value || "emcmake"
 const cmakeOverride = toolOverride("CMAKE")
 const ninjaOverride = toolOverride("NINJA")
 const pythonOverride = toolOverride("PYTHON")
@@ -406,30 +404,13 @@ if (existsSync(activeConfig)) {
   }
 }
 
-// build.mjs prefers an activated project-local SDK, so avoid probing PATH when
-// that SDK already matches. Besides being faster, setup now validates the same
-// toolchain that the build will actually select.
-let pathSdkMatches = false
-if (!localSdkMatches && !existsSync(activeConfig) && !configuredSdkDir) {
-  const compiler = probe(emcc, ["--version"])
-  const cmakeWrapper = probe(emcmake, [process.execPath, "--version"])
-  pathSdkMatches = exactVersion(compiler, sdkVersion) && cmakeWrapper.ok
-  if (!pathSdkMatches && (compiler.found || cmakeWrapper.found)) {
-    const foundVersion = numericVersion(compiler.text)
-    const reason = foundVersion && foundVersion !== sdkVersion ? `version ${foundVersion}` : "an incomplete toolchain"
-    console.log(`Ignoring Emscripten on PATH (${reason}); this project requires ${sdkVersion}.`)
-  }
-}
-
 if (!cmakeTool.ok) {
   requireTool("tar", "tar")
   cmakeTool = await installLatestCmake()
 }
 
-if (cmakeTool.ok && ninjaTool.ok && (pathSdkMatches || localSdkMatches)) {
-  const source = localSdkMatches
-    ? `${configuredBy ? `selected by ${configuredBy}` : "installed locally"} at ${sdkDir}`
-    : "already available on PATH"
+if (cmakeTool.ok && ninjaTool.ok && localSdkMatches) {
+  const source = `${configuredBy ? `selected by ${configuredBy}` : "installed locally"} at ${sdkDir}`
   console.log(`Using the matching Emscripten SDK ${source}; no download is needed.`)
   process.exit(0)
 }
@@ -456,7 +437,7 @@ if (!ninjaTool.ok) {
   toolsToActivate.push(tool)
   console.log("Ninja was not found; installing a local copy with emsdk.")
 }
-if (!pathSdkMatches && !localSdkMatches) {
+if (!localSdkMatches) {
   toolsToInstall.push(sdkVersion)
   toolsToActivate.push(sdkVersion)
 }
@@ -479,9 +460,5 @@ if (!ninjaTool.ok) throw new Error("Ninja installation completed, but Ninja is s
 
 console.log(`Found CMake ${cmakeTool.version}`)
 console.log(`Found Ninja ${numericVersion(ninjaTool.text) || firstLine(ninjaTool.text)}`)
-if (pathSdkMatches) {
-  console.log(`Emscripten ${sdkVersion} is ready on PATH`)
-} else {
-  console.log(`Emscripten ${sdkVersion} is ready in ${sdkDir}`)
-}
+console.log(`Emscripten ${sdkVersion} is ready in ${sdkDir}`)
 console.log("Run pnpm build:optical-codec or pnpm build:nanorq; both build scripts load this SDK automatically.")

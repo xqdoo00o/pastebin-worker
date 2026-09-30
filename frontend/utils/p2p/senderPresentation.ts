@@ -2,6 +2,7 @@ import type { P2PSenderConnectionPhase, P2PSenderPeerInfo } from "./protocol.js"
 import {
   isPeerComplete,
   isPeerPaused,
+  isPeerTransportUsable,
   senderConnectionPhase,
   senderFileInfo,
   senderTransferStatus,
@@ -123,7 +124,6 @@ interface SenderPresentationCallbacks {
 interface SenderPeerPresentationOptions {
   callbacks: SenderPresentationCallbacks
   currentVersion: () => SenderFileVersion
-  isPeerTransportUsable: (peer: SenderPeerState) => boolean
   isSignalingReady: () => boolean
   peers: Map<string, SenderPeerState>
 }
@@ -152,7 +152,7 @@ export class SenderPeerPresentation {
         Array.from(this.options.peers.values(), (peer) => ({
           connectionPhase: senderConnectionPhase(peer),
           isWaitingForResume: peer.isWaitingForResume,
-          isTransportUsable: this.options.isPeerTransportUsable(peer),
+          isTransportUsable: isPeerTransportUsable(peer),
           isSignalingConnected: peer.isSignalingConnected,
         })),
         this.options.isSignalingReady(),

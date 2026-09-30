@@ -1,16 +1,19 @@
 import { describe, expect, it, vi } from "vitest"
-import { readFile } from "node:fs/promises"
 import { unzlibSync } from "fflate"
-import OpticalCodec from "../optical/codec/optical_codec.js"
+import { loadOpticalTestCodec, withOpticalInput } from "./optical-codec-test.js"
 import {
   copyQrMonochrome,
   createMonochromeRgbaLookup,
   createMonochromeFrame,
-  expandMonochromeRgba,
+  expandMonochromeRgbaRegion,
   qrMonochrome,
 } from "../optical/shared/monochrome.js"
 import { gridDims, qrVersion, TRANSFER_QR_MARGIN } from "../optical/shared/qr.js"
-import { OPTICAL_APNG_FORMAT_VERSION, type OpticalApngMetadata } from "../optical/shared/apng-format.js"
+import {
+  apngFrameGeometry,
+  validateOpticalApngMetadata,
+  type OpticalApngMetadata,
+} from "../optical/shared/apng-format.js"
 import { APNG_QR_SCALE, ApngEncoder } from "../optical/send/apng.js"
 import { inflateApngFrameInto, streamApngFrames } from "../optical/receive/apng.js"
 import { patternedQr, referenceTransferQr, type ReferenceQrBitmap } from "./qr-reference.js"
@@ -21,13 +24,11 @@ interface ApngChunk {
 }
 
 const TEST_APNG_METADATA: OpticalApngMetadata = {
-  format: OPTICAL_APNG_FORMAT_VERSION,
   scale: 1,
   grid: 1,
   qr: 1,
 }
 const TEST_APNG_SIZE = 21 + 2 * TRANSFER_QR_MARGIN
-
 function testApngFrame(fill = 0xff, scale = 1): Uint8Array {
   const width = TEST_APNG_SIZE * scale
   return new Uint8Array(Math.ceil(width / 8) * width).fill(fill)
@@ -95,6 +96,59 @@ function referenceMonochrome(qr: ReferenceQrBitmap, margin: number): Uint8Array 
 }
 
 describe("optical APNG encoder", () => {
+  it("streams complete PNG chunks without changing APNG bytes", async () => {
+    const chunks: Uint8Array<ArrayBuffer>[] = []
+    const writeChunks = vi.fn((next: Uint8Array<ArrayBuffer>[]) => {
+      chunks.push(...next)
+      return Promise.resolve()
+    })
+    const streamed = new ApngEncoder(TEST_APNG_SIZE, TEST_APNG_SIZE, 2, 20, TEST_APNG_METADATA, 0, writeChunks, 1)
+    const inMemory = new ApngEncoder(TEST_APNG_SIZE, TEST_APNG_SIZE, 2, 20, TEST_APNG_METADATA)
+    for (const pixels of [testApngFrame(0xff), testApngFrame(0x00)]) {
+      await streamed.addFrame(pixels)
+      await inMemory.addFrame(pixels)
+    }
+    await streamed.complete()
+    expect(writeChunks).toHaveBeenCalledTimes(3)
+    expect(new Uint8Array(await new Blob(chunks).arrayBuffer())).toEqual(
+      new Uint8Array(await inMemory.finish().arrayBuffer()),
+    )
+  })
+
+  it("waits for a chunk batch to be accepted before encoding can continue", async () => {
+    let acceptBatch!: () => void
+    const accepted = new Promise<void>((resolve) => {
+      acceptBatch = resolve
+    })
+    const writeChunks = vi.fn(() => accepted)
+    const encoder = new ApngEncoder(TEST_APNG_SIZE, TEST_APNG_SIZE, 1, 20, TEST_APNG_METADATA, 0, writeChunks, 1)
+    let frameFinished = false
+    const frame = encoder.addFrame(testApngFrame()).then(() => {
+      frameFinished = true
+    })
+
+    await vi.waitFor(() => expect(writeChunks).toHaveBeenCalledOnce())
+    expect(frameFinished).toBe(false)
+    acceptBatch()
+    await frame
+    expect(frameFinished).toBe(true)
+    await encoder.complete()
+  })
+
+  it("accepts v48 geometry while rejecting unassigned versions", () => {
+    const metadata = { ...TEST_APNG_METADATA, qr: 48, scale: 4 }
+    expect(validateOpticalApngMetadata(metadata)).toEqual(metadata)
+    expect(apngFrameGeometry(868, 868, metadata).modules).toBe(209)
+    expect(() => validateOpticalApngMetadata({ ...metadata, qr: 41 })).toThrow("metadata is invalid")
+  })
+
+  it("ignores extra metadata fields but requires valid QR geometry", () => {
+    expect(validateOpticalApngMetadata({ format: 1, ...TEST_APNG_METADATA, other: "unused" })).toEqual(
+      TEST_APNG_METADATA,
+    )
+    expect(() => validateOpticalApngMetadata({ scale: 1, grid: 1 })).toThrow("metadata is invalid")
+  })
+
   it("maps the nine-code mode to a 3×3 grid", () => {
     expect(gridDims(9)).toEqual({ cols: 3, rows: 3 })
   })
@@ -115,7 +169,7 @@ describe("optical APNG encoder", () => {
     const image = qrMonochrome(qr, 1)
     const rgba = new Uint32Array(16)
     const lookup = createMonochromeRgbaLookup(0x11111111, 0xeeeeeeee)
-    expandMonochromeRgba(image.data, image.width, image.height, rgba, lookup)
+    expandMonochromeRgbaRegion(image.data, image.width, image.height, rgba, image.width, 0, 0, lookup)
 
     expect([...image.data]).toEqual([0xff, 0xbf, 0xdf, 0xff])
     expect([...rgba]).toEqual([
@@ -382,7 +436,7 @@ describe("optical APNG encoder", () => {
       index === metadataIndex
         ? {
             ...pngChunk,
-            data: new TextEncoder().encode('qr-transfer\0\0\0\0\0{"format":1,"scale":9,"grid":1,"qr":1}'),
+            data: new TextEncoder().encode('qr-transfer\0\0\0\0\0{"scale":9,"grid":1,"qr":1}'),
           }
         : pngChunk,
     )
@@ -394,7 +448,7 @@ describe("optical APNG encoder", () => {
       index === metadataIndex
         ? {
             ...pngChunk,
-            data: new TextEncoder().encode('qr-transfer\0\0\0\0\0{"format":1,"scale":1,"grid":2,"qr":1}'),
+            data: new TextEncoder().encode('qr-transfer\0\0\0\0\0{"scale":1,"grid":2,"qr":1}'),
           }
         : pngChunk,
     )
@@ -457,38 +511,29 @@ describe("optical APNG encoder", () => {
         ),
       )
       const metadata: OpticalApngMetadata = {
-        format: OPTICAL_APNG_FORMAT_VERSION,
         scale: APNG_QR_SCALE,
         grid: 9,
         qr: qrVersion(codes[0]),
       }
       const encoder = new ApngEncoder(width, width, 1, 20, metadata)
       await encoder.addFrame(pixels)
-      const wasm = await WebAssembly.compile(await readFile(`frontend/optical/codec/optical_codec_${variant}.wasm`))
-      const codec = await OpticalCodec({
-        instantiateWasm(imports, done) {
-          const instance = new WebAssembly.Instance(wasm, imports)
-          done(instance, wasm)
-          return instance.exports
-        },
-      })
+      const codec = await loadOpticalTestCodec(variant)
       await streamApngFrames(encoder.finish(), async ({ compressed, width: decodedWidth, height, metadata }) => {
         const packed = await inflateFrame(compressed, decodedWidth, height, metadata)
-        const ptr = codec._malloc(packed.length)
-        codec.HEAPU8.set(packed, ptr)
-        const symbols = codec.readModuleGridMono1(
-          ptr,
-          decodedWidth / metadata.scale,
-          height / metadata.scale,
-          metadata.qr,
-          3,
-          3,
-        )
-        expect(symbols).toHaveLength(9)
-        expect(symbols.map((symbol) => [...symbol]).sort((left, right) => left[0] - right[0])).toEqual(
-          payloads.map((payload) => [...payload]),
-        )
-        codec._free(ptr)
+        withOpticalInput(codec, packed, (ptr) => {
+          const symbols = codec.readModuleGridMono1(
+            ptr,
+            decodedWidth / metadata.scale,
+            height / metadata.scale,
+            metadata.qr,
+            3,
+            3,
+          )
+          expect(symbols).toHaveLength(9)
+          expect(symbols.map((symbol) => [...symbol]).sort((left, right) => left[0] - right[0])).toEqual(
+            payloads.map((payload) => [...payload]),
+          )
+        })
       })
     },
   )
@@ -503,32 +548,30 @@ describe("optical APNG encoder", () => {
     // Uint32 pixels are native little-endian RGBA bytes. Keep substantial
     // green-channel contrast while simulating a warm display/camera cast.
     const rgbaWords = new Uint32Array(width * width)
-    expandMonochromeRgba(packed, width, width, rgbaWords, createMonochromeRgbaLookup(0xff04123c, 0xff96d2fa))
+    expandMonochromeRgbaRegion(
+      packed,
+      width,
+      width,
+      rgbaWords,
+      width,
+      0,
+      0,
+      createMonochromeRgbaLookup(0xff04123c, 0xff96d2fa),
+    )
     const rgba = new Uint8Array(rgbaWords.buffer)
     const bgrx = rgba.slice()
     for (let offset = 0; offset < bgrx.length; offset += 4) {
       ;[bgrx[offset], bgrx[offset + 2]] = [bgrx[offset + 2], bgrx[offset]]
     }
 
-    const wasm = await WebAssembly.compile(await readFile("frontend/optical/codec/optical_codec_simd.wasm"))
-    const codec = await OpticalCodec({
-      instantiateWasm(imports, done) {
-        const instance = new WebAssembly.Instance(wasm, imports)
-        done(instance, wasm)
-        return instance.exports
-      },
-    })
-    const ptr = codec._malloc(rgba.length)
-    try {
-      for (const pixels of [rgba, bgrx]) {
-        codec.HEAPU8.set(pixels, ptr)
+    const codec = await loadOpticalTestCodec("simd")
+    for (const pixels of [rgba, bgrx]) {
+      withOpticalInput(codec, pixels, (ptr) => {
         const symbols =
           pixels === rgba ? codec.readFull(ptr, width, width, 1) : codec.readFullBGRX(ptr, width, width, 1)
         expect(symbols).toHaveLength(1)
         expect(symbols[0]).toEqual(payload)
-      }
-    } finally {
-      codec._free(ptr)
+      })
     }
   })
 

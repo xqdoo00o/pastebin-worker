@@ -4,9 +4,6 @@
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
-}
-
-.action-button-row {
   max-width: 20rem;
   margin-inline: auto;
   flex-wrap: nowrap;
@@ -288,11 +285,8 @@
   position: absolute;
   top: 0;
   left: 0;
-  padding-right: 0.5em;
   border-right: 1px solid var(--color-default-300);
   color: var(--color-default-500);
-  text-align: right;
-  white-space: pre;
   pointer-events: none;
 }
 

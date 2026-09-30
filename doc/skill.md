@@ -15,8 +15,9 @@ client-selected names.
   to guess; it does not add authentication or encryption.
 - Never expose the returned `manageUrl`: it is the credential for replacement
   and deletion. Share only `url` or `/d/<name>`.
-- Direct `POST`/`PUT` content is limited to 5 MiB. For larger content, use the
-  web UI or the [`pb`]({{REPO}}/tree/goshujin/scripts) client, which uses R2
+- Direct `POST`/`PUT` content is limited to 5 MiB and `{{R2_MAX_ALLOWED}}`.
+  For content above 5 MiB, use the web UI or the
+  [`pb`]({{REPO}}/tree/goshujin/scripts) client, which uses R2
   multipart upload up to the deployment limit (`{{R2_MAX_ALLOWED}}`).
 - Setting `encryption-scheme` only labels already-encrypted bytes; the server
   does not encrypt them. Use the web UI or `pb -E` when actual client-side
@@ -143,7 +144,7 @@ optical protocols deliberately.
 - `403`: management password or P2P sender token is wrong.
 - `404`: paste is absent, expired, or has exhausted its reads.
 - `410`: multipart upload or P2P room has expired; start a new one.
-- `413`: direct content exceeds 5 MiB, or completed multipart content exceeds
+- `413`: direct content exceeds 5 MiB or `{{R2_MAX_ALLOWED}}`, or completed multipart content exceeds
   `{{R2_MAX_ALLOWED}}`.
 - `416`: requested R2 byte range is unsatisfiable.
 

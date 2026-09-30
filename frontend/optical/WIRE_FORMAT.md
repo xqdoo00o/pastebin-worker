@@ -94,6 +94,19 @@ to 65,535 UTF-8 bytes. A transmitted piece payload is limited to 64 MiB; the
 DCF5 container can be larger by its 17-byte header and metadata. Part placement
 supports at most 16 pieces, and the configured whole-file limit is 1 GiB.
 
+The sender selects a smaller part budget for low-capacity QR settings: 24 MiB
+at 500 bytes/frame, 48 MiB at 1000 bytes/frame, and 64 MiB at the remaining
+offered settings. Raw payloads can fill that budget; zstd fragments reserve
+the DCF header, metadata, and an additional 64 bytes within it. Partitioning
+uses the payload after compression. The 16-piece limit is unchanged, so raw
+transfers are limited to 384 MiB, 768 MiB, and 1 GiB respectively. These are
+sender policies; the v2 wire format and receiver limits are unchanged.
+
+Changing the sender's part budget reuses the prepared payload and whole-file
+hash. Only the part boundaries and containers are rebuilt; changing the source
+file or its media type releases the preparation. A budget that exceeds the
+16-piece limit can be retried with a larger budget without recompressing.
+
 The sender reduces the file name to a safe basename. A missing media type is
 inferred from the file extension or encoded as `application/octet-stream`.
 Receivers apply filename sanitization again before presenting a download.
@@ -110,6 +123,13 @@ uncompressed file. The receiver additionally requires matching total part
 count, file name, media type, compression mode, and decompressed length across
 pieces. After ordered assembly or streaming decompression, it hashes the final
 file and compares it with the transfer id.
+
+The receiver writes contiguous parts directly to its OPFS output. Parts that
+arrive before a missing predecessor are immediately stored in separate OPFS
+temporary files; only their file handles and transfer metadata remain in the
+assembler. As gaps are filled, staged parts are read in bounded chunks,
+appended or streamed through the whole-frame zstd decoder in index order,
+and deleted. Reset and failure clean up the staged files and unfinished output.
 
 The container tag identifies one exact DCF5 object; the transfer id groups the
 different containers belonging to one file. Repair symbols can be combined
@@ -128,22 +148,74 @@ record with keyword `qr-transfer`. Its UTF-8 JSON value is an atomic geometry
 record:
 
 ```json
-{ "format": 1, "scale": 4, "grid": 9, "qr": 40 }
+{ "scale": 4, "grid": 9, "qr": 40 }
 ```
 
-`format` versions the APNG carrier metadata, `scale` is the number of physical
-PNG pixels per module, `grid` is the number of QR cells, and `qr` is their
-shared ISO QR version. The exporter writes the record before `acTL`; the
-receiver requires and validates it before the first `fcTL`. Width and height
-must exactly equal the declared grid of `(17 + 4 × qr + 8) × scale` cells,
-where eight accounts for the four-module quiet zone on each side.
-Files without this version-1 record are rejected; there is no legacy APNG
-carrier fallback.
+`scale` is the number of physical PNG pixels per module, `grid` is the number
+of QR cells, and `qr` is the supported QR version shared by every cell. The
+exporter writes the record before `acTL`; the receiver requires and validates
+it before the first `fcTL`. Width and height must exactly equal the declared
+grid of `(17 + 4 × qr + 8) × scale` cells, where eight accounts for the
+four-module quiet zone on each side. Files without this record are rejected.
 
 During import, each replicated `scale × scale` pixel block is collapsed to one
 packed bit. The WASM codec then slices the validated grid into exact QR module
 matrices and enters zxing-cpp at the decoder stage, bypassing symbol detection
 and perspective sampling.
+
+## QR carrier profile
+
+Live display, camera/screen capture, and APNG use the same restricted QR
+carrier. The complete optical frame below is encoded as raw binary bytes;
+there is no text, Base64, or character-set conversion layer.
+
+| Property         | Required value                                                   |
+| ---------------- | ---------------------------------------------------------------- |
+| QR family        | Model 2 versions 1–40 plus transfer-only v48 (209×209 modules)     |
+| Error correction | L, M, Q, or H, as indicated by the QR format information         |
+| Data mask        | **3**, with mask condition `(x + y) % 3 == 0`                    |
+| Segments         | Exactly one Byte-mode segment (`0100`)                           |
+| Byte count       | 8 bits for versions 1–9; 16 bits for versions 10–40 and v48      |
+| Quiet zone       | At least four light modules on every side; the sender emits four |
+
+The byte-count field contains the complete optical-frame length, including
+its header and FEC Payload ID. Payload bytes and count bits are written most
+significant bit first. After the payload, append up to four zero terminator
+bits (limited by the remaining data capacity), zero bits to the next byte
+boundary, then alternating `EC 11` hexadecimal pad bytes starting with `EC`
+until the selected version/ECC data capacity is full. Apply the normal QR
+Reed–Solomon encoding, interleaving, remainder bits, and mask 3.
+
+Version 48 extends the Model 2 alignment positions to
+`6, 34, 62, 90, 118, 146, 174, 202` and uses the same version BCH field.
+Its byte-mode capacities are 4143 (L), 2953 (M), 2331 (Q), and 1450 (H).
+Versions 41–47 are not used. The sender offers one new B/frame size, 4143,
+at ECC L; existing sizes 2953 and 2331 can now be used at ECC M and Q.
+
+ECI, Structured Append, FNC1, numeric/alphanumeric/Kanji modes, additional
+segments, other masks, and nonstandard padding are outside this profile.
+The receiver uses a dedicated decoder for this profile on both the camera
+and APNG paths; it does not fall back to general-purpose QR decoding.
+Matching optical-frame bytes alone are therefore insufficient for sender
+interoperability. Mirrored sampling and format/version error correction
+remain supported. This documents the existing carrier restrictions without
+changing the v2 optical header.
+
+### Carrier test vectors
+
+[qr-carrier.json](test-vectors/qr-carrier.json) contains fixed payload and
+module-matrix vectors for version 1-L (full byte capacity), version 2-L
+(8-bit byte count), and version 10-Q (16-bit byte count). `payloadHex` is the
+exact Byte-segment content. `modulesHex` packs the `(17 + 4 × version)` square
+matrix in row-major order, least-significant bit first, with dark modules set
+to one, no quiet zone, and unused final bits zero. This storage convention is
+separate from the most-significant-bit-first QR data encoding above.
+
+These test the QR carrier independently: the short version-1 payload is not
+an optical frame, and the header examples do not constitute a complete file
+transfer. Tests compare both independent encoders with the frozen matrices,
+decode them through both SIMD/scalar camera and APNG paths, and check rejection
+of other masks, ECI, multiple segments, invalid counts/terminators, and padding.
 
 Protocol references: [RFC 6330 FEC Payload ID](https://www.rfc-editor.org/rfc/rfc6330.html#section-3.2),
 [object-delivery parameters](https://www.rfc-editor.org/rfc/rfc6330.html#section-4.2),

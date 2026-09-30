@@ -66,7 +66,8 @@ import { BINARY_MIME_TYPE, TEXT_MIME_TYPE } from "../../shared/constants.js"
 import { setupServer } from "msw/node"
 import { http, HttpResponse } from "msw"
 import { stubBrowserFunctions, unStubBrowserFunctions } from "./testUtils.js"
-import { encodeKey, encrypt, genKey } from "../utils/encryption.js"
+import { encodeKey, genKey } from "../utils/encryption.js"
+import { encryptForTest } from "./crypto-test.js"
 import { LOCAL_UPLOADS_KEY } from "../utils/localUploads.js"
 import { OPTICAL_SENDER_SETTINGS_KEY } from "../optical/shared/settings.js"
 
@@ -400,8 +401,8 @@ describe("Pastebin", () => {
 
     const frameBytes = screen.getByRole("combobox", { name: "Optical bytes per frame" })
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Optical error correction" }), "H")
-    expect(frameBytes).toHaveValue("1000")
-    expect(Array.from(frameBytes.querySelectorAll("option"), (option) => option.value)).toEqual(["500", "1000"])
+    expect(frameBytes).toHaveValue("1450")
+    expect(Array.from(frameBytes.querySelectorAll("option"), (option) => option.value)).toEqual(["500", "1000", "1450"])
   })
 
   it("locks QR archive controls and restores the upload algorithm when leaving QR", async () => {
@@ -431,7 +432,7 @@ describe("Pastebin", () => {
         config={{
           ...pasteConfig,
           DEFAULT_QR_TX_FPS: 24,
-          DEFAULT_QR_FRAME_BYTES: 1465,
+          DEFAULT_QR_FRAME_BYTES: 1450,
           DEFAULT_QR_ECC: "Q",
           DEFAULT_QR_LAYOUT: 4,
         }}
@@ -440,7 +441,7 @@ describe("Pastebin", () => {
     await userEvent.click(screen.getByRole("radio", { name: "QR" }))
 
     expect(screen.getByRole("combobox", { name: "Optical TX FPS" })).toHaveValue("24")
-    expect(screen.getByRole("combobox", { name: "Optical bytes per frame" })).toHaveValue("1465")
+    expect(screen.getByRole("combobox", { name: "Optical bytes per frame" })).toHaveValue("1450")
     expect(screen.getByRole("combobox", { name: "Optical error correction" })).toHaveValue("Q")
     expect(screen.getByRole("combobox", { name: "Optical QR layout" })).toHaveValue("4")
   })
@@ -448,7 +449,7 @@ describe("Pastebin", () => {
   it("restores and updates saved QR sender settings ahead of Wrangler defaults", async () => {
     localStorage.setItem(
       OPTICAL_SENDER_SETTINGS_KEY,
-      JSON.stringify({ version: 1, txFps: 24, frameBytes: 1465, ecc: "Q", gridCodes: 2 }),
+      JSON.stringify({ version: 1, txFps: 24, frameBytes: 1450, ecc: "Q", gridCodes: 2 }),
     )
     render(
       <PasteBin
@@ -465,7 +466,7 @@ describe("Pastebin", () => {
 
     const fps = screen.getByRole("combobox", { name: "Optical TX FPS" })
     expect(fps).toHaveValue("24")
-    expect(screen.getByRole("combobox", { name: "Optical bytes per frame" })).toHaveValue("1465")
+    expect(screen.getByRole("combobox", { name: "Optical bytes per frame" })).toHaveValue("1450")
     expect(screen.getByRole("combobox", { name: "Optical error correction" })).toHaveValue("Q")
     expect(screen.getByRole("combobox", { name: "Optical QR layout" })).toHaveValue("2")
 
@@ -558,10 +559,10 @@ describe("Pastebin admin page", () => {
     expect(screen.getByRole("button", { name: "Update" })).toBeEnabled()
   })
 
-  it("decrypts encrypted admin text when the URL hash has the key", async () => {
+  it.each([true, false])("checks the encrypted admin response length (valid: %s)", async (validLength) => {
     const key = await genKey("AES-GCM-CHUNKED")
     const encodedKey = await encodeKey(key)
-    const ciphertext = await encrypt("AES-GCM-CHUNKED", key, new TextEncoder().encode(mockedPasteContent))
+    const ciphertext = await encryptForTest(key, new TextEncoder().encode(mockedPasteContent))
     vi.stubGlobal("location", new URL(`https://example.com/abcd:xxxxxxxxx#${encodedKey}`))
     server.use(
       http.get(`${__WRANGLER_CONFIG__.DEPLOY_URL}/m/abcd`, () => {
@@ -586,6 +587,7 @@ describe("Pastebin admin page", () => {
       http.get(`${__WRANGLER_CONFIG__.DEPLOY_URL}/abcd`, () => {
         return new HttpResponse(ciphertext, {
           headers: {
+            "Content-Length": String(ciphertext.length + (validLength ? 0 : 1)),
             "Content-Type": BINARY_MIME_TYPE,
             "X-PB-Encryption-Scheme": "AES-GCM-CHUNKED",
             "X-PB-Decrypted-Content-Type": TEXT_MIME_TYPE,
@@ -597,13 +599,19 @@ describe("Pastebin admin page", () => {
     render(<PasteBin config={pasteConfig} />)
 
     const editor = screen.getByRole("textbox", { name: "Paste editor" })
-    await waitFor(() => expect((editor as HTMLTextAreaElement).value).toStrictEqual(mockedPasteContent))
+    if (validLength) {
+      await waitFor(() => expect((editor as HTMLTextAreaElement).value).toStrictEqual(mockedPasteContent))
+    } else {
+      await screen.findByText("Decryption failed")
+      expect((editor as HTMLTextAreaElement).value).toBe("")
+      expect(screen.getByText(/Encrypted response size does not match its header/)).toBeInTheDocument()
+    }
     expect(screen.getByRole("checkbox", { name: "End-to-end encryption" })).toBeChecked()
   })
 
   it("does not render encrypted admin text without the URL hash key", async () => {
     const key = await genKey("AES-GCM-CHUNKED")
-    const ciphertext = await encrypt("AES-GCM-CHUNKED", key, new TextEncoder().encode(mockedPasteContent))
+    const ciphertext = await encryptForTest(key, new TextEncoder().encode(mockedPasteContent))
     vi.stubGlobal("location", new URL("https://example.com/abcd:xxxxxxxxx"))
     server.use(
       http.get(`${__WRANGLER_CONFIG__.DEPLOY_URL}/m/abcd`, () => {

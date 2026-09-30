@@ -1,4 +1,3 @@
-import { Buffer } from "node:buffer"
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { delimiter, dirname, join, resolve } from "node:path"
 
@@ -7,6 +6,7 @@ import {
   commandRunner,
   ensurePinnedGitCheckout,
   preparePatchedSource,
+  writeIfChanged,
 } from "../build-utils.mjs"
 import {
   configuredNinja,
@@ -171,13 +171,6 @@ function prepareBuildDirectory(variantBuildDir, simd) {
   return !existsSync(join(variantBuildDir, "build.ninja"))
 }
 
-function writeIfChanged(destination, content) {
-  const next = Buffer.isBuffer(content) ? content : Buffer.from(content)
-  if (existsSync(destination) && readFileSync(destination).equals(next)) return false
-  writeFileSync(destination, next)
-  return true
-}
-
 const outputDir = options.outputDir
 const writesFrontendArtifacts = resolve(outputDir) === resolve(frontendOutputRoot)
 const sourceHash = buildHash()
@@ -240,9 +233,6 @@ const changed = [
   writeIfChanged(join(outputDir, "optical_codec_scalar.wasm"), scalar.wasm),
   writeIfChanged(join(outputDir, "optical_codec.d.ts"), readFileSync(join(projectDir, "src", "optical_codec.d.ts"))),
 ].some(Boolean)
-const legacyWasmPath = join(outputDir, "optical_codec.wasm")
-const removedLegacyWasm = existsSync(legacyWasmPath)
-rmSync(legacyWasmPath, { force: true })
 
 if (inputHash !== null) {
   if (buildHash() !== inputHash) {
@@ -251,4 +241,4 @@ if (inputHash !== null) {
   writeBuildHash(inputHash)
   console.log(`Recorded optical codec build state in ${stampPath}`)
 }
-console.log(changed || removedLegacyWasm ? `Wrote ${outputDir}` : `Artifacts are unchanged in ${outputDir}`)
+console.log(changed ? `Wrote ${outputDir}` : `Artifacts are unchanged in ${outputDir}`)

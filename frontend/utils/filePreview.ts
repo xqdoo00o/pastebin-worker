@@ -57,6 +57,17 @@ export function mediaPreviewBlob(file: File): Blob {
   return file
 }
 
+/** Normalize declared types once while keeping each entry's preview policy explicit. */
+function describeReceivedFile(file: Pick<File, "name" | "type">, configuredDisallowed: readonly string[]) {
+  const isDisallowed = isDisallowedPasteMime(file.type, configuredDisallowed)
+  const contentType = isDisallowed ? TEXT_MIME_TYPE : mimeEssence(file.type) || BINARY_MIME_TYPE
+  return {
+    isDisallowed,
+    contentType,
+    media: isDisallowed ? null : mediaKindOfFile({ name: file.name, type: contentType }),
+  }
+}
+
 /** Mirrors the regular receiver's automatic-preview policy without coupling
  * the standalone camera entry to React. Media can render at any supported
  * size; text is opened automatically only below the same 1 MiB limit. */
@@ -76,9 +87,7 @@ function classifyReceivedBytes(
   configuredDisallowed: readonly string[],
   autoPreviewMedia: readonly MediaKind[],
 ): ReceivedPreview {
-  const isDisallowed = isDisallowedPasteMime(declaredType, configuredDisallowed)
-  const contentType = isDisallowed ? TEXT_MIME_TYPE : mimeEssence(declaredType) || BINARY_MIME_TYPE
-  const media = isDisallowed ? null : mediaKindOfFile({ name, type: contentType })
+  const { contentType, media } = describeReceivedFile({ name, type: declaredType }, configuredDisallowed)
   if (media && autoPreviewMedia.includes(media)) return { kind: media, contentType }
 
   if (bytes.length < MAX_P2P_AUTO_PREVIEW_BYTES) {
@@ -97,16 +106,14 @@ export async function classifyReceivedBlob(
   configuredDisallowed: readonly string[] = [],
   autoPreviewMedia: readonly MediaKind[] = ["image", "audio", "video"],
 ): Promise<ReceivedBlobClassification> {
-  const isDisallowed = isDisallowedPasteMime(file.type, configuredDisallowed)
-  const declaredType = isDisallowed ? TEXT_MIME_TYPE : file.type
-  const media = isDisallowed ? null : mediaKindOfFile({ name: file.name, type: declaredType })
+  const { isDisallowed, contentType, media } = describeReceivedFile(file, configuredDisallowed)
   if (media && autoPreviewMedia.includes(media)) {
-    return { preview: { kind: media, contentType: mimeEssence(declaredType) || BINARY_MIME_TYPE }, encoding: null }
+    return { preview: { kind: media, contentType }, encoding: null }
   }
 
   if (file.size < MAX_P2P_AUTO_PREVIEW_BYTES) {
     const bytes = new Uint8Array(await file.arrayBuffer())
-    const preview = classifyReceivedBytes(file.name, declaredType, bytes, [], isDisallowed ? [] : autoPreviewMedia)
+    const preview = classifyReceivedBytes(file.name, contentType, bytes, [], isDisallowed ? [] : autoPreviewMedia)
     return {
       preview,
       bytes: preview.kind === "text" ? bytes : undefined,
@@ -140,9 +147,7 @@ export function classifyStoredReceivedFile(
   file: Pick<File, "name" | "type">,
   configuredDisallowed: readonly string[] = [],
 ): ReceivedPreview {
-  const isDisallowed = isDisallowedPasteMime(file.type, configuredDisallowed)
-  const contentType = isDisallowed ? TEXT_MIME_TYPE : mimeEssence(file.type) || BINARY_MIME_TYPE
-  const media = isDisallowed ? null : mediaKindOfFile({ name: file.name, type: contentType })
+  const { contentType, media } = describeReceivedFile(file, configuredDisallowed)
   if (media) return { kind: media, contentType }
   return contentType.startsWith("text/") ? { kind: "deferred-text", contentType } : { kind: "download", contentType }
 }

@@ -168,7 +168,7 @@ screen-capture, or exported-APNG reception. See the
 |  `403` | The management password or P2P sender token is wrong.                                              |
 |  `404` | The paste or document does not exist.                                                              |
 |  `410` | A P2P room or multipart upload has expired.                                                        |
-|  `413` | A direct content part exceeds 5 MiB, or a completed multipart object exceeds `{{R2_MAX_ALLOWED}}`. |
+|  `413` | Direct content exceeds 5 MiB or `{{R2_MAX_ALLOWED}}`, or a completed multipart object exceeds `{{R2_MAX_ALLOWED}}`. |
 |  `416` | An R2 byte range is unsatisfiable.                                                                 |
 |  `500` | Unexpected server error.                                                                           |
 |  `503` | A random paste name or P2P room could not be allocated after retries.                              |

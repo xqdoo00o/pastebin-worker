@@ -2,19 +2,22 @@ diff --git a/deps/obl/oblas_lite.c b/deps/obl/oblas_lite.c
 index 657cb92..78364cd 100644
 --- a/deps/obl/oblas_lite.c
 +++ b/deps/obl/oblas_lite.c
-@@ -574,6 +574,37 @@ void obl_axpyb32_wasm(u8 *a, u32 *b, u8 u, unsigned k)
+@@ -574,6 +574,41 @@ void obl_axpyb32_wasm(u8 *a, u32 *b, u8 u, unsigned k)
  }
  #endif
  
 +void obl_qr_rs_init(void)
 +{
++#if !defined(__wasm_simd128__)
 +    oblas_lite_init();
++#endif
 +}
 +
 +void obl_qr_rs_update(u8 *remainder, const u8 *generator, u8 factor,
-+                      unsigned padded_degree)
++                      unsigned degree, unsigned padded_degree)
 +{
 +#if defined(__wasm_simd128__)
++    (void)degree;
 +    const v128_t low_table =
 +        wasm_v128_load(GF2_8_SHUF_LO + ((unsigned)factor * 16));
 +    const v128_t high_table =
@@ -31,9 +34,10 @@ index 657cb92..78364cd 100644
 +    }
 +#else
 +    const u8 *factor_row = &GF2_8_MUL[(unsigned)factor << 8];
-+    for (unsigned i = 0; i + 1 < padded_degree; i++)
++    (void)padded_degree;
++    for (unsigned i = 0; i + 1 < degree; i++)
 +        remainder[i] = remainder[i + 1] ^ factor_row[generator[i]];
-+    remainder[padded_degree - 1] = factor_row[generator[padded_degree - 1]];
++    remainder[degree - 1] = factor_row[generator[degree - 1]];
 +#endif
 +}
 +
@@ -44,14 +48,15 @@ diff --git a/deps/obl/oblas_lite.h b/deps/obl/oblas_lite.h
 index f86fa15..9af9245 100644
 --- a/deps/obl/oblas_lite.h
 +++ b/deps/obl/oblas_lite.h
-@@ -27,6 +27,11 @@ void obl_axiy_wasm(uint8_t *a, uint8_t *b, uint8_t u, unsigned k);
+@@ -27,6 +27,12 @@ void obl_axiy_wasm(uint8_t *a, uint8_t *b, uint8_t u, unsigned k);
  void obl_axpyb32_wasm(uint8_t *a, uint32_t *b, uint8_t u, unsigned k);
  #endif
  
 +void obl_qr_rs_init(void);
 +
++/* remainder has padded_degree + 1 writable bytes; SIMD reads the zero sentinel. */
 +void obl_qr_rs_update(uint8_t *remainder, const uint8_t *generator,
-+                      uint8_t factor, unsigned padded_degree);
++                      uint8_t factor, unsigned degree, unsigned padded_degree);
 +
  typedef uint8_t u8;
  typedef uint16_t u16;

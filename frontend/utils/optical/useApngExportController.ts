@@ -6,6 +6,8 @@ import { loadNanoRQCodecModule } from "../../optical/shared/wasm-module.js"
 import { createApngExportWorker } from "./worker-factory.js"
 import { errorMessage } from "../errors.js"
 import { downloadBlob } from "../download.js"
+import { disposeWorker } from "../workerLifecycle.js"
+import { StreamedFileCollector } from "../streamedOutput.js"
 
 export interface OpticalApngExportController {
   cancel: () => void
@@ -27,17 +29,10 @@ interface UseApngExportControllerOptions {
 
 interface PendingExport {
   part?: PackedOpticalFile
-  request: Omit<ApngWorkerInput, "wasmModule" | "part">
+  request: Omit<Extract<ApngWorkerInput, { type: "export" }>, "wasmModule" | "part">
   requestId: number
   wasmModule?: WebAssembly.Module
   worker: Worker
-}
-
-function disposeWorker(worker: Worker): void {
-  worker.onmessage = null
-  worker.onerror = null
-  worker.onmessageerror = null
-  worker.terminate()
 }
 
 /** Owns a short-lived APNG worker so its CPU-heavy encoding cannot starve the
@@ -53,14 +48,18 @@ export function useApngExportController({
   const [status, setStatus] = useState<string>()
   const [error, setError] = useState<string>()
   const workerRef = useRef<Worker | null>(null)
+  const outputRef = useRef<StreamedFileCollector | null>(null)
   const pendingRef = useRef<PendingExport | undefined>(undefined)
   const nextRequestIdRef = useRef(0)
 
   const disposeCurrent = useCallback(() => {
     const worker = workerRef.current
+    const output = outputRef.current
     workerRef.current = null
+    outputRef.current = null
     pendingRef.current = undefined
     if (worker) disposeWorker(worker)
+    if (output) void output.abort().catch(() => undefined)
   }, [])
 
   const postPendingExport = useCallback(() => {
@@ -105,6 +104,17 @@ export function useApngExportController({
     [postPendingExport],
   )
 
+  const handlePreparedPartError = useCallback(
+    (requestId: number, message: string): void => {
+      if (pendingRef.current?.requestId !== requestId) return
+      disposeCurrent()
+      setProgress(undefined)
+      setStatus(undefined)
+      setError(message)
+    },
+    [disposeCurrent],
+  )
+
   const start = useCallback(
     (extraPercent: number, qrScale: number) => {
       if (workerRef.current) return
@@ -121,9 +131,11 @@ export function useApngExportController({
         return
       }
       workerRef.current = worker
+      const output = new StreamedFileCollector({ purpose: "optical" })
+      outputRef.current = output
       const requestId = ++nextRequestIdRef.current
       const selectedPart = partCount > 1 ? activePartRef.current : 0
-      const request: Omit<ApngWorkerInput, "wasmModule" | "part"> = {
+      const request: Omit<Extract<ApngWorkerInput, { type: "export" }>, "wasmModule" | "part"> = {
         type: "export",
         fileName: file.name,
         frameBytes: settings.frameBytes,
@@ -150,17 +162,43 @@ export function useApngExportController({
           setProgress({ completed: message.completed, total: message.total })
           return
         }
+        if (message.type === "chunks") {
+          void output
+            .append(message.parts)
+            .then(() => {
+              if (workerRef.current === worker) worker.postMessage({ type: "chunksAck" })
+            })
+            .catch((cause) => fail(errorMessage(cause)))
+          return
+        }
         if (message.type === "error") {
           fail(message.message)
           return
         }
 
-        disposeCurrent()
-        setProgress(undefined)
-        downloadBlob(message.blob, message.filename)
-        setStatus(
-          `Exported ${message.width.toLocaleString()}×${message.height.toLocaleString()} APNG with ${message.frames.toLocaleString()} frames containing ${message.symbols.toLocaleString()} QR symbols.`,
-        )
+        void output
+          .finish(message.filename, "image/png")
+          .then((stored) => {
+            if (workerRef.current !== worker) {
+              void stored.cleanup?.().catch(() => undefined)
+              return
+            }
+            outputRef.current = null
+            disposeCurrent()
+            setProgress(undefined)
+            try {
+              downloadBlob(stored.file, message.filename, stored.deferCleanup ? 60_000 : 1000)
+              stored.deferCleanup?.()
+              setStatus(
+                `Exported ${message.width.toLocaleString()}×${message.height.toLocaleString()} APNG with ${message.frames.toLocaleString()} frames containing ${message.symbols.toLocaleString()} QR symbols.`,
+              )
+            } catch (cause) {
+              void stored.cleanup?.().catch(() => undefined)
+              setStatus(undefined)
+              setError(errorMessage(cause))
+            }
+          })
+          .catch((cause) => fail(errorMessage(cause)))
       }
       worker.onerror = (event) => fail(event.message)
       worker.onmessageerror = () => fail("The APNG export worker returned an unreadable message.")
@@ -190,5 +228,6 @@ export function useApngExportController({
     start,
     status,
     handlePreparedPart,
+    handlePreparedPartError,
   }
 }

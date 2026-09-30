@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { decodeKey, encodeKey, encrypt, genKey } from "../utils/encryption.js"
+import { decodeKey, encodeKey, genKey } from "../utils/encryption.js"
+import { encryptForTest } from "./crypto-test.js"
 import { CHUNKED_ENCRYPTION_SCHEME } from "../utils/encryptionCore.js"
 import {
   isMetaResponse,
@@ -90,7 +91,7 @@ function responseWithoutLength(content: Uint8Array, chunkSizes: number[]): Respo
 async function encryptedFixture(plaintext: Uint8Array) {
   const key = await genKey(CHUNKED_ENCRYPTION_SCHEME)
   return {
-    encrypted: await encrypt(CHUNKED_ENCRYPTION_SCHEME, key, plaintext),
+    encrypted: await encryptForTest(key, plaintext),
     encodedKey: await encodeKey(key),
   }
 }
@@ -128,7 +129,7 @@ describe("paste response parsing", () => {
       new Headers({
         "Content-Type": "application/octet-stream",
         "Content-Disposition": 'attachment; filename="photo.png.encrypted"',
-        "X-PB-Encryption-Scheme": "chunked-aes-gcm-v1",
+        "X-PB-Encryption-Scheme": CHUNKED_ENCRYPTION_SCHEME,
         "X-PB-Decrypted-Content-Type": "image/png",
       }),
     )
@@ -250,6 +251,52 @@ describe("OPFS temporary file cleanup", () => {
 })
 
 describe("plain response downloads", () => {
+  it("spills unknown-length bodies to OPFS without losing the buffered prefix", async () => {
+    const opfs = mockOPFS()
+    const content = new TextEncoder().encode("unknown length streamed body")
+    const result = await downloadResponseToFile(responseWithoutLength(content, [3, 4]), {
+      filename: "stream.bin",
+      type: "application/octet-stream",
+      includeContent: false,
+      opfsThreshold: 8,
+    })
+    expect(Array.from(new Uint8Array(await result.file.arrayBuffer()))).toEqual(Array.from(content))
+    expect(result.content).toBeUndefined()
+    expect(opfs.write.mock.calls.length).toBeGreaterThan(2)
+    await result.cleanup?.()
+    expect(opfs.removeEntry).toHaveBeenCalledOnce()
+  })
+
+  it("keeps unknown-length downloads usable when OPFS is unavailable", async () => {
+    vi.stubGlobal("navigator", {})
+    const content = new TextEncoder().encode("fallback without disk")
+    const result = await downloadResponseToFile(responseWithoutLength(content, [2]), {
+      filename: "stream.bin",
+      type: "application/octet-stream",
+      includeContent: false,
+      opfsThreshold: 3,
+    })
+    expect(Array.from(new Uint8Array(await result.file.arrayBuffer()))).toEqual(Array.from(content))
+    expect(result.cleanup).toBeUndefined()
+  })
+
+  it("cancels unknown-length downloads and removes their partial files on disk failure", async () => {
+    const opfs = mockOPFS()
+    opfs.write.mockRejectedValueOnce(new Error("disk full"))
+    const response = responseWithoutLength(new Uint8Array(20), [3])
+    await expect(
+      downloadResponseToFile(response, {
+        filename: "stream.bin",
+        type: "application/octet-stream",
+        includeContent: false,
+        opfsThreshold: 4,
+      }),
+    ).rejects.toThrow("disk full")
+    expect(opfs.abort).toHaveBeenCalledOnce()
+    expect(opfs.removeEntry).toHaveBeenCalledOnce()
+    expect(response.body!.locked).toBe(false)
+  })
+
   it("keeps responses below the threshold in memory", async () => {
     const content = new TextEncoder().encode("small response")
     const result = await downloadResponseToFile(responseFromChunks(content, [2, 3]), {
@@ -315,6 +362,24 @@ describe("plain response downloads", () => {
 })
 
 describe("chunked encrypted downloads", () => {
+  it("reports an invalid encrypted length while an unread clone still holds the stream", async () => {
+    const { encrypted, encodedKey } = await encryptedFixture(new TextEncoder().encode("cloned encrypted response"))
+    const response = responseFromChunks(encrypted, [encrypted.length])
+    response.headers.set("Content-Length", String(encrypted.length + 1))
+    const clone = response.clone()
+    try {
+      await expect(
+        decryptResponseToFile(response, CHUNKED_ENCRYPTION_SCHEME, encodedKey, {
+          filename: "note.txt",
+          type: "text/plain",
+        }),
+      ).rejects.toThrow("Encrypted response size does not match its header")
+      expect(response.body?.locked).toBe(false)
+    } finally {
+      await clone.body?.cancel()
+    }
+  })
+
   it("decrypts arbitrary response stream boundaries into memory", async () => {
     const plaintext = new TextEncoder().encode("streamed encrypted text")
     const { encrypted, encodedKey } = await encryptedFixture(plaintext)

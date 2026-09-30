@@ -1,5 +1,5 @@
 import { correction, generate, mode, type Correction } from "lean-qr"
-import type { QrBitmap, QrErrorCorrection } from "../optical/shared/qr.js"
+import { TRANSFER_QR_MASK, type QrBitmap, type QrErrorCorrection } from "../optical/shared/qr.js"
 
 const CORRECTION_LEVELS: Readonly<Record<QrErrorCorrection, Correction>> = {
   L: correction.L,
@@ -19,7 +19,7 @@ export function referenceTransferQr(bytes: Uint8Array, ecc: QrErrorCorrection, v
     maxCorrectionLevel: CORRECTION_LEVELS[ecc],
     minVersion: version,
     maxVersion: version,
-    mask: 3,
+    mask: TRANSFER_QR_MASK,
   })
   return patternedQr(generated.size, (x, y) => generated.get(x, y))
 }

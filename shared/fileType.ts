@@ -15,8 +15,7 @@ export function mimeEssence(value: string): string {
 const HIGHLIGHT_LANGUAGE_MIME_PARAMETER = "x-pb-highlight"
 const VALID_HIGHLIGHT_LANGUAGE = /^[a-z0-9][a-z0-9_+.-]{0,63}$/i
 
-/** Adds the optional QR presentation hint without changing the
- * media-type essence. Unknown MIME parameters are ignored by older clients. */
+/** Adds the optional QR presentation hint without changing the media-type essence. */
 export function withHighlightLanguage(contentType: string, language: string | undefined): string {
   if (!language || !VALID_HIGHLIGHT_LANGUAGE.test(language)) return contentType
   const essence = mimeEssence(contentType) || BINARY_MIME_TYPE

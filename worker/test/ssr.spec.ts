@@ -1,9 +1,14 @@
 import { test, expect, describe } from "vitest"
 import { workerFetch, upload, BASE_URL } from "./testUtils.js"
 import { createExecutionContext } from "cloudflare:test"
+import { getAssetPaths } from "../ssrUtils.js"
 
 describe("SSR Display Page", () => {
   const ctx = createExecutionContext()
+
+  test("rejects a missing asset manifest entry instead of rendering guessed resource paths", () => {
+    expect(() => getAssetPaths({}, "display.html")).toThrow("Frontend manifest is missing entry: display.html")
+  })
 
   test("should render display page HTML", async () => {
     // Upload a test paste
@@ -50,5 +55,17 @@ describe("SSR Display Page", () => {
     const data = JSON.parse(match![1]) as { contentType: string }
 
     expect(data.contentType).toBe("audio/mpeg")
+  })
+
+  test("escapes a URL filename in the client-rendered display shell", async () => {
+    const paste = await upload(ctx, { c: "limited", reads: "1" })
+    const name = new URL(paste.url).pathname.slice(1)
+    const injectedFilename = "</title><script>alert(1)</script>"
+    const response = await workerFetch(ctx, `${BASE_URL}/d/${name}/${encodeURIComponent(injectedFilename)}`)
+    const html = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(html).toContain("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;")
+    expect(html).not.toContain(injectedFilename)
   })
 })

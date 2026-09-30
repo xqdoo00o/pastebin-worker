@@ -5,7 +5,10 @@ import tailwindcss from "@tailwindcss/vite"
 import { readFileSync, writeFileSync } from "node:fs"
 import * as toml from "toml"
 import { DARK_MODE_SCRIPT } from "../shared/darkMode.ts"
+import { pickPublicEnv } from "../shared/interfaces.ts"
 import { hljsAliasesPlugin } from "./vite.hljs-aliases.config.js"
+import { PWA_HEAD_HTML } from "../shared/pwa.ts"
+import { writePwaFiles } from "./vite.pwa.config.js"
 
 export default defineConfig(({ mode }) => {
   const wranglerConfigText = readFileSync("wrangler.toml", "utf8")
@@ -24,6 +27,7 @@ export default defineConfig(({ mode }) => {
         return html
           .replace(/%INDEX_PAGE_TITLE%/g, vars.INDEX_PAGE_TITLE)
           .replace(/%DARK_MODE_SCRIPT%/g, DARK_MODE_SCRIPT)
+          .replace(/%PWA_HEAD_HTML%/g, PWA_HEAD_HTML)
       },
     },
   })
@@ -33,15 +37,20 @@ export default defineConfig(({ mode }) => {
   // entry's resolved jsFile + JS preload/CSS paths reachable through its
   // import graph — emit a slim version next to the full manifest and have
   // the worker import that.
+  let frontendOutputDir
   const ssrManifestPlugin = () => ({
     name: "ssr-manifest",
     apply: "build",
+    configResolved(config) {
+      frontendOutputDir = resolve(config.root, config.build.outDir)
+    },
     closeBundle() {
-      const manifestPath = resolve(import.meta.dirname, "../dist/frontend/.vite/manifest.json")
+      const manifestPath = resolve(frontendOutputDir, ".vite/manifest.json")
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8"))
       const resolveEntry = (entryKey) => {
         const entry = manifest[entryKey]
-        const jsFile = entry?.file || `assets/${entryKey.replace(".html", ".js")}`
+        if (!entry?.file) throw new Error(`Frontend manifest is missing entry: ${entryKey}`)
+        const jsFile = entry.file
         // Walk the import graph to collect every CSS chunk reachable from
         // this entry. An entry may transitively reach several CSS chunks
         // (e.g. a Tailwind chunk + a highlight-theme chunk via different
@@ -57,14 +66,13 @@ export default defineConfig(({ mode }) => {
           if (!key || visited.has(key)) return
           visited.add(key)
           const e = manifest[key]
-          if (!e) return
+          if (!e) throw new Error(`Frontend manifest is missing dependency: ${key}`)
           for (const p of e.css || []) css.add(p)
           for (const k of e.imports || []) walk(k)
           if (!isRoot && e.file?.endsWith(".js")) jsPreload.add(e.file)
         }
         walk(entryKey, true)
-        const cssPaths = css.size > 0 ? [...css] : ["assets/style.css"]
-        return { jsFile, jsPreloadPaths: [...jsPreload], cssPaths }
+        return { jsFile, jsPreloadPaths: [...jsPreload], cssPaths: [...css] }
       }
       const slim = {
         "index.html": resolveEntry("index.html"),
@@ -72,17 +80,15 @@ export default defineConfig(({ mode }) => {
         // Vanilla bootstrap for the /a/<paste> markdown render page.
         "pages/render/markdown.ts": resolveEntry("pages/render/markdown.ts"),
       }
-      writeFileSync(
-        resolve(import.meta.dirname, "../dist/frontend/.vite/ssr-manifest.json"),
-        JSON.stringify(slim, null, 2),
-      )
+      writeFileSync(resolve(frontendOutputDir, ".vite/ssr-manifest.json"), JSON.stringify(slim, null, 2))
+      writePwaFiles(frontendOutputDir, vars.INDEX_PAGE_TITLE, slim["index.html"])
     },
   })
 
   return {
     plugins: [react(), tailwindcss(), transformHtmlPlugin(), ssrManifestPlugin(), hljsAliasesPlugin()],
     define: {
-      __WRANGLER_CONFIG__: JSON.stringify(vars),
+      __WRANGLER_CONFIG__: JSON.stringify(pickPublicEnv(vars)),
       // The hosted frontend ships SIMD/scalar codec builds and chooses at runtime.
       __WASM_VARIANT__: JSON.stringify("auto"),
     },
@@ -95,7 +101,7 @@ export default defineConfig(({ mode }) => {
     },
     build: {
       manifest: true,
-      rollupOptions: {
+      rolldownOptions: {
         input: {
           index: resolve(import.meta.dirname, "index.html"),
           display: resolve(import.meta.dirname, "display.html"),

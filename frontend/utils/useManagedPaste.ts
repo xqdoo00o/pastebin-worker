@@ -5,7 +5,7 @@ import type { PasteResponse, PublicEnv } from "../../shared/interfaces.js"
 import { parsePath } from "../../shared/parsers.js"
 import type { PasteEditState } from "../models/paste.js"
 import { createUpdateSnapshot, uploadUpdateFields, type UpdateSnapshot } from "./content.js"
-import { decodeKey, decrypt } from "./encryption.js"
+import { decryptResponseToFile } from "./responseDownload.js"
 import { isMetaResponse, parsePasteResponseHeaders, stripEncryptedSuffix } from "./pasteResponse.js"
 import { isAbortError } from "./errors.js"
 import type { PasteSetting } from "./pasteSetting.js"
@@ -147,26 +147,23 @@ export function useManagedPasteLoader({
 
         let editContent: string
         if (isEncrypted) {
-          let key: CryptoKey
           try {
-            key = await decodeKey(encryptionScheme, keyString)
+            const decrypted = await decryptResponseToFile(response, encryptionScheme, keyString, {
+              filename: pasteFilename || name,
+              type: responseInfo.mimeType,
+              includeContent: true,
+              opfsThreshold: Number.POSITIVE_INFINITY,
+              signal,
+            })
+            editContent = new TextDecoder().decode(decrypted.content)
           } catch (error) {
-            showError("Invalid decryption key", (error as Error).message)
-            return
-          }
-          const encryptedBytes = new Uint8Array(await response.arrayBuffer())
-          signal.throwIfAborted()
-          const decrypted = await decrypt(encryptionScheme, key, encryptedBytes)
-          signal.throwIfAborted()
-          if (!decrypted) {
+            if (signal.aborted || isAbortError(error)) return
             showError(
               "Decryption failed",
-              "Could not decrypt the paste with the provided key. The URL fragment may be wrong, " +
-                "or the paste has been replaced or corrupted.",
+              `${(error as Error).message}. The URL fragment may be wrong, or the paste has been replaced or corrupted.`,
             )
             return
           }
-          editContent = new TextDecoder().decode(decrypted)
         } else {
           editContent = await response.text()
           signal.throwIfAborted()

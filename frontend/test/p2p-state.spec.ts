@@ -34,6 +34,19 @@ describe("P2P sender file-version registry", () => {
 })
 
 describe("P2P receiver transfer lifecycle", () => {
+  it("reports repair and verification independently of progress and connection recovery", () => {
+    const transfer = new ReceiverTransferLifecycle()
+    transfer.transition({ kind: "repairing" })
+    expect(transfer.status()).toBe("REPAIRING")
+    expect(transfer.status(true)).toBe("RECONNECTING")
+    transfer.transition({ kind: "verifying" })
+    expect(transfer.status()).toBe("VERIFYING")
+    transfer.transition({ kind: "paused" })
+    expect(transfer.status(true)).toBe("PAUSED")
+    transfer.transition({ kind: "complete" })
+    expect(transfer.status(true)).toBe("DONE")
+  })
+
   it("keeps stopping intent and pause state queries in one model", () => {
     const transfer = new ReceiverTransferLifecycle()
     expect(transfer.wantsDownload()).toBe(false)

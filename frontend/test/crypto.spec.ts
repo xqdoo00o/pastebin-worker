@@ -1,5 +1,6 @@
 import { afterEach, describe, it, expect, vi } from "vitest"
-import { ChunkCryptoSession, encrypt, decrypt, genKey, encodeKey, decodeKey } from "../utils/encryption.js"
+import { ChunkCryptoSession, decrypt, genKey, encodeKey, decodeKey } from "../utils/encryption.js"
+import { encryptForTest } from "./crypto-test.js"
 import type { EncryptionScheme } from "../../shared/constants.js"
 import {
   createEncryptionHeader,
@@ -82,7 +83,7 @@ describe("encrypt with AES-GCM", () => {
     expect(parseEncryptionHeader(header.bytes).plaintextSize).toStrictEqual(plaintextSize)
 
     const key = await genKey("AES-GCM-CHUNKED")
-    const encrypted = await encrypt("AES-GCM-CHUNKED", key, new Uint8Array(plaintextSize))
+    const encrypted = await encryptForTest(key, new Uint8Array(plaintextSize))
     expect(encrypted.byteLength).toStrictEqual(2 * ENCRYPTION_PART_SIZE + ENCRYPTION_TAG_SIZE + 1)
     expect(ENCRYPTION_HEADER_SIZE).toStrictEqual(24)
   })
@@ -93,7 +94,7 @@ describe("encrypt with AES-GCM", () => {
 
     const key = await genKey("AES-GCM-CHUNKED")
 
-    const ciphertext = await encrypt("AES-GCM-CHUNKED", key, textBuffer)
+    const ciphertext = await encryptForTest(key, textBuffer)
 
     const decryptedBuffer = await decrypt("AES-GCM-CHUNKED", key, ciphertext)
     expect(decryptedBuffer).not.toBeNull()
@@ -108,7 +109,7 @@ describe("encrypt with AES-GCM", () => {
     const textBuffer = new TextEncoder().encode(text)
 
     const key = await genKey("AES-GCM-CHUNKED")
-    const ciphertext = await encrypt("AES-GCM-CHUNKED", key, textBuffer)
+    const ciphertext = await encryptForTest(key, textBuffer)
 
     ciphertext[1024] = (ciphertext[1024] + 1) % 256
 
@@ -119,7 +120,7 @@ describe("encrypt with AES-GCM", () => {
   it("should encode and decode keys correctly", async () => {
     const key = await genKey("AES-GCM-CHUNKED")
     const plaintext = randArray(2048)
-    const ciphertext = await encrypt("AES-GCM-CHUNKED", key, plaintext)
+    const ciphertext = await encryptForTest(key, plaintext)
 
     for (let i = 0; i < 10; i++) {
       const encoded = await encodeKey(key)
@@ -137,7 +138,7 @@ describe("encrypt with AES-GCM", () => {
   it("encrypts and authenticates content spanning multiple 5 MiB chunks", async () => {
     const plaintext = new Uint8Array(firstEncryptionPlaintextSize() + 257)
     const key = await genKey("AES-GCM-CHUNKED")
-    const ciphertext = await encrypt("AES-GCM-CHUNKED", key, plaintext)
+    const ciphertext = await encryptForTest(key, plaintext)
 
     expect(ciphertext.byteLength).toStrictEqual(encryptedFileSize(plaintext.byteLength))
     const decrypted = await decrypt("AES-GCM-CHUNKED", key, ciphertext)
@@ -226,11 +227,6 @@ describe("unsupported scheme throws", () => {
 
   it("genKey rejects unknown scheme", async () => {
     await expect(genKey(bad)).rejects.toThrow(/Unsupported encryption scheme: RC4/)
-  })
-
-  it("encrypt rejects unknown scheme", async () => {
-    const key = await genKey("AES-GCM-CHUNKED")
-    await expect(encrypt(bad, key, new Uint8Array([1, 2, 3]))).rejects.toThrow(/Unsupported encryption scheme: RC4/)
   })
 
   it("decrypt rejects unknown scheme", async () => {

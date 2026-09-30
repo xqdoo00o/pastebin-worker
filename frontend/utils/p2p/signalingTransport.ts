@@ -84,9 +84,11 @@ export function createP2PRoomRetryProbe(
   return () => {
     if (pending || !options.shouldRun()) return
     pending = (async () => {
-      if ((await probeP2PRoomAvailability(config, name)) === "unavailable") {
+      const availability = await probeP2PRoomAvailability(config, name)
+      if (!options.shouldRun()) return
+      if (availability === "unavailable") {
         await options.onUnavailable()
-      } else if (options.shouldRun()) {
+      } else {
         options.onRetry()
       }
     })().finally(() => {

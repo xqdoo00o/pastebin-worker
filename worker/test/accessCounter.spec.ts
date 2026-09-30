@@ -2,6 +2,7 @@ import { expect, it, beforeEach, vi, afterEach } from "vitest"
 import { genRandomBlob, upload, workerFetch } from "./testUtils.js"
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test"
 import type { PasteMetadata } from "../storage/storage.js"
+import { getAccessCounter } from "../storage/accessCounter.js"
 
 beforeEach(() => {
   vi.spyOn(Math, "random").mockReturnValue(0)
@@ -20,7 +21,7 @@ it("increase access counter", async () => {
 
   async function getCounter() {
     const paste = await env.PB.getWithMetadata<PasteMetadata>(name)
-    return paste?.metadata?.accessCounter
+    return getAccessCounter(env, name, paste.metadata!)
   }
 
   expect(await getCounter()).toStrictEqual(0)

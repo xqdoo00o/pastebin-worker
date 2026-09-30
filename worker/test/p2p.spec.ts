@@ -1,6 +1,7 @@
 import { createExecutionContext, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { P2PRoom, getTurnIceServers, handleP2PUpdate, selfHostedTurnCredentialsCacheKey } from "../p2p.js"
+import { PAIRED_RECEIVER_COUNT_KEY, SUCCESSFUL_RECEIVER_COUNT_KEY } from "../p2p/roomState.js"
 import { PASTE_NAME_LEN, PRIVATE_PASTE_NAME_LEN } from "../../shared/constants.js"
 import type { P2PCreateResponse } from "../../shared/interfaces.js"
 import { workerFetch } from "./testUtils.js"
@@ -71,6 +72,42 @@ describe("P2P room creation", () => {
     expect((await response.json<P2PCreateResponse>()).name).toHaveLength(PRIVATE_PASTE_NAME_LEN)
   })
 
+  it("reads room options from JSON without a query-parameter override", async () => {
+    const response = await workerFetch(
+      createExecutionContext(),
+      new Request(`${env.DEPLOY_URL}/p2p/create?expire=invalid&maxTransfers=invalid`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expire: "10m", maxTransfers: 2, isPrivate: true }),
+      }),
+    )
+    expect(response.status).toBe(200)
+    const result = await response.json<P2PCreateResponse>()
+    expect(result.name).toHaveLength(PRIVATE_PASTE_NAME_LEN)
+    expect(result.expirationSeconds).toBe(600)
+  })
+
+  it.each(["senderToken", "expiresAt", "maxTransfers"])("rejects room initialization without %s", async (field) => {
+    const stub = env.P2P_ROOM.get(env.P2P_ROOM.idFromName(crypto.randomUUID()))
+    const init: Record<string, unknown> = { senderToken: "token", expiresAt: Date.now() + 60_000, maxTransfers: 1 }
+    delete init[field]
+    const response = await stub.fetch("https://p2p-room/init", { method: "POST", body: JSON.stringify(init) })
+    expect(response.status).toBe(400)
+    expect(await (await stub.fetch("https://p2p-room/status")).json()).toMatchObject({ active: false, joinable: false })
+  })
+
+  it("does not infer a room expiration from its old creation timestamp", async () => {
+    const stub = env.P2P_ROOM.get(env.P2P_ROOM.idFromName(crypto.randomUUID()))
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("createdAt", Date.now())
+    })
+    expect(await (await stub.fetch("https://p2p-room/status")).json()).toMatchObject({ active: false, joinable: false })
+    const url = new URL("https://p2p-room/ws")
+    url.searchParams.set("role", "receiver")
+    url.searchParams.set("peerId", crypto.randomUUID())
+    expect((await stub.fetch(new Request(url, { headers: { Upgrade: "websocket" } }))).status).toBe(410)
+  })
+
   it("invalidates self-hosted TURN credentials when the shared secret changes", async () => {
     const urls = ["turn:turn.example.com:3478?transport=tcp"]
     const first = await selfHostedTurnCredentialsCacheKey(urls, "first-long-random-secret")
@@ -112,7 +149,13 @@ describe("P2P room socket recovery cleanup", () => {
         close,
         websocket: {
           readyState: WebSocket.OPEN,
-          deserializeAttachment: () => ({ role, peerId: id }),
+          deserializeAttachment: () => ({
+            role,
+            peerId: id,
+            connectionId: "00000000-0000-4000-8000-000000000090",
+            connectedAt: 1,
+            lastPongAt: 1,
+          }),
           send: vi.fn(),
           close,
         } as unknown as WebSocket,
@@ -156,7 +199,13 @@ describe("P2P room socket recovery cleanup", () => {
         close,
         socket: {
           readyState: WebSocket.OPEN,
-          deserializeAttachment: () => ({ role, peerId: id, connectedAt }),
+          deserializeAttachment: () => ({
+            role,
+            peerId: id,
+            connectionId: "00000000-0000-4000-8000-000000000090",
+            connectedAt,
+            lastPongAt: connectedAt,
+          }),
           send: vi.fn(),
           close,
         } as unknown as WebSocket,
@@ -229,11 +278,47 @@ describe("P2P room transfer limits", () => {
       .poll(() => firstReceiver.messages.some((message) => message.type === "transfer-limit-complete"))
       .toStrictEqual(true)
 
+    await runInDurableObject(stub, async (_instance, state) => {
+      const stored = await state.storage.get([PAIRED_RECEIVER_COUNT_KEY, SUCCESSFUL_RECEIVER_COUNT_KEY])
+      expect(stored.get(PAIRED_RECEIVER_COUNT_KEY)).toBe(1)
+      expect(stored.get(SUCCESSFUL_RECEIVER_COUNT_KEY)).toBe(1)
+    })
+
     const nextReceiverUrl = new URL("https://p2p-room/ws")
     nextReceiverUrl.searchParams.set("role", "receiver")
     nextReceiverUrl.searchParams.set("peerId", "00000000-0000-4000-8000-000000000003")
     const nextReceiverResponse = await stub.fetch(new Request(nextReceiverUrl, { headers: { Upgrade: "websocket" } }))
     expect(nextReceiverResponse.status).toStrictEqual(429)
+  })
+
+  it("keeps per-receiver resumable membership while enforcing the room limit", async () => {
+    const name = crypto.randomUUID()
+    const senderToken = "sender-token"
+    const peerId = "00000000-0000-4000-8000-000000000004"
+    const stub = env.P2P_ROOM.get(env.P2P_ROOM.idFromName(name))
+    await stub.fetch("https://p2p-room/init", {
+      method: "POST",
+      body: JSON.stringify({ senderToken, expiresAt: Date.now() + 60_000, maxTransfers: 1 }),
+    })
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put({
+        [PAIRED_RECEIVER_COUNT_KEY]: 1,
+        [`receiverState:${peerId}`]: "resumable",
+      })
+    })
+
+    const resumed = await connect(stub, "receiver", { peerId })
+    sockets.push(resumed.socket)
+    const newReceiverUrl = new URL("https://p2p-room/ws")
+    newReceiverUrl.searchParams.set("role", "receiver")
+    newReceiverUrl.searchParams.set("peerId", "00000000-0000-4000-8000-000000000005")
+    expect((await stub.fetch(new Request(newReceiverUrl, { headers: { Upgrade: "websocket" } }))).status).toBe(429)
+
+    const update = await stub.fetch("https://p2p-room/update", {
+      method: "POST",
+      body: JSON.stringify({ senderToken, expiresAt: Date.now() + 60_000, expirationSeconds: 60, maxTransfers: 1 }),
+    })
+    expect((await update.json<{ pairedReceivers: number }>()).pairedReceivers).toBe(1)
   })
 
   it("updates room admission without interrupting receivers that already hold slots", async () => {

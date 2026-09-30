@@ -16,7 +16,7 @@ const maxP2PTypeLength = 256
 const maxP2PMessageTextLength = 2048
 
 export interface P2PFileMeta {
-  revision?: string
+  revision: string
   name: string
   size: number
   type: string
@@ -50,8 +50,7 @@ export function isP2PFileMeta(value: unknown): value is P2PFileMeta {
           (file) => isOriginalFileInfo(file) && file.name.length <= maxP2PFileNameLength,
         ))) &&
     typeof candidate.verifyTransfer === "boolean" &&
-    (candidate.revision === undefined ||
-      (typeof candidate.revision === "string" && candidate.revision.length > 0 && candidate.revision.length <= 128)) &&
+    isRevision(candidate.revision) &&
     (candidate.highlightLanguage === undefined ||
       (typeof candidate.highlightLanguage === "string" && candidate.highlightLanguage.length <= 128))
   )
@@ -138,6 +137,7 @@ export interface P2PReceiverSession {
 
 export interface P2PReceiverCallbacks {
   onStatus: (status: string) => void
+  onTransferStatusChange?: (status: P2PTransferStatus) => void
   onConnectionRouteChange?: (route: P2PConnectionRoute | undefined) => void
   onMeta: (meta: P2PFileMeta) => void
   onUpdateAvailable?: (meta: P2PFileMeta | undefined) => void
@@ -168,8 +168,8 @@ export { parseP2PSignalMessage }
 export type DataMessage =
   | { type: "meta"; meta: P2PFileMeta }
   | { type: "file-update"; meta: P2PFileMeta }
-  | { type: "download"; offset: number; revision?: string }
-  | { type: "progress"; doneBytes: number; revision?: string }
+  | { type: "download"; offset: number; revision: string; receiveWindow: number }
+  | { type: "progress"; doneBytes: number; revision: string; flowBytes?: number }
   | { type: "pause" }
   | { type: "paused" }
   | { type: "stop" }
@@ -181,7 +181,7 @@ export type DataMessage =
   | { type: "repair-start"; index: number; size: number }
   | { type: "repair-end"; index: number }
   | { type: "verified" }
-  | { type: "received"; revision?: string }
+  | { type: "received"; revision: string }
   | { type: "error"; message: string }
 
 export type P2PDataMessageSource = "sender" | "receiver"
@@ -209,11 +209,8 @@ const receiverDataMessageTypes = new Set<DataMessage["type"]>([
   "received",
 ])
 
-function hasValidRevision(message: Record<string, unknown>): boolean {
-  return (
-    message.revision === undefined ||
-    (typeof message.revision === "string" && message.revision.length > 0 && message.revision.length <= 128)
-  )
+function isRevision(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 128
 }
 
 export function parseP2PDataMessage(raw: string, source: P2PDataMessageSource): DataMessage {
@@ -221,7 +218,10 @@ export function parseP2PDataMessage(raw: string, source: P2PDataMessageSource): 
   const type = message.type as DataMessage["type"]
   const allowedTypes = source === "sender" ? senderDataMessageTypes : receiverDataMessageTypes
   if (!allowedTypes.has(type)) throw new Error(`Unexpected P2P ${source} message type.`)
-  if (!hasValidRevision(message)) throw new Error("Invalid P2P message revision.")
+  const requiresRevision = type === "download" || type === "progress" || type === "received"
+  if ((requiresRevision || message.revision !== undefined) && !isRevision(message.revision)) {
+    throw new Error("Invalid P2P message revision.")
+  }
 
   switch (type) {
     case "meta":
@@ -230,9 +230,18 @@ export function parseP2PDataMessage(raw: string, source: P2PDataMessageSource): 
       break
     case "download":
       if (!isNonNegativeSafeInteger(message.offset)) throw new Error("Invalid P2P download offset.")
+      if (
+        !isNonNegativeSafeInteger(message.receiveWindow) ||
+        message.receiveWindow < 1024 * 1024 ||
+        message.receiveWindow > 4 * 1024 * 1024
+      )
+        throw new Error("Invalid P2P receive window.")
       break
     case "progress":
       if (!isNonNegativeSafeInteger(message.doneBytes)) throw new Error("Invalid P2P progress.")
+      if (message.flowBytes !== undefined && !isNonNegativeSafeInteger(message.flowBytes)) {
+        throw new Error("Invalid P2P receive credit.")
+      }
       break
     case "verification-start":
       if (message.blockSize !== verificationBlockSize || !isNonNegativeSafeInteger(message.hashCount)) {

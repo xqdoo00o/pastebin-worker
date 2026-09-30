@@ -10,6 +10,7 @@
 
 import type { DecodeWorkerOutput } from "./worker-messages.js"
 import { asError } from "../../utils/errors.js"
+import { disposeWorker } from "../../utils/workerLifecycle.js"
 
 export interface PoolWorker {
   onmessage: ((event: MessageEvent) => void) | null
@@ -132,15 +133,7 @@ export class DecodeWorkerPool {
     if (this.stoppedWorkers.has(worker)) return
     this.stoppedWorkers.add(worker)
     this.markWorkerInitialized(worker)
-    worker.onmessage = null
-    worker.onerror = null
-    worker.onmessageerror = null
-    try {
-      worker.dispose?.()
-    } catch {
-      // A broken side channel must not prevent the worker itself from terminating.
-    }
-    worker.terminate()
+    disposeWorker(worker)
   }
 
   private release(slot: number): void {

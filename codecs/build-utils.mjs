@@ -1,10 +1,12 @@
 import { spawnSync } from "node:child_process"
+import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 import {
   copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -14,6 +16,58 @@ import {
 import { dirname, join, resolve } from "node:path"
 
 import { emscriptenBuildContext, emscriptenExecutable } from "./emscripten/toolchain.mjs"
+
+/** Shared module ABI; codec-specific optimization, exports and threading stay local. */
+export function emscriptenModuleFlags({
+  exportName,
+  maximumMemory,
+  incomingModuleApi = "instantiateWasm",
+  runtimeMethods = "HEAPU8",
+}) {
+  return [
+    "-sWASM=1",
+    "-sMODULARIZE=1",
+    "-sEXPORT_ES6=1",
+    `-sEXPORT_NAME=${exportName}`,
+    `-sINCOMING_MODULE_JS_API=${incomingModuleApi}`,
+    "-sENVIRONMENT=web,worker",
+    "-sFILESYSTEM=0",
+    "-sASSERTIONS=0",
+    "-sMALLOC=emmalloc",
+    "-sALLOW_MEMORY_GROWTH=1",
+    `-sMAXIMUM_MEMORY=${maximumMemory}`,
+    `-sEXPORTED_RUNTIME_METHODS=${runtimeMethods}`,
+    "--no-entry",
+  ]
+}
+
+export function writeIfChanged(destination, content) {
+  const next = Buffer.isBuffer(content) ? content : Buffer.from(content)
+  if (existsSync(destination) && readFileSync(destination).equals(next)) return false
+  writeFileSync(destination, next)
+  return true
+}
+
+export function copyFileIfChanged(source, destination) {
+  return writeIfChanged(destination, readFileSync(source))
+}
+
+/** Keep Emscripten's in-place optimization away from published files that
+ * browsers and file watchers may be reading on Windows. */
+export function createCodecBuildOutput(codecRoot, outputRoot) {
+  const buildRoot = resolve(codecRoot, "build")
+  mkdirSync(buildRoot, { recursive: true })
+  const directory = mkdtempSync(join(buildRoot, "generated-"))
+  return {
+    directory,
+    publish() {
+      if (dirname(directory) !== buildRoot) throw new Error(`Unexpected codec build output: ${directory}`)
+      mkdirSync(outputRoot, { recursive: true })
+      for (const name of readdirSync(directory)) copyFileIfChanged(join(directory, name), join(outputRoot, name))
+      rmSync(directory, { recursive: true, force: true })
+    },
+  }
+}
 
 export function commandRunner({ cwd: defaultCwd, environment: defaultEnvironment = process.env, missingCommand }) {
   function run(command, args, cwd = defaultCwd, environment = defaultEnvironment) {
@@ -50,7 +104,7 @@ export function emscriptenCodecBuildContext({ cwd, missingCommand } = {}) {
   return { emcc, run, output, sdkDir: toolchain.sdkDir }
 }
 
-export function gitState(output, git, cwd, args = []) {
+function gitState(output, git, cwd, args = []) {
   const lines = output(git, ["status", "--porcelain=v2", "--branch", ...args], cwd).split(/\r?\n/)
   const oid = lines.find((line) => line.startsWith("# branch.oid "))?.slice("# branch.oid ".length)
   const changes = lines.filter((line) => line && !line.startsWith("# "))
@@ -89,7 +143,7 @@ export function ensurePinnedGitCheckout({ directory, repository, revision, spars
   }
 }
 
-export function readPatchFiles(directory) {
+function readPatchFiles(directory) {
   if (!existsSync(directory)) return []
   return readdirSync(directory)
     .filter((name) => name.endsWith(".patch"))
@@ -101,7 +155,7 @@ export function readPatchFiles(directory) {
     }))
 }
 
-export function patchSetDigest(revision, patches) {
+function patchSetDigest(revision, patches) {
   const hash = createHash("sha256")
   hash.update(revision)
   for (const patch of patches) {
@@ -113,7 +167,7 @@ export function patchSetDigest(revision, patches) {
   return hash.digest("hex")
 }
 
-export function applyPatchFiles({ patches, cwd, git, run, label }) {
+function applyPatchFiles({ patches, cwd, git, run, label }) {
   for (const patch of patches) {
     run(git, ["apply", "--check", patch.path], cwd)
     run(git, ["apply", patch.path], cwd)
@@ -121,7 +175,7 @@ export function applyPatchFiles({ patches, cwd, git, run, label }) {
   }
 }
 
-export function resetExpectedDirectory(directory, expectedDirectory) {
+function resetExpectedDirectory(directory, expectedDirectory) {
   if (resolve(directory) !== resolve(expectedDirectory)) {
     throw new Error(`Refusing to replace unexpected directory ${directory}`)
   }

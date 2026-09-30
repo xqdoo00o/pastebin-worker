@@ -43,6 +43,10 @@ typedef struct {
   uint8_t *initial_matrix;
   uint8_t *overhead_payloads;
   uint8_t *input_packet;
+  uint8_t *work;
+  uint8_t *schedule_memory;
+  size_t work_capacity;
+  size_t schedule_capacity;
   bool input_ready;
   bool complete;
 } nanorq_decoder;
@@ -104,6 +108,8 @@ static void decoder_release(nanorq_decoder *decoder) {
   obl_free(decoder->initial_matrix);
   free(decoder->overhead_payloads);
   free(decoder->input_packet);
+  free(decoder->work);
+  free(decoder->schedule_memory);
   free(decoder);
 }
 
@@ -189,6 +195,16 @@ EMSCRIPTEN_KEEPALIVE int nanorq_encoder_prepare(nanorq_encoder *encoder) {
     return 0;
   ops_run(&encoder->core, encoder->matrix, encoder->stride,
           &encoder->operations);
+  /* Repair generation only needs core.P and the intermediate-symbol matrix.
+   * Drop the inversion arenas and their pointers after the final permutation. */
+  free(encoder->prepare);
+  free(encoder->work);
+  free(encoder->operations.ops.a);
+  encoder->prepare = NULL;
+  encoder->work = NULL;
+  encoder->operations = (schedule){0};
+  encoder->core.W = (pc){0};
+  encoder->work_size = encoder->schedule_size = 0;
   encoder->prepared = true;
   return 1;
 }
@@ -411,6 +427,22 @@ static bool decoder_populate_matrix(nanorq_decoder *decoder,
   return true;
 }
 
+static bool reserve_decoder_buffer(uint8_t **buffer, size_t *capacity,
+                                   size_t required) {
+  if (required <= *capacity)
+    return true;
+  /* Overhead tends to grow by one packet per retry. Leave room for subsequent
+   * attempts instead of reallocating on each small increase. */
+  size_t grown = *capacity <= SIZE_MAX / 2 ? *capacity * 2 : required;
+  size_t next_capacity = grown > required ? grown : required;
+  uint8_t *next = realloc(*buffer, next_capacity);
+  if (!next)
+    return false;
+  *buffer = next;
+  *capacity = next_capacity;
+  return true;
+}
+
 /* Return 1 on recovery, 0 when another independent repair symbol is needed,
  * and -1 on an allocation or internal error. */
 static int decoder_attempt(nanorq_decoder *decoder, uint8_t *output) {
@@ -420,9 +452,7 @@ static int decoder_attempt(nanorq_decoder *decoder, uint8_t *output) {
   nanorq_core *core = &decoder->initial_core;
   uint8_t *prepare = NULL;
   uint8_t *matrix = decoder->initial_matrix;
-  uint8_t *work = NULL;
   uint8_t *scratch = NULL;
-  void *schedule_memory = NULL;
   schedule operations = {0};
   struct nanorq_core_mem_reqs requirements;
   int result = -1;
@@ -457,14 +487,16 @@ static int decoder_attempt(nanorq_decoder *decoder, uint8_t *output) {
   if (!nanorq_core_patch_matrix(core))
     goto cleanup;
 
-  work = malloc(requirements.work_bytes);
-  schedule_memory = malloc(requirements.schedule_bytes);
-  if (!work || !schedule_memory ||
-      !schedule_init(&operations, schedule_memory,
-                     requirements.schedule_bytes))
+  if (!reserve_decoder_buffer(&decoder->work, &decoder->work_capacity,
+                               requirements.work_bytes) ||
+      !reserve_decoder_buffer(&decoder->schedule_memory,
+                               &decoder->schedule_capacity,
+                               requirements.schedule_bytes) ||
+      !schedule_init(&operations, decoder->schedule_memory,
+                     decoder->schedule_capacity))
     goto cleanup;
   nanorq_core_set_op_callback(core, &operations, ops_push);
-  if (!nanorq_core_precalculate(core, work, requirements.work_bytes)) {
+  if (!nanorq_core_precalculate(core, decoder->work, decoder->work_capacity)) {
     result = operations.overflowed ? -1 : 0;
     goto cleanup;
   }
@@ -497,9 +529,8 @@ static int decoder_attempt(nanorq_decoder *decoder, uint8_t *output) {
   result = written == decoder->transfer_length ? 1 : -1;
 
 cleanup:
+  nanorq_core_set_op_callback(core, NULL, NULL);
   free(scratch);
-  free(schedule_memory);
-  free(work);
   if (!initial_attempt)
     obl_free(matrix);
   free(prepare);
@@ -564,11 +595,12 @@ EMSCRIPTEN_KEEPALIVE void nanorq_decoder_free(nanorq_decoder *decoder) {
 }
 
 EMSCRIPTEN_KEEPALIVE nanorq_qr *nanorq_qr_new(void) {
-  /* The SIMD AXPY kernel uses the reference multiplication table for its
-   * sub-16-byte tail. Initialize that table even when QR generation is the
-   * first operation performed by a fresh module instance. */
+  /* The scalar QR RS kernel needs the multiplication table. The SIMD QR
+   * kernel only uses the nibble shuffle tables, so it can skip this work. */
+#if !defined(__wasm_simd128__)
   struct oblas_impl implementation;
   oblas_get_impl(&implementation);
+#endif
   return calloc(1, sizeof(nanorq_qr));
 }
 
@@ -602,6 +634,8 @@ EMSCRIPTEN_KEEPALIVE int nanorq_qr_encode(nanorq_qr *qr, size_t data_length,
 }
 
 EMSCRIPTEN_KEEPALIVE void nanorq_qr_free(nanorq_qr *qr) {
+  if (qr)
+    qrcodegen_freeFixedMaskCache(&qr->cache);
   free(qr);
 }
 

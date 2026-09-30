@@ -10,7 +10,7 @@ export const projectRoot = resolve(codecsRoot, "..")
 const definitions = {
   nanorq: {
     label: "NanoRQ SIMD/scalar WASM",
-    outputDirectory: "nanorq-codec",
+    outputPath: "frontend/optical/nanorq-codec",
     requiredOutputs: [
       "LICENSE",
       "LICENSE.QR-Code-generator",
@@ -25,21 +25,21 @@ const definitions = {
   optical: {
     label: "Optical codec SIMD/scalar WASM",
     passOutputArgument: true,
-    outputDirectory: "codec",
+    outputPath: "frontend/optical/codec",
     requiredOutputs: ["optical_codec.js", "optical_codec_simd.wasm", "optical_codec_scalar.wasm", "optical_codec.d.ts"],
     inputs: ["CMakeLists.txt", "build.mjs"],
     salt: "pastebin-worker:optical-codec-web-simd-and-scalar:v2\0",
   },
   argon2: {
     label: "Argon2 Monocypher WASM",
-    localOutputDirectory: "dist",
+    outputPath: "codecs/argon2/dist",
     requiredOutputs: ["argon2.js", "argon2.d.ts", "argon2_bg.js", "argon2_bg.wasm"],
     inputs: ["build.mjs"],
     salt: "pastebin-worker:argon2-web-monocypher:v1\0",
   },
   zstd: {
-    label: "Meta zstd encoder/decoder threaded/SIMD/scalar WASM",
-    frontendOutputPath: ["wasm", "zstd"],
+    label: "zstd encoder/decoder threaded/SIMD/scalar WASM",
+    outputPath: "frontend/wasm/zstd",
     requiredOutputs: [
       "LICENSE",
       "zstd_encoder.js",
@@ -58,9 +58,9 @@ const definitions = {
     salt: "pastebin-worker:zstd-official-split-level-4-threaded-simd-and-scalar:v4\0",
   },
   xxhash: {
-    label: "Official XXH3 SIMD/scalar WASM",
+    label: "XXH3 SIMD/scalar WASM",
     projectDirectory: "codecs/xxHash",
-    frontendOutputPath: ["wasm", "xxhash"],
+    outputPath: "frontend/wasm/xxhash",
     requiredOutputs: ["LICENSE", "xxhash.js", "xxhash.d.ts", "xxhash_simd.wasm", "xxhash_scalar.wasm"],
     inputs: ["build.mjs"],
     salt: "pastebin-worker:xxhash-official-xxh3-simd-and-scalar:v1\0",
@@ -86,11 +86,7 @@ export function codecBuildState(codecName) {
   const codecRoot = definition.projectDirectory
     ? join(projectRoot, definition.projectDirectory)
     : join(codecsRoot, codecName)
-  const outputRoot = definition.localOutputDirectory
-    ? join(codecRoot, definition.localOutputDirectory)
-    : definition.frontendOutputPath
-      ? join(projectRoot, "frontend", ...definition.frontendOutputPath)
-      : join(projectRoot, "frontend", "optical", definition.outputDirectory)
+  const outputRoot = join(projectRoot, definition.outputPath)
   const stampPath = join(outputRoot, ".build-hash")
 
   function buildHash() {

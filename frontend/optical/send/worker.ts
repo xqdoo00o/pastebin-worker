@@ -6,7 +6,12 @@ import { initializeZstdEncoder } from "../../wasm/zstd-runtime.js"
 import { initializeXXHash } from "../../wasm/xxhash-runtime.js"
 import type { PackedOpticalFile } from "../shared/protocol.js"
 import type { SenderWorkerInput, SenderWorkerOutput } from "../shared/worker-messages.js"
-import { prepareOpticalTransfer, type OpticalMemoryFile, type PreparedOpticalTransfer } from "./prepared-transfer.js"
+import {
+  prepareOpticalPayload,
+  type OpticalMemoryFile,
+  type PreparedOpticalPayload,
+  type OpticalTransferParts,
+} from "./prepared-transfer.js"
 import { errorMessage } from "../../utils/errors.js"
 
 const ctx = self as unknown as {
@@ -23,22 +28,29 @@ interface StreamState {
   recycledBuffers: ArrayBuffer[]
   /** Index of the part currently being encoded. */
   currentPart: number
+  /** Exact transmitted payload bytes in the current part. */
+  partBytes: number
 }
 
-let preparedTransfer: PreparedOpticalTransfer | undefined
+let preparedPayload: PreparedOpticalPayload | undefined
+let preparedTransfer: OpticalTransferParts | undefined
 interface CachedPart {
   controller: AbortController
   promise: Promise<PackedOpticalFile>
 }
 
 const partCache = new Map<number, CachedPart>()
+// A prepared container may be 64 MiB. Keep automatic prefetch bounded because
+// part navigation is manual and the active container already lives in WASM.
+const MAX_PREFETCH_CONTAINER_BYTES = 16 * 1024 * 1024
 let stream: StreamState | undefined
 let codecReady: Promise<void> | undefined
 let codecInitializationErrorReported = false
 let codecWork = Promise.resolve()
 let prepareWork = Promise.resolve()
 let partLoadWork = Promise.resolve()
-let prepareController: AbortController | undefined
+// Keep cancellation alive through lazy hashing and part reads, not just compression.
+let payloadController: AbortController | undefined
 
 function reportCodecInitializationError(error: unknown): void {
   if (codecInitializationErrorReported) return
@@ -51,20 +63,18 @@ function initializedCodecs(): Promise<void> {
 }
 
 async function prepare(file: File | OpticalMemoryFile, mediaType?: string): Promise<void> {
-  prepareController?.abort()
+  payloadController?.abort()
   const controller = new AbortController()
-  prepareController = controller
+  payloadController = controller
   try {
     await releasePreparedTransfer()
-    const next = await prepareOpticalTransfer(file, { signal: controller.signal, mediaType })
+    const next = await prepareOpticalPayload(file, { signal: controller.signal, mediaType })
     if (controller.signal.aborted) {
       await next.cleanup()
       return
     }
-    preparedTransfer = next
-    stream?.encoder.free()
-    stream = undefined
-    ctx.postMessage({ type: "prepared", file: next.summary })
+    preparedPayload = next
+    ctx.postMessage({ type: "payloadReady" })
   } catch (error) {
     if (controller.signal.aborted) return
     preparedTransfer = undefined
@@ -72,8 +82,6 @@ async function prepare(file: File | OpticalMemoryFile, mediaType?: string): Prom
     stream?.encoder.free()
     stream = undefined
     ctx.postMessage({ type: "error", message: errorMessage(error) })
-  } finally {
-    if (prepareController === controller) prepareController = undefined
   }
 }
 
@@ -81,9 +89,29 @@ async function releasePreparedTransfer(): Promise<void> {
   stream?.encoder.free()
   stream = undefined
   clearPartCache()
-  const previous = preparedTransfer
+  const previous = preparedPayload
+  preparedPayload = undefined
   preparedTransfer = undefined
+  await partLoadWork
   await previous?.cleanup()
+}
+
+/** Replace only part views, preserving the compressed source and whole-file hash. */
+async function partition(message: Extract<SenderWorkerInput, { type: "partition" }>): Promise<void> {
+  await prepareWork
+  stream?.encoder.free()
+  stream = undefined
+  preparedTransfer = undefined
+  clearPartCache()
+  await partLoadWork
+  if (!preparedPayload) throw new Error("The optical file is not prepared.")
+  preparedTransfer = await preparedPayload.partition(message.partPayloadSize)
+  ctx.postMessage({
+    type: "prepared",
+    requestId: message.requestId,
+    partPayloadSize: message.partPayloadSize,
+    file: preparedTransfer.summary,
+  })
 }
 
 function clearPartCache(): void {
@@ -130,7 +158,13 @@ function retainParts(...indices: number[]): void {
 
 function prefetchNextPart(index: number): void {
   const next = index + 1
-  if (!preparedTransfer || next >= preparedTransfer.summary.partCount) return
+  if (
+    !preparedTransfer ||
+    next >= preparedTransfer.summary.partCount ||
+    preparedTransfer.summary.containerSize > MAX_PREFETCH_CONTAINER_BYTES
+  ) {
+    return
+  }
   void cachedPart(next).catch(() => undefined)
 }
 
@@ -165,6 +199,7 @@ async function configure(message: Extract<SenderWorkerInput, { type: "configure"
     nextSequence: 0,
     recycledBuffers: [],
     currentPart: 0,
+    partBytes: first.transmittedSize,
   }
   // NanoRQ copied the container into WASM; retain only the prefetched next
   // part on the JS heap rather than keeping a duplicate of the active one.
@@ -198,6 +233,7 @@ async function switchPart(message: Extract<SenderWorkerInput, { type: "switchPar
     ecc: current.ecc,
   })
   current.currentPart = target
+  current.partBytes = next.transmittedSize
   current.nextSequence = 0
   partCache.delete(target)
   retainParts(target + 1)
@@ -235,6 +271,7 @@ function generateBatch(message: Extract<SenderWorkerInput, { type: "generate" }>
         version: current.encoder.version!,
         modules: current.encoder.modules,
         part: current.currentPart,
+        partBytes: current.partBytes,
       },
       monochromeBuffers,
     )
@@ -248,8 +285,7 @@ function generateBatch(message: Extract<SenderWorkerInput, { type: "generate" }>
  * sender can drop this cache entry without cloning another full part. */
 async function copyPreparedPart(message: Extract<SenderWorkerInput, { type: "copyPreparedPart" }>): Promise<void> {
   if (!preparedTransfer || message.part < 0 || message.part >= preparedTransfer.summary.partCount) {
-    ctx.postMessage({ type: "error", message: "The requested optical part is not prepared." })
-    return
+    throw new Error("The requested optical part is not prepared.")
   }
   retainParts(message.part)
   const part = await cachedPart(message.part)
@@ -258,7 +294,7 @@ async function copyPreparedPart(message: Extract<SenderWorkerInput, { type: "cop
 }
 
 async function dispose(): Promise<void> {
-  prepareController?.abort()
+  payloadController?.abort()
   await prepareWork.catch(() => undefined)
   await releasePreparedTransfer()
   ctx.postMessage({ type: "disposed" })
@@ -284,7 +320,7 @@ ctx.onmessage = (event) => {
       .then(() => prepare({ name: message.name, type: message.mediaType, data: message.data }))
       .catch(reportCodecInitializationError)
   } else if (message.type === "dispose") {
-    prepareController?.abort()
+    payloadController?.abort()
     clearPartCache()
     codecWork = codecWork.then(dispose).catch((error) => {
       ctx.postMessage({ type: "error", message: errorMessage(error) })
@@ -296,15 +332,21 @@ ctx.onmessage = (event) => {
     codecWork = codecWork
       .then(async () => {
         await initializedCodecs()
-        if (message.type === "configure") await configure(message)
+        if (message.type === "partition") await partition(message)
+        else if (message.type === "configure") await configure(message)
         else if (message.type === "switchPart") await switchPart(message)
         else if (message.type === "copyPreparedPart") await copyPreparedPart(message)
         else generateBatch(message)
       })
       .catch((error) => {
+        if (message.type === "copyPreparedPart") {
+          ctx.postMessage({ type: "preparedPartError", requestId: message.requestId, message: errorMessage(error) })
+          return
+        }
         ctx.postMessage({
           type: "error",
           session: "session" in message ? message.session : undefined,
+          requestId: message.type === "partition" ? message.requestId : undefined,
           message: errorMessage(error),
         })
       })

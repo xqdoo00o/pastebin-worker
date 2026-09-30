@@ -1,13 +1,13 @@
+import { initializeTransferTestCodecs } from "./transfer-codec-test.js"
 import { readFileSync } from "node:fs"
 import { beforeAll, describe, expect, it, vi } from "vitest"
 import createNanoRQCodec, { type NanoRQCodecModule } from "../optical/nanorq-codec/nanorq_codec.js"
 import { expectedTransferVerdict, RaptorQDecoder, RaptorQEncoder } from "../optical/shared/fountain.js"
 import { initializeNanoRQ } from "../optical/shared/nanorq-runtime.js"
 import { RAPTORQ_PAYLOAD_ID_BYTES } from "../optical/shared/wire.js"
-import { initializeZstdDecoder, initializeZstdEncoder } from "../wasm/zstd-runtime.js"
-import { initializeXXHash, xxh3 } from "../wasm/xxhash-runtime.js"
+import { xxh3 } from "../wasm/xxhash-runtime.js"
 import { STREAMING_FILE_READ_CHUNK_BYTES } from "../../shared/constants.js"
-import { prepareOpticalTransfer } from "../optical/send/prepared-transfer.js"
+import { prepareOpticalParts as prepareParts } from "./optical-transfer-helper.js"
 import { OpticalQrFrameEncoder } from "../optical/shared/qr-frame-encoder.js"
 import { referenceTransferQr } from "./qr-reference.js"
 import { estimateTransferProgress, expectedRaptorQOverhead } from "../optical/shared/progress.js"
@@ -17,7 +17,6 @@ import {
   getXXH3,
   isPrecompressedType,
   inspectFrame,
-  MAX_FILE_BYTES,
   MAX_PART_COUNT,
   MAX_TRANSFER_BYTES,
   MULTIPART_HEADER_LEN,
@@ -51,11 +50,7 @@ beforeAll(async () => {
   const wasm = readFileSync("frontend/optical/nanorq-codec/nanorq_codec_simd.wasm")
   await initializeNanoRQ(wasm)
   // Load the zstd codec straight from disk so protocol calls never fetch.
-  await Promise.all([
-    initializeZstdEncoder(readFileSync("frontend/wasm/zstd/zstd_encoder_simd.wasm")),
-    initializeZstdDecoder(readFileSync("frontend/wasm/zstd/zstd_decoder_simd.wasm")),
-    initializeXXHash(readFileSync("frontend/wasm/xxhash/xxhash_simd.wasm")),
-  ])
+  await initializeTransferTestCodecs()
 })
 
 function goldenFrame(): Uint8Array {
@@ -85,23 +80,6 @@ function noise(length: number, seed: number): Uint8Array {
     output[index] = state & 0xff
   }
   return output
-}
-
-async function prepareParts(
-  name: string,
-  type: string,
-  bytes: Uint8Array,
-  partPayloadSize = MAX_FILE_BYTES,
-): Promise<PackedOpticalFile[]> {
-  const transfer = await prepareOpticalTransfer(
-    { name, type, data: bytes.slice().buffer },
-    { partPayloadSize, opfsThreshold: Number.MAX_SAFE_INTEGER },
-  )
-  try {
-    return await Promise.all(Array.from({ length: transfer.summary.partCount }, (_, index) => transfer.getPart(index)))
-  } finally {
-    await transfer.cleanup()
-  }
 }
 
 type TestPartOptions = Pick<PackTransferPayloadOptions, "index" | "count" | "transferId">

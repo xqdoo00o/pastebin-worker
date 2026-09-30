@@ -9,7 +9,10 @@ receiver-specific paths implemented in `src/optical_codec.cpp`:
 
 - full-frame RGBA, BGRX, packed luminance and 1-bit monochrome decoding;
 - metadata-directed APNG grid extraction directly into QR module matrices;
-- multiple-symbol acquisition for camera QR grids.
+- multiple-symbol acquisition for camera QR grids;
+- a transfer-only Model 2 decoder fixed to mask 3 and one byte segment, while
+  retaining dynamic QR versions, all four ECC levels, BCH format correction,
+  and mirrored-symbol handling.
 
 ## Requirements
 
@@ -44,6 +47,20 @@ pristine: the build copies `core` into its generated build directory, applies
 the patches there, and compiles that disposable tree. Any local change in the
 upstream checkout stops the build instead of being silently overwritten.
 
+The full-frame entry points use `GlobalHistogramBinarizer`; APNG module grids
+enter the transfer decoder directly. The SIMD patch therefore targets pattern
+scanning only. The payload reader uses a fixed exhaustive finder scan, while
+the transfer-profile patch owns format restrictions and early decode failures.
+The transfer hot-path patch caches codeword offsets and mask bits for one QR
+version per thread, including mirrored offsets (at most about 167 KiB at v48). Switching
+versions replaces that cache. Byte-segment unpacking validates the terminator
+and padding before compacting the payload into the decoded codeword buffer.
+SIMD pattern scanning consumes every transition in each 16-pixel block.
+The layout uses 16-bit module offsets and one shared mask byte per codeword,
+so decoding applies the mask once per byte instead of once per module.
+The `0008-qr-v48-profile.patch` extends Model 2 geometry, version recognition,
+and ECC block layouts for the same transfer-only v48 profile as NanoRQ.
+
 For faster local C++ iteration, use the isolated non-LTO build. It writes to
 `build-dev` and `dist-dev`, so it cannot contaminate release artifacts:
 
@@ -68,7 +85,9 @@ node --expose-gc codecs/optical/benchmark.mjs
 ```
 
 The benchmark uses the SIMD binary by default; pass `--variant scalar` to
-measure the fallback build.
+measure the fallback build. It includes the live camera's nine-symbol limit,
+a nine-QR grid, and a high-contrast frame with no QR code alongside the
+single-symbol and flat-frame cases.
 
 For an alternating before/after comparison, preserve the old artifacts and
 pass both directories to the benchmark:
@@ -94,6 +113,11 @@ missing or stale. It writes the three artifacts and `.build-hash` to
 same check automatically. The hosted receiver selects a variant at runtime;
 the standalone exports select one at build time via `pnpm build:optical-receive`
 or `pnpm build:optical-receive:scalar`.
+
+Both standalone receiver builds bundle highlight.js's common language set;
+other languages are displayed as plain text. QR v48 and all transfer features
+remain available. Outputs go to `dist/optical-receive/`. The hosted receiver
+keeps all language support.
 
 Use `pnpm build:optical-codec` when you explicitly want to invoke the
 incremental CMake/Ninja build.

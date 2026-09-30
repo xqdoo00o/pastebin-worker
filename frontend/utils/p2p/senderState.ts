@@ -11,7 +11,7 @@ import {
   type P2PVerificationManifest,
 } from "./protocol.js"
 import type { P2PReconnectPolicy } from "./signalingTransport.js"
-import { uuid, type SpeedTracker } from "./transfer.js"
+import { uuid, type SpeedTracker, type P2PSendWindow } from "./transfer.js"
 import type { OriginalFileInfo } from "../../../shared/interfaces.js"
 import type { P2PIceMode } from "./rtc.js"
 
@@ -78,6 +78,7 @@ export interface SenderPeerState {
   isCompletionReported: boolean
   operationGeneration: number
   activeReader?: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>
+  sendWindow?: P2PSendWindow
   speedBytesPerSecond: number
   progressTracker?: SpeedTracker
   activeVersion?: SenderFileVersion
@@ -295,9 +296,16 @@ export const isPeerComplete = (peer: SenderPeerState) => peer.transferState.kind
 export const isPeerPaused = (peer: SenderPeerState) => peer.transferState.kind === "paused"
 export const isPeerSending = (peer: SenderPeerState) => peer.transferState.kind === "uploading"
 export const isPeerVerifying = (peer: SenderPeerState) => peer.transferState.kind === "verifying"
-const isPeerRepairing = (peer: SenderPeerState) => peer.transferState.kind === "repairing"
+export const isPeerRepairing = (peer: SenderPeerState) => peer.transferState.kind === "repairing"
 export const isPeerActive = (peer: SenderPeerState) =>
   isPeerSending(peer) || isPeerVerifying(peer) || isPeerRepairing(peer)
+
+export const isPeerTransportUsable = (peer: SenderPeerState) =>
+  peer.isConnected &&
+  peer.dc.readyState === "open" &&
+  peer.pc.connectionState !== "closed" &&
+  peer.pc.connectionState !== "failed" &&
+  peer.pc.connectionState !== "disconnected"
 
 export function transitionPeer(peer: SenderPeerState, transferState: SenderTransferState): void {
   peer.transferState = transferState
@@ -305,6 +313,7 @@ export function transitionPeer(peer: SenderPeerState, transferState: SenderTrans
 
 export function invalidateSenderPeerOperation(peer: SenderPeerState): number {
   peer.operationGeneration += 1
+  peer.sendWindow?.wake()
   const reader = peer.activeReader
   peer.activeReader = undefined
   if (reader) void reader.cancel().catch(() => undefined)

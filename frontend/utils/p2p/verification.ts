@@ -90,9 +90,12 @@ function hashToHex(hash: bigint): string {
 
 /** Hash one verification block with official XXH3-64. Multiple received data
  * channel parts are fed through the streaming API without concatenation. */
-export async function xxh3Hex(parts: readonly ArrayBuffer[]): Promise<string> {
-  if (parts.length === 1) return hashToHex(await xxh3(new Uint8Array(parts[0])))
-  return hashToHex(await xxh3Chunks(parts.map((part) => new Uint8Array(part))))
+export type VerificationPart = ArrayBuffer | Uint8Array<ArrayBuffer>
+
+export async function xxh3Hex(parts: readonly VerificationPart[]): Promise<string> {
+  const view = (part: VerificationPart) => (part instanceof Uint8Array ? part : new Uint8Array(part))
+  if (parts.length === 1) return hashToHex(await xxh3(view(parts[0])))
+  return hashToHex(await xxh3Chunks(parts.map(view)))
 }
 
 export async function hashFileVerificationBlocks(file: File, signal?: AbortSignal): Promise<string[]> {
@@ -105,10 +108,6 @@ export async function hashFileVerificationBlocks(file: File, signal?: AbortSigna
   } finally {
     disposeHashData(state)
   }
-}
-
-export function sliceArrayBuffer(buffer: ArrayBuffer, start: number, end: number): ArrayBuffer {
-  return start === 0 && end === buffer.byteLength ? buffer : buffer.slice(start, end)
 }
 
 export async function appendHashData(

@@ -1,3 +1,4 @@
+import { median } from "../benchmark-utils.mjs"
 const params = new URLSearchParams(location.search)
 const sizeMiB = Number(params.get("sizeMiB") || 128)
 const samples = Number(params.get("samples") || 5)
@@ -113,11 +114,6 @@ function equalBytes(left, right) {
   if (left.length !== right.length) return false
   for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false
   return true
-}
-
-function median(values) {
-  const sorted = [...values].sort((left, right) => left - right)
-  return sorted[Math.floor(sorted.length / 2)]
 }
 
 function timedCompress(module, source) {

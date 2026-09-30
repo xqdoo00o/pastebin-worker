@@ -1,17 +1,41 @@
 import { dirname, resolve } from "node:path"
 import { readFileSync, rmSync } from "node:fs"
+import { defineConfig } from "vite"
 import * as toml from "toml"
 import react from "@vitejs/plugin-react"
 import tailwindcss from "@tailwindcss/vite"
 import { DARK_MODE_SCRIPT } from "../shared/darkMode.ts"
-import { hljsAliasesPlugin } from "./vite.hljs-aliases.config.js"
+import { pickPublicEnv } from "../shared/interfaces.ts"
+
+const standalonePages = new Map([
+  [
+    "optical-send",
+    {
+      entryName: "opticalSend",
+      entryFile: "optical-send.html",
+      outputDirectory: "../dist/optical-send",
+      workerImporterPath: "/utils/optical/",
+      inlineWorkerFactoryPath: "utils/optical/worker-factory.inline.ts",
+    },
+  ],
+  [
+    "optical-receive",
+    {
+      entryName: "opticalReceive",
+      entryFile: "optical-receive.html",
+      outputDirectory: "../dist/optical-receive",
+      workerImporterPath: "/optical/receive/",
+      inlineWorkerFactoryPath: "optical/receive/worker-factory.inline.ts",
+    },
+  ],
+])
 
 /**
  * Build one optical sender/receiver as a self-contained HTML file that can be
- * opened from file://. Page-specific configs supply only their entry point and
+ * opened from file://. Page profiles supply only their entry point and
  * worker factory; all inlining and output-safety rules stay identical.
  */
-export function createOpticalStandaloneConfig({
+function createOpticalStandaloneConfig({
   mode,
   name,
   entryName,
@@ -124,9 +148,17 @@ export function createOpticalStandaloneConfig({
   return {
     root: frontendDir,
     base: "./",
-    plugins: [react(), tailwindcss(), hljsAliasesPlugin(), inlineWorkersPlugin(), singleFilePlugin()],
+    resolve: {
+      alias: [
+        {
+          find: /^(?:.*\/)?highlight-client\.js$/,
+          replacement: resolve(frontendDir, "utils/highlight-common-client.tsx"),
+        },
+      ],
+    },
+    plugins: [react(), tailwindcss(), inlineWorkersPlugin(), singleFilePlugin()],
     define: {
-      __WRANGLER_CONFIG__: JSON.stringify(vars),
+      __WRANGLER_CONFIG__: JSON.stringify(pickPublicEnv(vars)),
       __WASM_VARIANT__: JSON.stringify(wasmVariant),
     },
     worker: {
@@ -160,3 +192,10 @@ export function createOpticalStandaloneConfig({
     },
   }
 }
+
+export default defineConfig(({ mode }) => {
+  const name = mode.replace(/-scalar$/, "")
+  const page = standalonePages.get(name)
+  if (!page) throw new Error(`Unknown optical standalone build mode: ${mode}`)
+  return createOpticalStandaloneConfig({ mode, name, scalarMode: `${name}-scalar`, ...page })
+})

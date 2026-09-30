@@ -64,7 +64,7 @@ const COMPRESSIBLE_CODECS: Record<ArchiveCompression, { method: number; level: n
 }
 
 // Keep native and registered codecs in the current archive realm. The per-entry
-// override enables the custom fflate codec worker only for the legacy fallback.
+// override enables the custom fflate codec worker when native deflate is unavailable.
 configure({
   useWebWorkers: false,
   chunkSize: STREAMING_COMPRESSION_CHUNK_BYTES,

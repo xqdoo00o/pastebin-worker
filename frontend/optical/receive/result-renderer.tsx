@@ -16,6 +16,7 @@ import { countTextLines } from "../../components/LineNumbers.js"
 import { classifyReceivedFile, classifyStoredReceivedFile, decodeReceivedText } from "../../utils/filePreview.js"
 import { formatSize } from "../../utils/utils.js"
 import { triggerUrlDownload } from "../../utils/download.js"
+import { useObjectUrl } from "../../utils/useObjectUrl.js"
 import { highlightHTML, useHljsForLang } from "../../utils/highlight.js"
 import { highlightLanguageFromMimeType } from "../../../shared/fileType.js"
 import type { OpticalFile } from "../shared/protocol.js"
@@ -111,11 +112,7 @@ function OpticalReceivedFileView({
           getCopyContent={() => loadedText}
         />
       )}
-      {loadedText !== undefined ? (
-        <WebShareButton title={file.name} text={loadedText} file={shareFile} />
-      ) : (
-        <WebShareButton title={file.name} file={shareFile} />
-      )}
+      <WebShareButton title={file.name} text={loadedText} file={shareFile} />
       <ActionButton type="button" variant="tertiary" isIconOnly aria-label="Other" title="Other" onClick={onRestart}>
         <RefreshIcon className="size-6 text-default-600" aria-hidden="true" />
       </ActionButton>
@@ -183,7 +180,7 @@ export function OpticalReceivedFileResult({
     () => createReceivedPresentation(file, containerBytes, seconds, disallowedMimeTypes),
     [containerBytes, disallowedMimeTypes, file, seconds],
   )
-  const url = useMemo(() => URL.createObjectURL(presentation.blob), [presentation.blob])
+  const url = useObjectUrl(presentation.blob)
   const onDownloadRef = useRef(onDownload)
   const autoDownloadedUrlRef = useRef<string | undefined>(undefined)
 
@@ -192,12 +189,11 @@ export function OpticalReceivedFileResult({
   }, [onDownload])
 
   useLayoutEffect(() => {
-    if (presentation.preview.kind === "download" && autoDownloadedUrlRef.current !== url) {
+    if (url && presentation.preview.kind === "download" && autoDownloadedUrlRef.current !== url) {
       autoDownloadedUrlRef.current = url
       onDownloadRef.current?.()
       triggerUrlDownload(url, file.name)
     }
-    return () => URL.revokeObjectURL(url)
   }, [file.name, presentation.preview.kind, url])
 
   return (

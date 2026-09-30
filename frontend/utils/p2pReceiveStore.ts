@@ -9,11 +9,12 @@ import {
 } from "./opfs.js"
 import { acquireExclusiveWebLock, type WebLockLease } from "./webLock.js"
 import { WorkerRequestMap } from "./workerRequests.js"
+import { disposeWorker } from "./workerLifecycle.js"
 import {
   browserStorage,
   readStorageJson,
   removeStorageItem,
-  storageKeysWithPrefix,
+  pruneStorageRecords,
   writeStorageJson,
 } from "./browserStorage.js"
 
@@ -30,7 +31,7 @@ export interface P2PResumeCheckpoint {
   version: typeof checkpointSchemaVersion
   roomName: string
   peerId: string
-  storageId?: string
+  storageId: string
   meta: P2PFileMeta
   receivedBytes: number
   completedHashes: string[]
@@ -72,7 +73,7 @@ function isCheckpoint(value: unknown, roomName: string, now = Date.now()): value
     checkpoint.version === checkpointSchemaVersion &&
     checkpoint.roomName === roomName &&
     isUuid(checkpoint.peerId) &&
-    (checkpoint.storageId === undefined || isUuid(checkpoint.storageId)) &&
+    isUuid(checkpoint.storageId) &&
     isP2PFileMeta(checkpoint.meta) &&
     typeof checkpoint.receivedBytes === "number" &&
     Number.isSafeInteger(checkpoint.receivedBytes) &&
@@ -156,29 +157,13 @@ export function setP2PSessionRecoveryRetryToken(
 }
 
 export function cleanupStaleP2PSessionPeers(now = Date.now()): number {
-  const storage = browserStorage("session")
-  let removed = 0
-  for (const key of storageKeysWithPrefix(storage, sessionPeerKeyPrefix)) {
-    const roomName = key.slice(sessionPeerKeyPrefix.length)
-    const peer = readSessionPeerValue(storage, key, now)
-    if (roomName && peer) continue
-    if (removeStorageItem(storage, key)) removed += 1
-  }
-  return removed
+  return pruneStorageRecords(browserStorage("session"), sessionPeerKeyPrefix, (value) => isSessionPeer(value, now))
 }
 
 export function cleanupStaleP2PResumeCheckpoints(now = Date.now()): number {
-  const storage = browserStorage("local")
-  let removed = 0
-  for (const key of storageKeysWithPrefix(storage, checkpointKeyPrefix)) {
-    const roomName = key.slice(checkpointKeyPrefix.length)
-    const checkpoint = readStorageJson(storage, key, (value) =>
-      roomName && isCheckpoint(value, roomName, now) ? value : undefined,
-    )
-    if (checkpoint) continue
-    if (removeStorageItem(storage, key)) removed += 1
-  }
-  return removed
+  return pruneStorageRecords(browserStorage("local"), checkpointKeyPrefix, (value, roomName) =>
+    isCheckpoint(value, roomName, now),
+  )
 }
 
 export function readP2PResumeCheckpoint(roomName: string): P2PResumeCheckpoint | undefined {
@@ -378,14 +363,14 @@ export class P2PPersistentReceiveStore {
     this.closed = true
     this.closeError = error
     this.clearPendingWrite()
-    this.worker.terminate()
+    disposeWorker(this.worker)
     this.requests.rejectAll(error)
   }
 
   private terminate(): void {
     this.closed = true
     this.clearPendingWrite()
-    this.worker.terminate()
+    disposeWorker(this.worker)
     this.requests.rejectAll(new Error("P2P storage worker closed."))
   }
 }

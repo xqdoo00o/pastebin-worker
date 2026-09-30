@@ -7,6 +7,7 @@ import {
   verificationHashIndices,
   xxh3Hex,
   type BlockHashState,
+  type VerificationPart,
 } from "./verification.js"
 import { verificationBlockSize, type P2PVerificationManifest } from "./protocol.js"
 
@@ -144,7 +145,7 @@ export class ReceiverVerificationState {
 
   async mismatches(
     manifest: P2PVerificationManifest,
-    verificationParts: (index: number) => readonly ArrayBuffer[] | undefined,
+    verificationParts: (index: number) => readonly VerificationPart[] | undefined,
     indicesToVerify?: Iterable<number>,
     isCurrent: () => boolean = () => true,
   ): Promise<number[]> {

@@ -10,7 +10,7 @@ import {
   workerFetch,
 } from "./testUtils.js"
 import { createExecutionContext, env } from "cloudflare:test"
-import type { MetaResponse } from "../../shared/interfaces.js"
+import type { MetaResponse, PasteResponse } from "../../shared/interfaces.js"
 import { BINARY_MIME_TYPE, MAX_PASSWD_LEN, MIN_PASSWD_LEN, PRIVATE_PASTE_NAME_LEN } from "../../shared/constants.js"
 import { parseExpiration } from "../../shared/parsers.js"
 import { isOriginalFileInfo } from "../../shared/verify.js"
@@ -25,6 +25,24 @@ test("validates original file metadata", () => {
       sizeBytes: Number.MAX_SAFE_INTEGER + 1,
     }),
   ).toBe(false)
+})
+
+test("keeps the last duplicate field and accepts file-valued metadata", async () => {
+  const ctx = createExecutionContext()
+  const form = new FormData()
+  form.append("c", new Blob(["ignored"]), "old.txt")
+  form.append("c", new Blob(["你好"]), "note.txt")
+  form.append("lang", "ignored")
+  form.append("lang", new Blob(["typescript"]), "language.txt")
+  form.append("e", new Blob(["1h"]), "expiration.txt")
+  const response = await workerFetch(ctx, new Request(BASE_URL, { method: "POST", body: form }))
+  expect(response.status).toBe(200)
+  const paste = await response.json<PasteResponse>()
+  expect(paste.filename).toBe("note.txt")
+  expect(paste.highlightLanguage).toBe("typescript")
+  expect(paste.expirationSeconds).toBe(3600)
+  expect(paste.sizeBytes).toBe(6)
+  expect(await (await workerFetch(ctx, paste.url)).text()).toBe("你好")
 })
 
 test("privacy url with option p", async () => {

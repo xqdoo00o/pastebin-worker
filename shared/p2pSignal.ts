@@ -23,7 +23,7 @@ export interface P2PIceCandidate {
 export interface P2PSignalingPeer {
   peerId: string
   userAgent?: string
-  connectionId?: string
+  connectionId: string
 }
 
 export type P2PSignalMessage =
@@ -36,10 +36,10 @@ export type P2PSignalMessage =
     }
   | {
       type: "peer-joined"
-      role: P2PRole
-      peerId?: string
+      role: "receiver"
+      peerId: string
       userAgent?: string
-      connectionId?: string
+      connectionId: string
       iceServers?: P2PIceServer[]
     }
   | { type: "peer-left"; role: P2PRole; peerId?: string; resumable?: boolean }
@@ -47,11 +47,11 @@ export type P2PSignalMessage =
       type: "offer"
       peerId: string
       sdp: P2PSessionDescription
-      negotiationId?: string
+      negotiationId: string
       directOnly?: boolean
     }
-  | { type: "answer"; peerId: string; sdp: P2PSessionDescription; negotiationId?: string }
-  | { type: "candidate"; peerId: string; candidate: P2PIceCandidate; negotiationId?: string }
+  | { type: "answer"; peerId: string; sdp: P2PSessionDescription; negotiationId: string }
+  | { type: "candidate"; peerId: string; candidate: P2PIceCandidate; negotiationId: string }
   | { type: "receiver-paired"; peerId: string }
   | { type: "receiver-pair-result"; peerId: string; accepted: boolean }
   | { type: "receiver-limit-reached" }
@@ -67,12 +67,8 @@ export type P2PSignalMessage =
   | { type: "sender-leave" }
   | { type: "peer-reconnect-request"; peerId?: string; retryToken?: string }
   | { type: "peer-reconnect-failed"; peerId: string; retryToken: string }
-  | {
-      type: "peer-signaling-disconnected"
-      role: P2PRole
-      peerId?: string
-      connectionId?: string
-    }
+  | { type: "peer-signaling-disconnected"; role: "sender" }
+  | { type: "peer-signaling-disconnected"; role: "receiver"; peerId: string; connectionId: string }
   | { type: "room-options-updated"; expireAt: string; maxTransfers: number; joinable: boolean }
   | { type: "ping" }
   | { type: "pong" }
@@ -132,14 +128,14 @@ function isPeer(value: unknown): value is P2PSignalingPeer {
     isRecord(value) &&
     isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) &&
     isOptionalBoundedString(value.userAgent, MAX_SHORT_TEXT_LENGTH) &&
-    isOptionalBoundedString(value.connectionId, MAX_PEER_ID_LENGTH)
+    isBoundedString(value.connectionId, MAX_PEER_ID_LENGTH)
   )
 }
 
 export function isP2PSignalMessage(value: unknown): value is P2PSignalMessage {
   if (!isRecord(value) || !isBoundedString(value.type, 64)) return false
   const hasOptionalPeerId = isOptionalBoundedString(value.peerId, MAX_PEER_ID_LENGTH)
-  const hasOptionalNegotiationId = isOptionalBoundedString(value.negotiationId, MAX_PEER_ID_LENGTH)
+  const hasNegotiationId = isBoundedString(value.negotiationId, MAX_PEER_ID_LENGTH)
 
   switch (value.type) {
     case "ready":
@@ -154,10 +150,10 @@ export function isP2PSignalMessage(value: unknown): value is P2PSignalMessage {
       )
     case "peer-joined":
       return (
-        isRole(value.role) &&
-        hasOptionalPeerId &&
+        value.role === "receiver" &&
+        isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) &&
         isOptionalBoundedString(value.userAgent, MAX_SHORT_TEXT_LENGTH) &&
-        isOptionalBoundedString(value.connectionId, MAX_PEER_ID_LENGTH) &&
+        isBoundedString(value.connectionId, MAX_PEER_ID_LENGTH) &&
         (value.iceServers === undefined || (Array.isArray(value.iceServers) && value.iceServers.every(isP2PIceServer)))
       )
     case "peer-left":
@@ -169,22 +165,14 @@ export function isP2PSignalMessage(value: unknown): value is P2PSignalMessage {
     case "offer":
       return (
         isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) &&
-        hasOptionalNegotiationId &&
+        hasNegotiationId &&
         isP2PSessionDescription(value.sdp) &&
         (value.directOnly === undefined || typeof value.directOnly === "boolean")
       )
     case "answer":
-      return (
-        isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) &&
-        hasOptionalNegotiationId &&
-        isP2PSessionDescription(value.sdp)
-      )
+      return isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) && hasNegotiationId && isP2PSessionDescription(value.sdp)
     case "candidate":
-      return (
-        isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) &&
-        hasOptionalNegotiationId &&
-        isP2PIceCandidate(value.candidate)
-      )
+      return isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) && hasNegotiationId && isP2PIceCandidate(value.candidate)
     case "receiver-paired":
     case "transfer-complete":
       return isBoundedString(value.peerId, MAX_PEER_ID_LENGTH)
@@ -195,7 +183,12 @@ export function isP2PSignalMessage(value: unknown): value is P2PSignalMessage {
     case "peer-reconnect-failed":
       return isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) && isBoundedString(value.retryToken, MAX_PEER_ID_LENGTH)
     case "peer-signaling-disconnected":
-      return isRole(value.role) && hasOptionalPeerId && isOptionalBoundedString(value.connectionId, MAX_PEER_ID_LENGTH)
+      return (
+        value.role === "sender" ||
+        (value.role === "receiver" &&
+          isBoundedString(value.peerId, MAX_PEER_ID_LENGTH) &&
+          isBoundedString(value.connectionId, MAX_PEER_ID_LENGTH))
+      )
     case "room-options-updated":
       return (
         isBoundedString(value.expireAt, 64) &&

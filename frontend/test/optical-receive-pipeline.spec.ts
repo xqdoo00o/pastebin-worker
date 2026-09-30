@@ -2,11 +2,13 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { CapturePipeline } from "../optical/receive/capture-pipeline.js"
 import {
   acquireCamera,
+  cameraExposureConstraints,
   cameraOptionState,
   cameraSelection,
   formatActiveReceiverSettings,
   formatPendingReceiverSettings,
   formatReceiverStatus,
+  probeCameraCapabilities,
 } from "../optical/receive/camera.js"
 import { tightVideoFrameLayout } from "../optical/shared/capture.js"
 import { DecodeWorkerPool, type PoolWorker } from "../optical/shared/worker-pool.js"
@@ -61,6 +63,37 @@ describe("optical camera selection", () => {
       selected: "",
       disabled: true,
     })
+  })
+
+  it("uses the active camera's ISO range and step", () => {
+    const track = {
+      getCapabilities: () => ({
+        exposureMode: ["continuous", "manual"],
+        exposureTime: { min: 5, max: 15, step: 2 },
+        iso: { min: 190, max: 850, step: 25 },
+      }),
+    } as unknown as MediaStreamTrack
+    const caps = probeCameraCapabilities(track)
+
+    expect(caps).toMatchObject({
+      isoRange: { min: 190, max: 850, step: 25 },
+      manualExposure: true,
+      exposureTimeRange: { min: 5, max: 15, step: 2 },
+    })
+    expect(cameraExposureConstraints(200, caps)).toEqual({
+      advanced: [{ exposureMode: "manual", exposureTime: 15, iso: 190 }],
+    })
+    expect(cameraExposureConstraints(200, { ...caps, manualExposure: false })).toBeUndefined()
+  })
+
+  it("does not offer manual ISO for an incomplete capability report", () => {
+    const track = {
+      getCapabilities: () => ({ exposureMode: ["manual"], iso: { min: 100 } }),
+    } as unknown as MediaStreamTrack
+    const caps = probeCameraCapabilities(track)
+
+    expect(caps.isoRange).toBeUndefined()
+    expect(cameraExposureConstraints(200, caps)).toBeUndefined()
   })
 
   it("requests ideal frame rate on the first and only camera acquisition", async () => {
@@ -263,6 +296,17 @@ describe("CapturePipeline", () => {
     expect(cloneTrack).toHaveBeenCalledOnce()
     expect(worker.postMessage).toHaveBeenCalledWith({ type: "start", track: clonedTrack }, [clonedTrack])
     worker.reply({ type: "ready" })
+    expect(pipeline.backendLabel).toBe("videoframe-worker format unavailable capture")
+
+    worker.reply({
+      type: "frame",
+      frame: {
+        format: "I420",
+        visibleRect: { x: 0, y: 0, width: 4, height: 4 },
+        close: vi.fn(),
+      } as unknown as VideoFrame,
+    })
+    expect(pipeline.backendLabel).toBe("videoframe-worker I420 capture")
 
     pipeline.stop()
     expect(worker.postMessage).toHaveBeenLastCalledWith({ type: "stop" })
@@ -351,11 +395,16 @@ describe("optical receiver status", () => {
     expect(formatReceiverStatus("receiving", camera)).toBe("Receiving QR stream · 1280×720 @ 30 fps")
   })
 
-  it("distinguishes requested settings from the camera's negotiated settings", () => {
+  it("formats pending requests separately from active camera settings", () => {
     expect(formatPendingReceiverSettings(requested, 3)).toBe("Will request 1920 px wide @ 60 fps · 3 decode workers")
-    expect(formatActiveReceiverSettings(camera, requested, 3, "readback")).toBe(
-      "Actual 1280×720 @ 30 fps · requested 1920 px wide @ 60 fps · 3 decode workers · " +
-        "readback capture · changes apply live",
+    expect(formatActiveReceiverSettings(camera, 3, "readback capture")).toBe(
+      "Actual 1280×720 @ 30 fps · ISO not reported · 3 decode workers · " + "readback capture · changes apply live",
+    )
+    expect(formatActiveReceiverSettings(camera, 3, "videoframe-worker I420 capture")).toBe(
+      "Actual 1280×720 @ 30 fps · ISO not reported · 3 decode workers · videoframe-worker I420 capture · changes apply live",
+    )
+    expect(formatActiveReceiverSettings(camera, 3, "readback capture", "changes apply live", false)).toBe(
+      "Actual 1280×720 @ 30 fps · 3 decode workers · readback capture · changes apply live",
     )
   })
 })
@@ -405,12 +454,12 @@ describe("optical decode worker limit", () => {
   })
 
   it.each([
-    [16, 14],
+    [16, 6],
     [8, 6],
     [4, 2],
     [2, 1],
     [1, 1],
-  ])("defaults to %s minus two logical processors, clamped to %s worker(s)", (workerLimit, expected) => {
+  ])("leaves two logical processors free with a six-worker default cap (%s → %s)", (workerLimit, expected) => {
     expect(opticalDefaultDecodeWorkerCount(workerLimit)).toBe(expected)
   })
 })

@@ -178,10 +178,8 @@ export function P2PTransferPanel({
                 {transferGroups.map((group) => (
                   <div key={group.file.revision} className="min-w-0">
                     <Divider className="mb-2" />
-                    <div className="min-w-0 overflow-hidden text-sm font-semibold text-foreground">
-                      <span className="block truncate" title={group.file.name}>
-                        {group.file.name}
-                      </span>
+                    <div className="min-w-0 truncate text-sm font-semibold text-foreground" title={group.file.name}>
+                      {group.file.name}
                     </div>
                     {group.peers.length > 0 && (
                       <div className="flex flex-col gap-2">

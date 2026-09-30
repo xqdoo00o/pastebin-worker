@@ -1,10 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { ApngDecodeSource } from "../optical/receive/apng-source.js"
-import { OPTICAL_APNG_FORMAT_VERSION } from "../optical/shared/apng-format.js"
 import type { ApngParserWorkerOutput } from "../optical/shared/worker-messages.js"
 
-const metadata = { format: OPTICAL_APNG_FORMAT_VERSION, scale: 4, grid: 2, qr: 40 } as const
+const metadata = { scale: 4, grid: 2, qr: 40 } as const
 
 class ParserWorkerStub {
   static latest: ParserWorkerStub | undefined
@@ -25,6 +24,65 @@ class ParserWorkerStub {
 }
 
 describe("APNG decode source", () => {
+  it("rejects an aborted parse and lets a replacement complete independently", async () => {
+    vi.stubGlobal("Worker", ParserWorkerStub)
+    try {
+      const source = new ApngDecodeSource({
+        pool: { size: 1, submit: vi.fn(() => true) } as never,
+        isStale: () => false,
+        onFrameTotal: vi.fn(),
+        memoryInput: false,
+      })
+      const first = source.parse(new File([], "first.png"), 1)
+      const rejected = expect(first).rejects.toMatchObject({ name: "AbortError" })
+      const previous = ParserWorkerStub.latest!
+      const replacement = source.parse(new File([], "second.png"), 2)
+      await rejected
+      expect(previous.terminate).toHaveBeenCalledOnce()
+      expect(previous.onmessage).toBeNull()
+      previous.emit({ type: "error", message: "late error" })
+      ParserWorkerStub.latest!.emit({ type: "done", width: 2, height: 1, frames: 1, metadata })
+      await replacement
+      source.abort()
+      expect(ParserWorkerStub.latest!.terminate).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+      ParserWorkerStub.latest = undefined
+    }
+  })
+
+  it("settles cancellation before a standalone file read completes", async () => {
+    vi.stubGlobal("Worker", ParserWorkerStub)
+    try {
+      let finishRead!: (bytes: ArrayBuffer) => void
+      const file = new File([], "slow.png")
+      vi.spyOn(file, "arrayBuffer").mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            finishRead = resolve
+          }),
+      )
+      const source = new ApngDecodeSource({
+        pool: { size: 1 } as never,
+        isStale: () => false,
+        onFrameTotal: vi.fn(),
+        memoryInput: true,
+      })
+      const parsing = source.parse(file, 1)
+      const rejected = expect(parsing).rejects.toMatchObject({ name: "AbortError" })
+      source.abort()
+      source.abort()
+      await rejected
+      finishRead(new ArrayBuffer(1))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(ParserWorkerStub.latest!.postMessage).not.toHaveBeenCalled()
+      expect(ParserWorkerStub.latest!.terminate).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+      ParserWorkerStub.latest = undefined
+    }
+  })
+
   it("forwards QR geometry metadata from the parser to the decode worker", async () => {
     vi.stubGlobal("Worker", ParserWorkerStub)
     try {

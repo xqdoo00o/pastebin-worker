@@ -16,7 +16,6 @@
 #include "DecoderResult.h"
 #include "GlobalHistogramBinarizer.h"
 #include "ImageView.h"
-#include "ReaderOptions.h"
 #include "qrcode/QRDecoder.h"
 #include "qrcode/QRReader.h"
 
@@ -24,7 +23,9 @@
 #include <emscripten/heap.h>
 #include <emscripten/val.h>
 
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -39,6 +40,14 @@ enum class InputLayout
 };
 
 static constexpr int MAX_SYMBOLS = 9;
+
+static constexpr auto MONO1_MODULES = [] {
+	std::array<std::array<uint8_t, 8>, 256> table{};
+	for (int value = 0; value < 256; ++value)
+		for (int bit = 0; bit < 8; ++bit)
+			table[value][bit] = (value & (0x80 >> bit)) ? BitMatrix::UNSET_V : BitMatrix::SET_V;
+	return table;
+}();
 
 static bool validInput(int bufferPtr, int width, int height, int maxSymbols, InputLayout layout)
 {
@@ -76,9 +85,7 @@ static emscripten::val toUint8Array(const std::vector<uint8_t>& bytes)
 
 static emscripten::val readBitmap(const BinaryBitmap& bitmap, int maxSymbols)
 {
-	static const auto options =
-		ReaderOptions().formats(BarcodeFormat::QRCode).tryHarder(true).returnErrors(false);
-	auto payloads = QRCode::ReadStandardPayloads(bitmap, maxSymbols, options);
+	auto payloads = QRCode::ReadTransferPayloads(bitmap, maxSymbols);
 
 	auto results = emscripten::val::array();
 	for (size_t i = 0; i < payloads.size(); ++i)
@@ -120,7 +127,7 @@ emscripten::val readModuleGridMono1(int bufferPtr, int width, int height,
 {
 	try {
 		constexpr int margin = 4;
-		if (qrVersion < 1 || qrVersion > 40 || columns < 1 || rows < 1 ||
+		if (qrVersion < 1 || (qrVersion > 40 && qrVersion != 48) || columns < 1 || rows < 1 ||
 			columns > MAX_SYMBOLS / rows)
 			return emscripten::val::array();
 		const int symbolCount = columns * rows;
@@ -142,14 +149,20 @@ emscripten::val readModuleGridMono1(int bufferPtr, int width, int height,
 				for (int y = 0; y < modules; ++y) {
 					auto* dst = matrix.row(y).begin();
 					const auto* src = packed + size_t(originY + y) * stride;
-					for (int x = 0; x < modules; ++x) {
+					int x = 0;
+					for (; x < modules && ((originX + x) & 7) != 0; ++x) {
 						const int sourceX = originX + x;
-						const bool white = (src[sourceX >> 3] & (0x80 >> (sourceX & 7))) != 0;
-						dst[x] = white ? BitMatrix::UNSET_V : BitMatrix::SET_V;
+						dst[x] = (src[sourceX >> 3] & (0x80 >> (sourceX & 7))) ? BitMatrix::UNSET_V : BitMatrix::SET_V;
+					}
+					for (; x + 8 <= modules; x += 8)
+						std::memcpy(dst + x, MONO1_MODULES[src[(originX + x) >> 3]].data(), 8);
+					for (; x < modules; ++x) {
+						const int sourceX = originX + x;
+						dst[x] = (src[sourceX >> 3] & (0x80 >> (sourceX & 7))) ? BitMatrix::UNSET_V : BitMatrix::SET_V;
 					}
 				}
 				try {
-					auto decoded = QRCode::Decode(matrix);
+					auto decoded = QRCode::DecodeTransfer(matrix);
 					if (!decoded.isValid())
 						continue;
 					auto content = std::move(decoded).content();

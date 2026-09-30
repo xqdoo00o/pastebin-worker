@@ -67,35 +67,6 @@ describe("paste read counter", () => {
     await waitOnExecutionContext(ctx)
   })
 
-  it("lazily initializes legacy read-limited metadata", async () => {
-    const pasteName = "~legacy_read_counter"
-    const nowUnix = Math.floor(Date.now() / 1000)
-    const legacyMetadata: PasteMetadata = {
-      schemaVersion: 1,
-      location: "KV",
-      passwd: "legacy-password",
-      lastModifiedAtUnix: nowUnix,
-      createdAtUnix: nowUnix,
-      willExpireAtUnix: nowUnix + 3600,
-      accessCounter: 0,
-      remainingReads: 1,
-      sizeBytes: 6,
-    }
-    await env.PB.put(pasteName, "legacy", {
-      metadata: legacyMetadata,
-      expiration: legacyMetadata.willExpireAtUnix,
-    })
-
-    const url = `${BASE_URL}/${pasteName}`
-    const firstContext = createExecutionContext()
-    const secondContext = createExecutionContext()
-    const responses = await Promise.all([workerFetch(firstContext, url), workerFetch(secondContext, url)])
-
-    expect(responses.map((response) => response.status).sort()).toStrictEqual([200, 404])
-    expect(await responses.find((response) => response.status === 200)!.text()).toStrictEqual("legacy")
-    await Promise.all([waitOnExecutionContext(firstContext), waitOnExecutionContext(secondContext)])
-  })
-
   it("creates a fresh counter version when a paste is updated", async () => {
     const ctx = createExecutionContext()
     const paste = await upload(ctx, { c: "before", reads: "2" })

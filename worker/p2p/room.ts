@@ -13,21 +13,16 @@ import {
   MIN_TURN_CREDENTIALS_REMAINING_MS,
 } from "./turnCredentials.js"
 import {
-  canAddReceiverFromStorage,
-  CREATED_AT_KEY,
   EXPIRES_AT_KEY,
   ICE_SERVERS_EXPIRES_AT_KEY,
   ICE_SERVERS_KEY,
   MAX_TRANSFERS_KEY,
-  PAIRED_RECEIVER_IDS_KEY,
+  PAIRED_RECEIVER_COUNT_KEY,
   RECEIVER_CLEANUP_AT_KEY,
-  RESUMABLE_RECEIVER_IDS_KEY,
-  ROOM_TTL_MS,
   SENDER_TOKEN_KEY,
   storedReceiverDeadlines,
   storedRoomExpiresAt,
-  storedStringIds,
-  SUCCESSFUL_RECEIVER_IDS_KEY,
+  SUCCESSFUL_RECEIVER_COUNT_KEY,
   P2PRoomMembershipStore,
   type P2PRoomInit,
   type P2PRoomStatus,
@@ -48,7 +43,7 @@ function earliestTimestamp(values: readonly (number | undefined)[]): number | un
 function isValidP2PClientSignalMessage(value: unknown): value is P2PSignalMessage {
   if (!isP2PSignalMessage(value)) return false
 
-  if ("negotiationId" in value && value.negotiationId !== undefined && !isUuid(value.negotiationId)) {
+  if ("negotiationId" in value && !isUuid(value.negotiationId)) {
     return false
   }
   if ("retryToken" in value && value.retryToken !== undefined && !isUuid(value.retryToken)) {
@@ -83,7 +78,7 @@ function isValidP2PClientSignalMessage(value: unknown): value is P2PSignalMessag
 interface P2PReceiver {
   socket: WebSocket
   userAgent: string
-  connectionId?: string
+  connectionId: string
   connectedAt: number
 }
 
@@ -92,9 +87,9 @@ interface P2PWebSocketAttachment {
   peerId?: string
   userAgent?: string
   connectionId?: string
-  connectedAt?: number
+  connectedAt: number
   lastPingAt?: number
-  lastPongAt?: number
+  lastPongAt: number
 }
 
 export class P2PRoom {
@@ -116,7 +111,7 @@ export class P2PRoom {
       if (!attachment) {
         socket.close(1008, "invalid socket attachment")
       } else if (attachment.role === "sender") {
-        const connectedAt = attachment.connectedAt ?? 0
+        const connectedAt = attachment.connectedAt
         this.latestConnectionAt = Math.max(this.latestConnectionAt, connectedAt)
         if (!this.sender) {
           this.sender = socket
@@ -130,14 +125,14 @@ export class P2PRoom {
           socket.close(1008, "duplicate sender")
         }
       } else if (attachment.peerId) {
-        const connectedAt = attachment.connectedAt ?? 0
+        const connectedAt = attachment.connectedAt
         this.latestConnectionAt = Math.max(this.latestConnectionAt, connectedAt)
         const existing = this.receivers.get(attachment.peerId)
         if (!existing || connectedAt > existing.connectedAt) {
           this.receivers.set(attachment.peerId, {
             socket,
             userAgent: attachment.userAgent ?? "",
-            connectionId: attachment.connectionId,
+            connectionId: attachment.connectionId!,
             connectedAt,
           })
           existing?.socket.close(1001, "peer reconnected")
@@ -152,7 +147,7 @@ export class P2PRoom {
     const now = Date.now()
     this.sendHeartbeat(now)
     const receiverCleanupAt = await this.cleanupExpiredReceivers(now)
-    const stored = await this.state.storage.get([EXPIRES_AT_KEY, CREATED_AT_KEY])
+    const stored = await this.state.storage.get([EXPIRES_AT_KEY])
     const expiresAt = storedRoomExpiresAt(stored)
     if (!this.sender && now >= expiresAt) {
       await this.closeRoomAfterSenderLeft()
@@ -172,6 +167,7 @@ export class P2PRoom {
     }
     if (url.pathname === "/init" && request.method === "POST") {
       const init = await this.readInit(request)
+      if (!init) return new Response("invalid P2P room initialization", { status: 400 })
       await this.initRoom(init)
       return jsonResponse({ ok: true })
     }
@@ -209,45 +205,48 @@ export class P2PRoom {
     await this.disconnect(socket)
   }
 
-  private async readInit(request: Request): Promise<P2PRoomInit> {
+  private async readInit(request: Request): Promise<P2PRoomInit | null> {
     try {
       const init: unknown = await request.json()
-      if (typeof init !== "object" || init === null) return {}
+      if (typeof init !== "object" || init === null) return null
       const iceServers = (init as P2PRoomInit).iceServers
       const iceServersExpiresAt = (init as P2PRoomInit).iceServersExpiresAt
       const senderToken = (init as P2PRoomInit).senderToken
       const expiresAt = (init as P2PRoomInit).expiresAt
       const maxTransfers = (init as P2PRoomInit).maxTransfers
+      if (
+        typeof senderToken !== "string" ||
+        senderToken.length === 0 ||
+        typeof expiresAt !== "number" ||
+        !Number.isFinite(expiresAt) ||
+        typeof maxTransfers !== "number" ||
+        !Number.isSafeInteger(maxTransfers) ||
+        maxTransfers < 0
+      )
+        return null
       return {
         ...(Array.isArray(iceServers) && iceServers.every(isP2PIceServer) ? { iceServers } : {}),
         ...(typeof iceServersExpiresAt === "number" && Number.isFinite(iceServersExpiresAt)
           ? { iceServersExpiresAt }
           : {}),
-        ...(typeof senderToken === "string" && senderToken.length > 0 ? { senderToken } : {}),
-        ...(typeof expiresAt === "number" && Number.isFinite(expiresAt) ? { expiresAt } : {}),
-        ...(typeof maxTransfers === "number" && Number.isSafeInteger(maxTransfers) && maxTransfers >= 0
-          ? { maxTransfers }
-          : {}),
+        senderToken,
+        expiresAt,
+        maxTransfers,
       }
     } catch {
-      return {}
+      return null
     }
   }
 
   private async status(): Promise<P2PRoomStatus> {
-    const stored = await this.state.storage.get([
-      CREATED_AT_KEY,
-      EXPIRES_AT_KEY,
-      MAX_TRANSFERS_KEY,
-      PAIRED_RECEIVER_IDS_KEY,
-      RESUMABLE_RECEIVER_IDS_KEY,
-      SUCCESSFUL_RECEIVER_IDS_KEY,
-      RECEIVER_CLEANUP_AT_KEY,
+    const [stored, membership] = await Promise.all([
+      this.state.storage.get([EXPIRES_AT_KEY, RECEIVER_CLEANUP_AT_KEY]),
+      this.membership.summary(),
     ])
     const expiresAt = storedRoomExpiresAt(stored)
-    const createdAt = stored.get(CREATED_AT_KEY)
-    const unexpired = typeof createdAt === "number" && Date.now() < expiresAt
-    const joinable = unexpired && canAddReceiverFromStorage(stored)
+    const unexpired = Date.now() < expiresAt
+    const joinable =
+      unexpired && (membership.maxTransfers === 0 || membership.pairedReceivers < membership.maxTransfers)
     const hasSender = this.sender !== undefined
     const hasReceiver =
       this.receivers.size > 0 || Object.keys(storedReceiverDeadlines(stored.get(RECEIVER_CLEANUP_AT_KEY))).length > 0
@@ -272,28 +271,16 @@ export class P2PRoom {
       return new Response("invalid sender token", { status: 403 })
     }
     const receiverAdmission =
-      role === "receiver"
-        ? await this.state.storage.get([
-            CREATED_AT_KEY,
-            EXPIRES_AT_KEY,
-            MAX_TRANSFERS_KEY,
-            PAIRED_RECEIVER_IDS_KEY,
-            RESUMABLE_RECEIVER_IDS_KEY,
-            SUCCESSFUL_RECEIVER_IDS_KEY,
-            RECEIVER_CLEANUP_AT_KEY,
-          ])
-        : undefined
+      role === "receiver" ? await this.state.storage.get([EXPIRES_AT_KEY, RECEIVER_CLEANUP_AT_KEY]) : undefined
+    const membershipAdmission = peerId ? await this.membership.admission(peerId) : undefined
     const isReceiverReconnect =
       role === "receiver" &&
       peerId !== null &&
       (this.receivers.has(peerId) ||
         (storedReceiverDeadlines(receiverAdmission?.get(RECEIVER_CLEANUP_AT_KEY))[peerId] ?? 0) > Date.now() ||
-        storedStringIds(receiverAdmission?.get(RESUMABLE_RECEIVER_IDS_KEY)).includes(peerId))
-    const isCompletedReceiver =
-      role === "receiver" &&
-      peerId !== null &&
-      storedStringIds(receiverAdmission?.get(SUCCESSFUL_RECEIVER_IDS_KEY)).includes(peerId)
-    if (isCompletedReceiver && !isReceiverReconnect) {
+        membershipAdmission?.resumable === true)
+    const isCompletedReceiver = membershipAdmission?.successful === true
+    if (peerId && isCompletedReceiver && !isReceiverReconnect) {
       return this.terminalReceiverSocket(peerId, { type: "receiver-reconnect-expired" })
     }
     if (
@@ -304,12 +291,7 @@ export class P2PRoom {
     ) {
       return new Response("P2P link expired", { status: 410 })
     }
-    if (
-      role === "receiver" &&
-      !isReceiverReconnect &&
-      receiverAdmission &&
-      !canAddReceiverFromStorage(receiverAdmission, peerId ?? undefined)
-    ) {
+    if (role === "receiver" && !isReceiverReconnect && receiverAdmission && !membershipAdmission?.canAdd) {
       return new Response("P2P receiver limit reached", { status: 429 })
     }
     const staleReceiverSocket = role === "receiver" && peerId ? this.receivers.get(peerId)?.socket : undefined
@@ -339,7 +321,7 @@ export class P2PRoom {
       this.receivers.set(peerId!, {
         socket: server,
         userAgent,
-        connectionId,
+        connectionId: connectionId!,
         connectedAt,
       })
       staleReceiverSocket?.close(1001, "peer reconnected")
@@ -369,9 +351,9 @@ export class P2PRoom {
     if (role === "receiver") {
       this.send(this.sender, {
         type: "peer-joined",
-        role,
-        peerId: peerId ?? undefined,
-        connectionId,
+        role: "receiver",
+        peerId: peerId!,
+        connectionId: connectionId!,
         iceServers: signalIceServers,
         userAgent,
       })
@@ -396,20 +378,18 @@ export class P2PRoom {
   }
 
   private async initRoom(init: P2PRoomInit): Promise<void> {
-    const now = Date.now()
-    const expiresAt = init.expiresAt ?? now + ROOM_TTL_MS
+    const expiresAt = init.expiresAt
     const roomState: Record<string, unknown> = {
-      [CREATED_AT_KEY]: now,
       [EXPIRES_AT_KEY]: expiresAt,
-      [PAIRED_RECEIVER_IDS_KEY]: [],
-      [RESUMABLE_RECEIVER_IDS_KEY]: [],
-      [SUCCESSFUL_RECEIVER_IDS_KEY]: [],
+      [MAX_TRANSFERS_KEY]: init.maxTransfers,
+      [SENDER_TOKEN_KEY]: init.senderToken,
+      [PAIRED_RECEIVER_COUNT_KEY]: 0,
+      [SUCCESSFUL_RECEIVER_COUNT_KEY]: 0,
     }
     if (init.iceServers !== undefined) roomState[ICE_SERVERS_KEY] = init.iceServers
     if (init.iceServersExpiresAt !== undefined) roomState[ICE_SERVERS_EXPIRES_AT_KEY] = init.iceServersExpiresAt
-    if (init.maxTransfers !== undefined) roomState[MAX_TRANSFERS_KEY] = init.maxTransfers
-    if (init.senderToken !== undefined) roomState[SENDER_TOKEN_KEY] = init.senderToken
 
+    await this.state.storage.deleteAll()
     await this.state.storage.put(roomState)
     await this.state.storage.setAlarm(expiresAt)
   }
@@ -421,6 +401,7 @@ export class P2PRoom {
     server.serializeAttachment({
       role: "receiver",
       peerId,
+      connectionId: crypto.randomUUID(),
       connectedAt,
       lastPongAt: connectedAt,
     } satisfies P2PWebSocketAttachment)
@@ -451,23 +432,20 @@ export class P2PRoom {
     }
 
     const result = await this.enqueueStorageMutation(async () => {
-      const stored = await this.state.storage.get([PAIRED_RECEIVER_IDS_KEY, SUCCESSFUL_RECEIVER_IDS_KEY])
-      const pairedReceiverIds = storedStringIds(stored.get(PAIRED_RECEIVER_IDS_KEY))
-      const successfulReceiverIds = storedStringIds(stored.get(SUCCESSFUL_RECEIVER_IDS_KEY))
+      const membership = await this.membership.summary()
       await this.state.storage.put({
         [EXPIRES_AT_KEY]: update.expiresAt,
         [MAX_TRANSFERS_KEY]: update.maxTransfers,
-        [PAIRED_RECEIVER_IDS_KEY]: pairedReceiverIds,
       })
       const joinable =
-        Date.now() < update.expiresAt && (update.maxTransfers === 0 || pairedReceiverIds.length < update.maxTransfers)
+        Date.now() < update.expiresAt && (update.maxTransfers === 0 || membership.pairedReceivers < update.maxTransfers)
       return {
         expireAt: new Date(update.expiresAt).toISOString(),
         expirationSeconds: update.expirationSeconds,
         maxTransfers: update.maxTransfers,
         joinable,
-        pairedReceivers: pairedReceiverIds.length,
-        successfulReceivers: successfulReceiverIds.length,
+        pairedReceivers: membership.pairedReceivers,
+        successfulReceivers: membership.successfulReceivers,
       } satisfies P2PUpdateResponse
     })
 
@@ -483,10 +461,6 @@ export class P2PRoom {
     return jsonResponse(result)
   }
 
-  private async resumableReceiverIds(): Promise<string[]> {
-    return (await this.membership.load()).resumableReceiverIds
-  }
-
   private enqueueStorageMutation<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.storageMutationQueue.then(operation, operation)
     this.storageMutationQueue = result.then(
@@ -499,76 +473,35 @@ export class P2PRoom {
   private recordPairedReceiver(peerId: string | undefined): Promise<boolean> {
     return this.enqueueStorageMutation(async () => {
       if (!peerId) return false
-      const { successfulReceiverIds, maxTransfers, pairedReceiverIds } = await this.membership.load()
-      if (successfulReceiverIds.includes(peerId)) return false
-      if (pairedReceiverIds.includes(peerId)) return true
-      if (maxTransfers > 0 && pairedReceiverIds.length >= maxTransfers) return false
-      pairedReceiverIds.push(peerId)
-      await this.membership.save({ pairedReceiverIds })
-      return true
+      return await this.membership.recordPaired(peerId)
     })
   }
 
   private recordSuccessfulTransfer(peerId: string | undefined): Promise<{ accepted: boolean; limitReached: boolean }> {
     return this.enqueueStorageMutation(async () => {
       if (!peerId) return { accepted: false, limitReached: false }
-      const { maxTransfers, pairedReceiverIds, successfulReceiverIds, resumableReceiverIds } =
-        await this.membership.load()
-      if (successfulReceiverIds.includes(peerId)) {
-        return { accepted: true, limitReached: maxTransfers > 0 && pairedReceiverIds.length >= maxTransfers }
-      }
-      if (!pairedReceiverIds.includes(peerId)) {
-        if (!this.receivers.has(peerId)) return { accepted: false, limitReached: false }
-        if (maxTransfers > 0 && pairedReceiverIds.length >= maxTransfers) {
-          return { accepted: false, limitReached: true }
-        }
-        pairedReceiverIds.push(peerId)
-      }
-      successfulReceiverIds.push(peerId)
-      await this.membership.save({
-        pairedReceiverIds,
-        successfulReceiverIds,
-        resumableReceiverIds: resumableReceiverIds.filter((id) => id !== peerId),
-      })
-      const limitReached = maxTransfers > 0 && pairedReceiverIds.length >= maxTransfers
-      if (limitReached) {
+      const result = await this.membership.recordSuccessful(peerId, this.receivers.has(peerId))
+      const { limitReached } = result
+      if (result.accepted && limitReached) {
         this.send(this.sender, { type: "transfer-limit-complete" })
       }
-      return { accepted: true, limitReached }
+      return result
     })
   }
 
   private recordResumableReceiver(peerId: string | undefined): Promise<boolean> {
     return this.enqueueStorageMutation(async () => {
       if (!peerId || !this.receivers.has(peerId)) return false
-      const { successfulReceiverIds, pairedReceiverIds, resumableReceiverIds } = await this.membership.load()
-      if (successfulReceiverIds.includes(peerId)) return false
-      if (!pairedReceiverIds.includes(peerId)) return false
-      if (!resumableReceiverIds.includes(peerId)) {
-        resumableReceiverIds.push(peerId)
-        await this.membership.save({ resumableReceiverIds })
-      }
-      return true
+      return await this.membership.recordResumable(peerId)
     })
   }
 
   private clearResumableReceiver(peerId: string): Promise<void> {
-    return this.enqueueStorageMutation(async () => {
-      const resumableReceiverIds = await this.resumableReceiverIds()
-      if (!resumableReceiverIds.includes(peerId)) return
-      await this.membership.save({ resumableReceiverIds: resumableReceiverIds.filter((id) => id !== peerId) })
-    })
+    return this.enqueueStorageMutation(() => this.membership.clearResumable(peerId))
   }
 
   private async releaseReceiverState(peerId: string, force = false): Promise<boolean> {
-    const { successfulReceiverIds, resumableReceiverIds, pairedReceiverIds } = await this.membership.load()
-    if (successfulReceiverIds.includes(peerId)) return false
-    if (!force && resumableReceiverIds.includes(peerId)) return true
-    await this.membership.save({
-      pairedReceiverIds: pairedReceiverIds.filter((id) => id !== peerId),
-      resumableReceiverIds: resumableReceiverIds.filter((id) => id !== peerId),
-    })
-    return false
+    return await this.membership.release(peerId, force)
   }
 
   private releaseReceiver(peerId: string, force = false): Promise<boolean> {
@@ -606,9 +539,7 @@ export class P2PRoom {
 
   private async roomExpiresAt(): Promise<number> {
     const expiresAt = await this.state.storage.get<number>(EXPIRES_AT_KEY)
-    if (typeof expiresAt === "number" && Number.isFinite(expiresAt)) return expiresAt
-    const createdAt = (await this.state.storage.get<number>(CREATED_AT_KEY)) ?? 0
-    return createdAt + ROOM_TTL_MS
+    return typeof expiresAt === "number" && Number.isFinite(expiresAt) ? expiresAt : 0
   }
 
   private async isValidSenderToken(token: string | null): Promise<boolean> {
@@ -730,7 +661,7 @@ export class P2PRoom {
         continue
       }
       const lastPingAt = attachment.lastPingAt
-      const lastPongAt = attachment.lastPongAt ?? now
+      const lastPongAt = attachment.lastPongAt
       if (lastPingAt !== undefined && lastPongAt < lastPingAt) {
         if (now - lastPingAt >= P2P_HEARTBEAT_TIMEOUT_MS) {
           socket.close(1001, "P2P heartbeat timeout")
@@ -790,7 +721,7 @@ export class P2PRoom {
 
   private async rescheduleRoomAlarm(): Promise<void> {
     const now = Date.now()
-    const stored = await this.state.storage.get([CREATED_AT_KEY, EXPIRES_AT_KEY, RECEIVER_CLEANUP_AT_KEY])
+    const stored = await this.state.storage.get([EXPIRES_AT_KEY, RECEIVER_CLEANUP_AT_KEY])
     const expiresAt = storedRoomExpiresAt(stored)
     const receiverDeadlines = Object.values(storedReceiverDeadlines(stored.get(RECEIVER_CLEANUP_AT_KEY)))
     const receiverCleanupAt = receiverDeadlines.length > 0 ? Math.min(...receiverDeadlines) : undefined
@@ -883,12 +814,12 @@ export class P2PRoom {
     const lastPingAt = (attachment as P2PWebSocketAttachment).lastPingAt
     const lastPongAt = (attachment as P2PWebSocketAttachment).lastPongAt
     if (role !== "sender" && role !== "receiver") return null
-    if (role === "receiver" && (typeof peerId !== "string" || !isUuid(peerId))) return null
+    if (role === "receiver" && (!isUuid(peerId) || !isUuid(connectionId))) return null
     if (userAgent !== undefined && typeof userAgent !== "string") return null
     if (connectionId !== undefined && (typeof connectionId !== "string" || !isUuid(connectionId))) return null
-    if (connectedAt !== undefined && (!Number.isFinite(connectedAt) || connectedAt < 0)) return null
+    if (!Number.isFinite(connectedAt) || connectedAt < 0) return null
     if (lastPingAt !== undefined && (!Number.isFinite(lastPingAt) || lastPingAt < 0)) return null
-    if (lastPongAt !== undefined && (!Number.isFinite(lastPongAt) || lastPongAt < 0)) return null
+    if (!Number.isFinite(lastPongAt) || lastPongAt < 0) return null
     return { role, peerId, userAgent, connectionId, connectedAt, lastPingAt, lastPongAt }
   }
 }

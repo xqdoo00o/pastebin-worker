@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qrcodegen.h"
+#include "qr_v48.h"
 #include "oblas_lite.h"
 #if defined(__wasm_simd128__)
 #include <wasm_simd128.h>
@@ -46,8 +47,8 @@
 //   arguments, and return scalar values; they are "pure" functions.
 // - They don't read mutable global variables or write to any global variables.
 // - They don't perform I/O, read the clock, print to console, etc.
-// - They allocate a small and constant amount of stack memory.
-// - They don't allocate or free any memory on the heap.
+// - Most functions allocate only a small and constant amount of stack memory.
+//   The fixed-mask cache allocates storage when the QR version changes.
 // - They don't recurse or mutually recurse. All the code
 //   could be inlined into the top-level public functions.
 // - They run in at most quadratic time with respect to input arguments.
@@ -67,12 +68,14 @@ testable int getNumRawDataModules(int ver);
 testable void reedSolomonComputeDivisor(int degree, uint8_t result[]);
 testable void reedSolomonComputeRemainder(const uint8_t data[], int dataLen,
 	const uint8_t generator[], int degree, uint8_t result[]);
+static void reedSolomonComputeRemainderCached(const uint8_t data[], int dataLen,
+	const struct qrcodegen_FixedMaskCache *cache, int degree, uint8_t result[]);
 testable uint8_t reedSolomonMultiply(uint8_t x, uint8_t y);
 
 testable void initializeFunctionModules(int version, uint8_t qrcode[]);
 static void drawLightFunctionModules(uint8_t qrcode[], int version);
 static void drawFormatBits(enum qrcodegen_Ecc ecl, enum qrcodegen_Mask mask, uint8_t qrcode[]);
-testable int getAlignmentPatternPositions(int version, uint8_t result[7]);
+testable int getAlignmentPatternPositions(int version, uint8_t result[8]);
 static void fillRectangle(int left, int top, int width, int height, uint8_t qrcode[]);
 
 static void drawCodewords(const uint8_t data[], int dataLen, uint8_t qrcode[]);
@@ -85,7 +88,7 @@ static void finderPenaltyAddHistory(int currentRunLength, int runHistory[7], int
 static bool encodeSegmentsAdvanced(const struct qrcodegen_Segment segs[], size_t len, enum qrcodegen_Ecc ecl,
 	int minVersion, int maxVersion, enum qrcodegen_Mask mask, bool boostEcl, uint8_t tempBuffer[], uint8_t qrcode[],
 	struct qrcodegen_FixedMaskCache *cache);
-static void prepareFixedMaskCache(struct qrcodegen_FixedMaskCache *cache, int version, enum qrcodegen_Ecc ecl);
+static bool prepareFixedMaskCache(struct qrcodegen_FixedMaskCache *cache, int version, enum qrcodegen_Ecc ecl);
 static void drawCachedCodewords(const uint8_t data[], int dataLen,
 	const struct qrcodegen_FixedMaskCache *cache, uint8_t qrcode[]);
 
@@ -270,6 +273,13 @@ static bool encodeSegmentsAdvanced(const struct qrcodegen_Segment segs[], size_t
 	// Find the minimal version number to use
 	int version, dataUsedBits;
 	for (version = minVersion; ; version++) {
+		if (version > 40 && version < 48) {
+			if (maxVersion < 48) {
+				qrcode[0] = 0;
+				return false;
+			}
+			version = 48;  // Versions 41-47 have no transfer profile.
+		}
 		int dataCapacityBits = getNumDataCodewords(version, ecl) * 8;  // Number of data bits available
 		dataUsedBits = getTotalBits(segs, len, version);
 		if (dataUsedBits != LENGTH_OVERFLOW && dataUsedBits <= dataCapacityBits)
@@ -286,9 +296,14 @@ static bool encodeSegmentsAdvanced(const struct qrcodegen_Segment segs[], size_t
 		if (boostEcl && dataUsedBits <= getNumDataCodewords(version, (enum qrcodegen_Ecc)i) * 8)
 			ecl = (enum qrcodegen_Ecc)i;
 	}
+	if (cache != NULL && !prepareFixedMaskCache(cache, version, ecl)) {
+		qrcode[0] = 0;
+		return false;
+	}
 	
 	// Concatenate all segments to create the data bit string
-	memset(qrcode, 0, (size_t)qrcodegen_BUFFER_LEN_FOR_VERSION(version) * sizeof(qrcode[0]));
+	int dataCapacityBits = getNumDataCodewords(version, ecl) * 8;
+	memset(qrcode, 0, (size_t)dataCapacityBits / 8);
 	int bitLen = 0;
 	for (size_t i = 0; i < len; i++) {
 		const struct qrcodegen_Segment *seg = &segs[i];
@@ -306,7 +321,6 @@ static bool encodeSegmentsAdvanced(const struct qrcodegen_Segment segs[], size_t
 	assert(bitLen == dataUsedBits);
 	
 	// Add terminator and pad up to a byte if applicable
-	int dataCapacityBits = getNumDataCodewords(version, ecl) * 8;
 	assert(bitLen <= dataCapacityBits);
 	int terminatorBits = dataCapacityBits - bitLen;
 	if (terminatorBits > 4)
@@ -316,14 +330,14 @@ static bool encodeSegmentsAdvanced(const struct qrcodegen_Segment segs[], size_t
 	assert(bitLen % 8 == 0);
 	
 	// Pad with alternating bytes until data capacity is reached
-	for (uint8_t padByte = 0xEC; bitLen < dataCapacityBits; padByte ^= 0xEC ^ 0x11)
-		appendBitsToBuffer(padByte, 8, qrcode, &bitLen);
+	for (int i = bitLen / 8; i < dataCapacityBits / 8; i++)
+		qrcode[i] = (i - bitLen / 8) % 2 == 0 ? 0xEC : 0x11;
+	bitLen = dataCapacityBits;
 	
 	// Compute ECC, draw modules
 	addEccAndInterleaveCached(qrcode, version, ecl, tempBuffer, cache);
 	if (cache != NULL) {
 		assert(mask == qrcodegen_Mask_3 && !boostEcl);
-		prepareFixedMaskCache(cache, version, ecl);
 		drawCachedCodewords(tempBuffer, getNumRawDataModules(version) / 8, cache, qrcode);
 		return true;
 	}
@@ -371,10 +385,10 @@ static void addEccAndInterleaveCached(uint8_t data[], int version, enum qrcodege
 	obl_qr_rs_init();
 	// Calculate parameter numbers
 	assert(0 <= (int)ecl && (int)ecl < 4 && qrcodegen_VERSION_MIN <= version && version <= qrcodegen_VERSION_MAX);
-	int numBlocks = NUM_ERROR_CORRECTION_BLOCKS[(int)ecl][version];
-	int blockEccLen = ECC_CODEWORDS_PER_BLOCK  [(int)ecl][version];
+	int numBlocks = version == 48 ? QR_V48_BLOCKS[(int)ecl] : NUM_ERROR_CORRECTION_BLOCKS[(int)ecl][version];
+	int blockEccLen = version == 48 ? QR_V48_ECC_PER_BLOCK[(int)ecl] : ECC_CODEWORDS_PER_BLOCK[(int)ecl][version];
 	int rawCodewords = getNumRawDataModules(version) / 8;
-	int dataLen = getNumDataCodewords(version, ecl);
+	int dataLen = rawCodewords - blockEccLen * numBlocks;
 	int numShortBlocks = numBlocks - rawCodewords % numBlocks;
 	int shortBlockDataLen = rawCodewords / numBlocks - blockEccLen;
 	assert(dataLen + (blockEccLen + 15) / 16 * 16 < qrcodegen_BUFFER_LEN_FOR_VERSION(version));
@@ -390,6 +404,12 @@ static void addEccAndInterleaveCached(uint8_t data[], int version, enum qrcodege
 		if (cache->rsDegree != blockEccLen) {
 			memset(rsdiv, 0, sizeof(cache->rsDivisor));
 			reedSolomonComputeDivisor(blockEccLen, rsdiv);
+			for (unsigned factor = 0; factor < 256; ++factor) {
+				uint8_t product[33] = {0};
+				obl_qr_rs_update(product, rsdiv, (uint8_t)factor,
+					(unsigned)blockEccLen, (unsigned)(blockEccLen + 15) / 16 * 16);
+				memcpy(cache->rsProducts[factor], product, 32);
+			}
 			cache->rsDegree = (uint8_t)blockEccLen;
 		}
 	} else {
@@ -399,7 +419,10 @@ static void addEccAndInterleaveCached(uint8_t data[], int version, enum qrcodege
 	for (int i = 0; i < numBlocks; i++) {
 		int datLen = shortBlockDataLen + (i < numShortBlocks ? 0 : 1);
 		uint8_t *ecc = &data[dataLen];  // Temporary storage
-		reedSolomonComputeRemainder(dat, datLen, rsdiv, blockEccLen, ecc);
+		if (cache != NULL)
+			reedSolomonComputeRemainderCached(dat, datLen, cache, blockEccLen, ecc);
+		else
+			reedSolomonComputeRemainder(dat, datLen, rsdiv, blockEccLen, ecc);
 		for (int j = 0, k = i; j < datLen; j++, k += numBlocks) {  // Copy data
 			if (j == shortBlockDataLen)
 				k -= numShortBlocks;
@@ -413,10 +436,12 @@ static void addEccAndInterleaveCached(uint8_t data[], int version, enum qrcodege
 
 
 // Returns the number of 8-bit codewords that can be used for storing data (not ECC),
-// for the given version number and error correction level. The result is in the range [9, 2956].
+// for the given version number and error correction level. The result is in the range [9, 4146].
 testable int getNumDataCodewords(int version, enum qrcodegen_Ecc ecl) {
 	int v = version, e = (int)ecl;
 	assert(0 <= e && e < 4);
+	if (v == 48)
+		return getNumRawDataModules(v) / 8 - QR_V48_ECC_PER_BLOCK[e] * QR_V48_BLOCKS[e];
 	return getNumRawDataModules(v) / 8
 		- ECC_CODEWORDS_PER_BLOCK    [e][v]
 		* NUM_ERROR_CORRECTION_BLOCKS[e][v];
@@ -425,7 +450,7 @@ testable int getNumDataCodewords(int version, enum qrcodegen_Ecc ecl) {
 
 // Returns the number of data bits that can be stored in a QR Code of the given version number, after
 // all function modules are excluded. This includes remainder bits, so it might not be a multiple of 8.
-// The result is in the range [208, 29648]. This could be implemented as a 40-entry lookup table.
+// The result is in the range [208, 41571].
 testable int getNumRawDataModules(int ver) {
 	assert(qrcodegen_VERSION_MIN <= ver && ver <= qrcodegen_VERSION_MAX);
 	int result = (16 * ver + 128) * ver + 64;
@@ -435,7 +460,7 @@ testable int getNumRawDataModules(int ver) {
 		if (ver >= 7)
 			result -= 36;
 	}
-	assert(208 <= result && result <= 29648);
+	assert(208 <= result && result <= 41571);
 	return result;
 }
 
@@ -478,8 +503,46 @@ testable void reedSolomonComputeRemainder(const uint8_t data[], int dataLen,
 	memset(result, 0, (size_t)workDegree * sizeof(result[0]));
 	for (int i = 0; i < dataLen; i++) {  // Polynomial division
 		uint8_t factor = data[i] ^ result[0];
-		obl_qr_rs_update(result, generator, factor, (unsigned)workDegree);
+		obl_qr_rs_update(result, generator, factor, (unsigned)degree, (unsigned)workDegree);
 	}
+}
+
+static void reedSolomonComputeRemainderCached(const uint8_t data[], int dataLen,
+		const struct qrcodegen_FixedMaskCache *cache, int degree, uint8_t result[]) {
+#if defined(__wasm_simd128__)
+	const v128_t zero = wasm_i8x16_splat(0);
+	v128_t low = zero;
+	if (degree <= 16) {
+		for (int i = 0; i < dataLen; ++i) {
+			unsigned factor = data[i] ^ wasm_u8x16_extract_lane(low, 0);
+			low = wasm_v128_xor(wasm_i8x16_shuffle(low, zero,
+				1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+				wasm_v128_load(cache->rsProducts[factor]));
+		}
+	} else {
+		v128_t high = zero;
+		for (int i = 0; i < dataLen; ++i) {
+			unsigned factor = data[i] ^ wasm_u8x16_extract_lane(low, 0);
+			const uint8_t *product = cache->rsProducts[factor];
+			low = wasm_v128_xor(wasm_i8x16_shuffle(low, high,
+				1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+				wasm_v128_load(product));
+			high = wasm_v128_xor(wasm_i8x16_shuffle(high, zero,
+				1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+				wasm_v128_load(product + 16));
+		}
+		wasm_v128_store(result + 16, high);
+	}
+	wasm_v128_store(result, low);
+#else
+	memset(result, 0, (size_t)degree);
+	for (int i = 0; i < dataLen; ++i) {
+		const uint8_t *product = cache->rsProducts[data[i] ^ result[0]];
+		for (int j = 0; j + 1 < degree; ++j)
+			result[j] = result[j + 1] ^ product[j];
+		result[degree - 1] = product[degree - 1];
+	}
+#endif
 }
 
 #undef qrcodegen_REED_SOLOMON_DEGREE_MAX
@@ -519,7 +582,7 @@ testable void initializeFunctionModules(int version, uint8_t qrcode[]) {
 	fillRectangle(0, qrsize - 8, 9, 8, qrcode);
 	
 	// Fill numerous alignment patterns
-	uint8_t alignPatPos[7];
+	uint8_t alignPatPos[8];
 	int numAlign = getAlignmentPatternPositions(version, alignPatPos);
 	for (int i = 0; i < numAlign; i++) {
 		for (int j = 0; j < numAlign; j++) {
@@ -563,7 +626,7 @@ static void drawLightFunctionModules(uint8_t qrcode[], int version) {
 	}
 	
 	// Draw numerous alignment patterns
-	uint8_t alignPatPos[7];
+	uint8_t alignPatPos[8];
 	int numAlign = getAlignmentPatternPositions(version, alignPatPos);
 	for (int i = 0; i < numAlign; i++) {
 		for (int j = 0; j < numAlign; j++) {
@@ -579,7 +642,7 @@ static void drawLightFunctionModules(uint8_t qrcode[], int version) {
 	// Draw version blocks
 	if (version >= 7) {
 		// Calculate error correction code and pack bits
-		int rem = version;  // version is uint6, in the range [7, 40]
+		int rem = version;  // version fits in the 6-bit version field
 		for (int i = 0; i < 12; i++)
 			rem = (rem << 1) ^ ((rem >> 11) * 0x1F25);
 		long bits = (long)version << 12 | rem;  // uint18
@@ -632,10 +695,10 @@ static void drawFormatBits(enum qrcodegen_Ecc ecl, enum qrcodegen_Mask mask, uin
 
 
 // Calculates and stores an ascending list of positions of alignment patterns
-// for this version number, returning the length of the list (in the range [0,7]).
-// Each position is in the range [0,177), and are used on both the x and y axes.
-// This could be implemented as lookup table of 40 variable-length lists of unsigned bytes.
-testable int getAlignmentPatternPositions(int version, uint8_t result[7]) {
+// for this version number, returning the length of the list (in the range [0,8]).
+// Each position is in the range [0,209), and are used on both the x and y axes.
+// This could be implemented as a lookup table of supported alignment lists.
+testable int getAlignmentPatternPositions(int version, uint8_t result[8]) {
 	if (version == 1)
 		return 0;
 	int numAlign = version / 7 + 2;
@@ -687,13 +750,26 @@ static void drawCodewords(const uint8_t data[], int dataLen, uint8_t qrcode[]) {
 }
 
 
-#define FIXED_MASK_CACHE_FLAG 0x8000U
-_Static_assert((qrcodegen_VERSION_MAX * 4 + 17) * (qrcodegen_VERSION_MAX * 4 + 17) < FIXED_MASK_CACHE_FLAG,
-	"The cache flag must not overlap a QR module position");
+_Static_assert((qrcodegen_VERSION_MAX * 4 + 17) * (qrcodegen_VERSION_MAX * 4 + 17) <= UINT16_MAX,
+	"Cached QR module positions must fit in 16 bits");
 
-static void prepareFixedMaskCache(struct qrcodegen_FixedMaskCache *cache, int version, enum qrcodegen_Ecc ecl) {
-	if (cache->version == version && cache->ecl == (uint8_t)ecl)
-		return;
+static bool prepareFixedMaskCache(struct qrcodegen_FixedMaskCache *cache, int version, enum qrcodegen_Ecc ecl) {
+	if (cache->version == version) {
+		if (cache->ecl != (uint8_t)ecl) {
+			drawFormatBits(ecl, qrcodegen_Mask_3, cache->qrcodeTemplate);
+			cache->ecl = (uint8_t)ecl;
+		}
+		return true;
+	}
+
+	int rawModules = getNumRawDataModules(version);
+	size_t templateLen = (size_t)qrcodegen_BUFFER_LEN_FOR_VERSION(version);
+	uint16_t *positions = malloc((size_t)rawModules * sizeof(*positions) + templateLen);
+	if (positions == NULL)
+		return false;
+	free(cache->modulePositions);
+	cache->modulePositions = positions;
+	cache->qrcodeTemplate = (uint8_t *)(positions + rawModules);
 
 	uint8_t *qrcode = cache->qrcodeTemplate;
 	initializeFunctionModules(version, qrcode);
@@ -709,28 +785,36 @@ static void prepareFixedMaskCache(struct qrcodegen_FixedMaskCache *cache, int ve
 				int y = upward ? qrsize - 1 - vert : vert;
 				if (!getModuleBounded(qrcode, x, y)) {
 					unsigned position = (unsigned)(y * qrsize + x);
-					if ((x + y) % 3 == 0)
-						position |= FIXED_MASK_CACHE_FLAG;
 					cache->modulePositions[count++] = (uint16_t)position;
+					// Each coordinate is visited once. Seed the zero-codeword
+					// template here, without a flag or a second traversal.
+					if ((x + y) % 3 == 0)
+						qrcode[(position >> 3) + 1] |= (uint8_t)(1U << (position & 7));
 				}
 			}
 		}
 	}
 	assert(count == getNumRawDataModules(version));
 
-	/* Turn the all-dark function map into a complete symbol template for zero
-	 * codewords. Payload one-bits can then be applied as simple XOR toggles. */
+	/* Data and remainder bits already carry mask 3. Complete the function
+	 * patterns; payload one-bits can then be applied as simple XOR toggles. */
 	drawLightFunctionModules(qrcode, version);
-	for (int i = 0; i < count; i++) {
-		unsigned entry = cache->modulePositions[i];
-		if ((entry & FIXED_MASK_CACHE_FLAG) != 0) {
-			unsigned position = entry & ~FIXED_MASK_CACHE_FLAG;
-			qrcode[(position >> 3) + 1] |= (uint8_t)(1U << (position & 7));
-		}
-	}
 	drawFormatBits(ecl, qrcodegen_Mask_3, qrcode);
 	cache->version = (uint8_t)version;
 	cache->ecl = (uint8_t)ecl;
+	return true;
+}
+
+
+void qrcodegen_freeFixedMaskCache(struct qrcodegen_FixedMaskCache *cache) {
+	if (cache == NULL)
+		return;
+	free(cache->modulePositions);
+	cache->modulePositions = NULL;
+	cache->qrcodeTemplate = NULL;
+	cache->version = 0;
+	cache->ecl = 0;
+	cache->rsDegree = 0;
 }
 
 
@@ -742,16 +826,12 @@ static void drawCachedCodewords(const uint8_t data[], int dataLen,
 		unsigned value = data[i];
 		while (value != 0) {
 			unsigned bit = (unsigned)__builtin_ctz(value);
-			unsigned entry = cache->modulePositions[i * 8 + 7 - bit];
-			unsigned position = entry & ~FIXED_MASK_CACHE_FLAG;
+			unsigned position = cache->modulePositions[i * 8 + 7 - bit];
 			qrcode[(position >> 3) + 1] ^= (uint8_t)(1U << (position & 7));
 			value &= value - 1;
 		}
 	}
 }
-
-#undef FIXED_MASK_CACHE_FLAG
-
 
 // XORs the codeword modules in this QR Code with the given mask pattern
 // and given pattern of function modules. The codeword bits must be drawn
@@ -920,7 +1000,7 @@ static int finderPenaltyCountPatterns(const int runHistory[7], int qrsize) {
 	int n = runHistory[1];
 	assert(n <= qrsize * 3);  (void)qrsize;
 	bool core = n > 0 && runHistory[2] == n && runHistory[3] == n * 3 && runHistory[4] == n && runHistory[5] == n;
-	// The maximum QR Code size is 177, hence the dark run length n <= 177.
+	// The maximum supported QR Code size is 209, hence n <= 209.
 	// Arithmetic is promoted to int, so n*4 will not overflow.
 	return (core && runHistory[0] >= n * 4 && runHistory[6] >= n ? 1 : 0)
 	     + (core && runHistory[6] >= n * 4 && runHistory[0] >= n ? 1 : 0);
@@ -972,7 +1052,7 @@ bool qrcodegen_getModule(const uint8_t qrcode[], int x, int y) {
 // Returns the color of the module at the given coordinates, which must be in bounds.
 testable bool getModuleBounded(const uint8_t qrcode[], int x, int y) {
 	int qrsize = qrcode[0];
-	assert(21 <= qrsize && qrsize <= 177 && 0 <= x && x < qrsize && 0 <= y && y < qrsize);
+	assert(21 <= qrsize && qrsize <= 209 && 0 <= x && x < qrsize && 0 <= y && y < qrsize);
 	int index = y * qrsize + x;
 	return getBit(qrcode[(index >> 3) + 1], index & 7);
 }
@@ -981,7 +1061,7 @@ testable bool getModuleBounded(const uint8_t qrcode[], int x, int y) {
 // Sets the color of the module at the given coordinates, which must be in bounds.
 testable void setModuleBounded(uint8_t qrcode[], int x, int y, bool isDark) {
 	int qrsize = qrcode[0];
-	assert(21 <= qrsize && qrsize <= 177 && 0 <= x && x < qrsize && 0 <= y && y < qrsize);
+	assert(21 <= qrsize && qrsize <= 209 && 0 <= x && x < qrsize && 0 <= y && y < qrsize);
 	int index = y * qrsize + x;
 	int bitIndex = index & 7;
 	int byteIndex = (index >> 3) + 1;
@@ -1036,24 +1116,24 @@ size_t qrcodegen_calcSegmentBufferSize(enum qrcodegen_Mode mode, size_t numChars
 	int temp = calcSegmentBitLength(mode, numChars);
 	if (temp == LENGTH_OVERFLOW)
 		return SIZE_MAX;
-	assert(0 <= temp && temp <= INT16_MAX);
+	assert(0 <= temp && temp <= INT_MAX);
 	return ((size_t)temp + 7) / 8;
 }
 
 
 // Returns the number of data bits needed to represent a segment
 // containing the given number of characters using the given mode. Notes:
-// - Returns LENGTH_OVERFLOW on failure, i.e. numChars > INT16_MAX
-//   or the number of needed bits exceeds INT16_MAX (i.e. 32767).
-// - Otherwise, all valid results are in the range [0, INT16_MAX].
+// - Returns LENGTH_OVERFLOW on failure, i.e. numChars > INT_MAX
+//   or the number of needed bits exceeds INT_MAX.
+// - Otherwise, all valid results are in the range [0, INT_MAX].
 // - For byte mode, numChars measures the number of bytes, not Unicode code points.
 // - For ECI mode, numChars must be 0, and the worst-case number of bits is returned.
 //   An actual ECI segment can have shorter data. For non-ECI modes, the result is exact.
 testable int calcSegmentBitLength(enum qrcodegen_Mode mode, size_t numChars) {
 	// All calculations are designed to avoid overflow on all platforms
-	if (numChars > (unsigned int)INT16_MAX)
+	if (numChars > (unsigned int)INT_MAX)
 		return LENGTH_OVERFLOW;
-	long result = (long)numChars;
+	int64_t result = (int64_t)numChars;
 	if (mode == qrcodegen_Mode_NUMERIC)
 		result = (result * 10 + 2) / 3;  // ceil(10/3 * n)
 	else if (mode == qrcodegen_Mode_ALPHANUMERIC)
@@ -1069,7 +1149,7 @@ testable int calcSegmentBitLength(enum qrcodegen_Mode mode, size_t numChars) {
 		return LENGTH_OVERFLOW;
 	}
 	assert(result >= 0);
-	if (result > INT16_MAX)
+	if (result > INT_MAX)
 		return LENGTH_OVERFLOW;
 	return (int)result;
 }
@@ -1187,24 +1267,24 @@ struct qrcodegen_Segment qrcodegen_makeEci(long assignVal, uint8_t buf[]) {
 
 // Calculates the number of bits needed to encode the given segments at the given version.
 // Returns a non-negative number if successful. Otherwise returns LENGTH_OVERFLOW if a segment
-// has too many characters to fit its length field, or the total bits exceeds INT16_MAX.
+// has too many characters to fit its length field, or the total bits exceeds INT_MAX.
 testable int getTotalBits(const struct qrcodegen_Segment segs[], size_t len, int version) {
 	assert(segs != NULL || len == 0);
-	long result = 0;
+	int64_t result = 0;
 	for (size_t i = 0; i < len; i++) {
 		int numChars  = segs[i].numChars;
 		int bitLength = segs[i].bitLength;
-		assert(0 <= numChars  && numChars  <= INT16_MAX);
-		assert(0 <= bitLength && bitLength <= INT16_MAX);
+		assert(0 <= numChars);
+		assert(0 <= bitLength);
 		int ccbits = numCharCountBits(segs[i].mode, version);
 		assert(0 <= ccbits && ccbits <= 16);
 		if (numChars >= (1L << ccbits))
 			return LENGTH_OVERFLOW;  // The segment's length doesn't fit the field's bit width
 		result += 4L + ccbits + bitLength;
-		if (result > INT16_MAX)
+		if (result > INT_MAX)
 			return LENGTH_OVERFLOW;  // The sum might overflow an int type
 	}
-	assert(0 <= result && result <= INT16_MAX);
+	assert(0 <= result && result <= INT_MAX);
 	return (int)result;
 }
 
@@ -1213,7 +1293,7 @@ testable int getTotalBits(const struct qrcodegen_Segment segs[], size_t len, int
 // in a QR Code at the given version number. The result is in the range [0, 16].
 static int numCharCountBits(enum qrcodegen_Mode mode, int version) {
 	assert(qrcodegen_VERSION_MIN <= version && version <= qrcodegen_VERSION_MAX);
-	int i = (version + 7) / 17;
+	int i = version <= 9 ? 0 : version <= 26 ? 1 : 2;
 	switch (mode) {
 		case qrcodegen_Mode_NUMERIC     : { static const int temp[] = {10, 12, 14}; return temp[i]; }
 		case qrcodegen_Mode_ALPHANUMERIC: { static const int temp[] = { 9, 11, 13}; return temp[i]; }

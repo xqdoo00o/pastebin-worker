@@ -4,7 +4,7 @@ import type { PasteMetadata } from "../storage/storage.js"
 import { hasReadLimit, metaResponseFromMetadata } from "../storage/storage.js"
 import type { SerializedPasteData } from "../../shared/interfaces.js"
 import manifest from "../../dist/frontend/.vite/ssr-manifest.json"
-import { bytesToBase64, detectUtf8 } from "../../shared/encoding.js"
+import { bytesToBase64, decodeUtf8 } from "../../shared/encoding.js"
 import { MAX_SSR_FILE_SIZE, publicEnv, renderReactDocument, renderStaticReact } from "../ssrUtils.js"
 import { filenameForTitle, itemCountLabel } from "../../shared/format.js"
 
@@ -28,7 +28,8 @@ export async function renderDisplayPage(
 
   const content = paste instanceof ArrayBuffer ? paste : await new Response(paste).arrayBuffer()
 
-  const encoding = detectUtf8(new Uint8Array(content))
+  const text = decodeUtf8(new Uint8Array(content))
+  const encoding = text === null ? null : "UTF-8"
   const isBinary = encoding === null
 
   const contentBase64 = bytesToBase64(new Uint8Array(content))
@@ -67,6 +68,7 @@ export async function renderDisplayPage(
       paste: {
         file: pasteFile,
         contentBuffer: new Uint8Array(content),
+        text: text ?? undefined,
         lang: urlLang || metadata.highlightLanguage,
         isFileBinary: isBinary,
         guessedEncoding: encoding,

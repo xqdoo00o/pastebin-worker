@@ -1,7 +1,9 @@
-import { copyFileSync, mkdirSync } from "node:fs"
+import { mkdirSync } from "node:fs"
 import { join } from "node:path"
 
 import {
+  emscriptenModuleFlags,
+  copyFileIfChanged,
   collapseEmscriptenVariantGlue,
   emscriptenCodecBuildContext,
   ensurePinnedGitCheckout,
@@ -18,7 +20,7 @@ const nanorqDir = join(codecRoot, "third_party", "nanorq")
 const nanorqPatchDir = join(codecRoot, "patches", "nanorq")
 const nanorqRepository = "https://github.com/sleepybishop/nanorq.git"
 const nanorqRevision = "6295a9525893b9a757dd57431db76fc6ecceafac"
-const git = process.env.NANORQ_GIT || toolOverride("GIT").value || "git"
+const git = toolOverride("GIT").value || "git"
 const { emcc, run, output } = emscriptenCodecBuildContext({ cwd: codecRoot })
 
 function preparePatchedNanoRQSource(revision) {
@@ -85,19 +87,11 @@ function compileNanoRQ(outputName, simd) {
     "-DNDEBUG",
     "-D_DEFAULT_SOURCE",
     "-D_FILE_OFFSET_BITS=64",
-    "-sWASM=1",
-    "-sMODULARIZE=1",
-    "-sEXPORT_ES6=1",
-    "-sEXPORT_NAME=createNanoRQCodec",
-    "-sINCOMING_MODULE_JS_API=wasmBinary,instantiateWasm",
-    "-sENVIRONMENT=web,worker",
-    "-sFILESYSTEM=0",
-    "-sASSERTIONS=0",
-    "-sMALLOC=emmalloc",
-    "-sALLOW_MEMORY_GROWTH=1",
-    "-sMAXIMUM_MEMORY=1073741824",
-    "-sEXPORTED_RUNTIME_METHODS=HEAPU8",
-    "--no-entry",
+    ...emscriptenModuleFlags({
+      exportName: "createNanoRQCodec",
+      maximumMemory: 1073741824,
+      incomingModuleApi: "wasmBinary,instantiateWasm",
+    }),
     "-o",
     join(outputRoot, outputName),
   ])
@@ -108,8 +102,8 @@ compileNanoRQ("nanorq_codec_scalar.js", false)
 
 collapseEmscriptenVariantGlue({ outputRoot, baseName: "nanorq_codec" })
 
-copyFileSync(join(codecRoot, "src", "nanorq_codec.d.ts"), join(outputRoot, "nanorq_codec.d.ts"))
-copyFileSync(join(patchedNanoRQRoot, "LICENSE"), join(outputRoot, "LICENSE"))
-copyFileSync(join(codecRoot, "src", "qrcodegen.LICENSE"), join(outputRoot, "LICENSE.QR-Code-generator"))
+copyFileIfChanged(join(codecRoot, "src", "nanorq_codec.d.ts"), join(outputRoot, "nanorq_codec.d.ts"))
+copyFileIfChanged(join(patchedNanoRQRoot, "LICENSE"), join(outputRoot, "LICENSE"))
+copyFileIfChanged(join(codecRoot, "src", "qrcodegen.LICENSE"), join(outputRoot, "LICENSE.QR-Code-generator"))
 writeBuildHash(inputHash)
 console.log(`Recorded NanoRQ build state in ${stampPath}`)

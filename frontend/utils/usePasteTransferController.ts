@@ -363,6 +363,9 @@ export function usePasteTransferController({
           archiveCompression: pasteSetting.archiveCompression,
           compressSingleFile: pasteSetting.compressSingleFile ?? false,
         })
+        const roomOptionsChanged =
+          previousUpdate.fields.expiration !== pasteSetting.expiration ||
+          previousUpdate.fields.readLimit !== pasteSetting.readLimit
         const prepared = fileVersionChanged
           ? await prepareContent(editorState, {
               errorTitle: "Error on Preparing P2P Share",
@@ -374,7 +377,9 @@ export function usePasteTransferController({
         pendingContentCleanup = prepared?.cleanup
         signal.throwIfAborted()
         if (!p2p.isCurrent(session)) return
-        const updatedRoom = await session.updateRoomOptions(pasteSetting.expiration, pasteSetting.readLimit, signal)
+        const updatedRoom = roomOptionsChanged
+          ? await session.updateRoomOptions(pasteSetting.expiration, pasteSetting.readLimit, signal)
+          : undefined
         signal.throwIfAborted()
         if (!p2p.isCurrent(session)) return
         if (prepared) {
@@ -391,7 +396,7 @@ export function usePasteTransferController({
           )
           pendingContentCleanup = undefined
         }
-        p2p.updateRoom(updatedRoom.expireAt, updatedRoom.expirationSeconds)
+        if (updatedRoom) p2p.updateRoom(updatedRoom.expireAt, updatedRoom.expirationSeconds)
         p2p.setLastUpdate(createUpdateSnapshot(editorState, p2pUpdateFields(pasteSetting)))
       } finally {
         await pendingContentCleanup?.()

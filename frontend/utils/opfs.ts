@@ -22,7 +22,7 @@ const managedTemporaryFilePattern = /^(?:paste-(?:decrypt|archive|optical)-|p2p-
 
 export const OPFS_DOWNLOAD_THRESHOLD = OPFS_LARGE_FILE_THRESHOLD_BYTES
 
-type OPFSStorageManager = StorageManager & { getDirectory?: () => Promise<FileSystemDirectoryHandle> }
+export type OPFSStorageManager = StorageManager & { getDirectory?: () => Promise<FileSystemDirectoryHandle> }
 
 export type OPFSFileLease = WebLockLease
 
@@ -174,11 +174,13 @@ export function cleanupOPFSTemporaryFilesOnce(root: FileSystemDirectoryHandle): 
   return cleanup
 }
 
-export async function createOPFSTemporaryFile(
+/** Create a writable file and retain its cross-tab lease until its owner releases it. */
+export async function createOPFSWritableFile(
   expectedSize: number,
-  purpose: OPFSTemporaryFilePurpose = "download",
-): Promise<OPFSTemporaryFile> {
-  const storage = navigator.storage as OPFSStorageManager | undefined
+  filename: string,
+  existingRoot?: FileSystemDirectoryHandle,
+) {
+  const storage = typeof navigator === "undefined" ? undefined : (navigator.storage as OPFSStorageManager | undefined)
   if (typeof storage?.getDirectory !== "function") {
     throw new Error("This browser does not support disk-backed large downloads (OPFS)")
   }
@@ -191,27 +193,36 @@ export async function createOPFSTemporaryFile(
     }
   }
 
-  const root = await storage.getDirectory()
+  const root = existingRoot ?? (await storage.getDirectory())
   void cleanupOPFSTemporaryFilesOnce(root)
-  const temporaryName = `${tempFilePrefixes[purpose]}${Date.now()}-${crypto.randomUUID()}${tempFileSuffix}`
-  const leaseRequest = acquireOPFSFileLease(temporaryName)
+  const leaseRequest = acquireOPFSFileLease(filename)
   const lease = leaseRequest ? await leaseRequest : undefined
   if (lease === null) throw new Error("The OPFS temporary file is already in use")
   let handle: FileSystemFileHandle
   try {
-    handle = await root.getFileHandle(temporaryName, { create: true })
+    handle = await root.getFileHandle(filename, { create: true })
   } catch (error) {
     lease?.release()
     throw error
   }
-  let writable: FileSystemWritableFileStream | undefined
   try {
-    writable = await handle.createWritable({ keepExistingData: false })
+    const writable = await handle.createWritable({ keepExistingData: false })
+    return { root, filename, handle, writable, lease }
   } catch (error) {
-    await root.removeEntry(temporaryName).catch(() => undefined)
+    await root.removeEntry(filename).catch(() => undefined)
     lease?.release()
     throw error
   }
+}
+
+export async function createOPFSTemporaryFile(
+  expectedSize: number,
+  purpose: OPFSTemporaryFilePurpose = "download",
+): Promise<OPFSTemporaryFile> {
+  const temporaryName = `${tempFilePrefixes[purpose]}${Date.now()}-${crypto.randomUUID()}${tempFileSuffix}`
+  const owned = await createOPFSWritableFile(expectedSize, temporaryName)
+  const { root, handle, lease } = owned
+  let writable: FileSystemWritableFileStream | undefined = owned.writable
   let settled = false
   let leaseReleased = false
   let disposal: "remove" | "defer" | undefined

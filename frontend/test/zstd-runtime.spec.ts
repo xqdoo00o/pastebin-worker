@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs"
-import { beforeAll, describe, expect, it } from "vitest"
+import { compressZstdForTest } from "./transfer-codec-test.js"
+import { beforeAll, describe, expect, it, vi } from "vitest"
 import createZstdDecoder, { type ZstdDecoderModule } from "../wasm/zstd/zstd_decoder.js"
 import createZstdEncoder, { type ZstdEncoderModule } from "../wasm/zstd/zstd_encoder.js"
 import {
-  compressZstd,
   createStreamingZstdCompressor,
   createStreamingZstdDecompressor,
   decompressZstd,
@@ -42,8 +42,8 @@ async function instantiateEncoderVariant(variant: "simd" | "scalar"): Promise<Zs
   })
 }
 
-async function instantiateDecoder(): Promise<ZstdDecoderModule> {
-  const compiled = await WebAssembly.compile(readFileSync("frontend/wasm/zstd/zstd_decoder_simd.wasm"))
+async function instantiateDecoder(variant: "simd" | "scalar" = "simd"): Promise<ZstdDecoderModule> {
+  const compiled = await WebAssembly.compile(readFileSync(`frontend/wasm/zstd/zstd_decoder_${variant}.wasm`))
   return await createZstdDecoder({
     instantiateWasm(imports, done) {
       const instance = new WebAssembly.Instance(compiled, imports)
@@ -75,18 +75,150 @@ function decompressionCapacity(module: ZstdDecoderModule, compressed: Uint8Array
 }
 
 describe("official zstd runtime", () => {
+  it("stops a chunk iterator safely when its decoder is freed between blocks", async () => {
+    const compressed = await compressZstdForTest(new Uint8Array(1024 * 1024).fill(9))
+    const decoder = await createStreamingZstdDecompressor(1024 * 1024)
+    const chunks = decoder.pushChunks(compressed)
+    try {
+      const first = chunks.next()
+      expect(first.done).toBe(false)
+      if (first.done) throw new Error("Expected a decompressed block")
+      decoder.free()
+      expect(() => chunks.next()).toThrow("decoder has been freed")
+      expect(first.value.every((byte) => byte === 9)).toBe(true)
+    } finally {
+      chunks.return?.(undefined)
+      decoder.free()
+    }
+  })
+
+  it("bounds high-ratio output and preserves chunks across subsequent decoder calls", async () => {
+    const source = new Uint8Array(16 * 1024 * 1024 + 7).fill(42)
+    const compressed = await compressZstdForTest(source)
+    expect(compressed.length).toBeLessThan(4096)
+    const decoder = await createStreamingZstdDecompressor(source.length)
+    const chunks: Uint8Array[] = []
+    try {
+      for (const chunk of decoder.pushChunks(compressed)) {
+        expect(chunk.length).toBeLessThanOrEqual(128 * 1024)
+        chunks.push(chunk)
+      }
+      decoder.finish()
+    } finally {
+      decoder.free()
+    }
+    expect(chunks.length).toBeGreaterThan(100)
+    expect(chunks.reduce((sum, chunk) => sum + chunk.length, 0)).toBe(source.length)
+    expect(chunks.every((chunk) => chunk.every((byte) => byte === 42))).toBe(true)
+    const whole = await decompressZstd(compressed, source.length)
+    expect(whole.length).toBe(source.length)
+    expect(whole.every((byte) => byte === 42)).toBe(true)
+  })
+
+  it("drains bounded output across byte boundaries and concatenated frames", async () => {
+    const source = new Uint8Array(256 * 1024).fill(9)
+    const frame = await compressWithoutContentSize(source)
+    const compressed = join([frame, frame])
+    const decoder = await createStreamingZstdDecompressor(source.length * 2)
+    let size = 0
+    try {
+      for (const byte of compressed) {
+        for (const chunk of decoder.pushChunks(Uint8Array.of(byte))) {
+          expect(chunk.every((value) => value === 9)).toBe(true)
+          size += chunk.length
+        }
+      }
+      decoder.finish()
+      expect(size).toBe(source.length * 2)
+    } finally {
+      decoder.free()
+    }
+    for (const limit of [source.length - 1, source.length]) {
+      const limited = await createStreamingZstdDecompressor(limit)
+      try {
+        if (limit < source.length) expect(() => Array.from(limited.pushChunks(frame))).toThrow(/configured limit/)
+        else {
+          Array.from(limited.pushChunks(frame.subarray(0, frame.length - 1)))
+          expect(() => limited.finish()).toThrow(/ended before/)
+        }
+      } finally {
+        limited.free()
+      }
+    }
+  })
+
+  it("stages unknown-size input only once, including failed decompression", async () => {
+    const source = new Uint8Array(1048576 + 7).fill(42)
+    const compressed = await compressWithoutContentSize(source)
+    for (const limit of [source.length, source.length - 1]) {
+      const copies = vi.spyOn(Uint8Array.prototype, "set")
+      try {
+        if (limit === source.length) {
+          const output = await decompressZstd(compressed, limit)
+          expect(output.length).toBe(source.length)
+          expect(output.every((byte) => byte === 42)).toBe(true)
+        } else {
+          await expect(decompressZstd(compressed, limit)).rejects.toThrow(/configured limit/)
+        }
+        expect(copies.mock.calls.filter(([input]) => input === compressed)).toHaveLength(1)
+      } finally {
+        copies.mockRestore()
+      }
+    }
+  })
+
+  it.each(["simd", "scalar"] as const)(
+    "bounds reused output space across consecutive frames in %s",
+    async (variant) => {
+      const module = await instantiateDecoder(variant)
+      const first = new Uint8Array(1048576 + 7).fill(42)
+      const second = new Uint8Array(262144 + 23).fill(19)
+      const frames = [await compressWithoutContentSize(first), await compressZstdForTest(second)]
+      const total = first.length + second.length
+      const input = module._malloc(Math.max(...frames.map((frame) => frame.length)))
+      expect(input).not.toBe(0)
+      try {
+        for (const limit of [total, total - 1, 0xffff_ffff]) {
+          const context = module._pw_zstd_decompressor_new(limit)
+          expect(context).not.toBe(0)
+          try {
+            for (const [index, frame] of frames.entries()) {
+              module.HEAPU8.set(frame, input)
+              const status = module._pw_zstd_decompressor_push(context, input, frame.length)
+              if (index === 1 && limit === total - 1) {
+                expect(status).toBe(3)
+                break
+              }
+              expect(status).toBe(0)
+              const expected = index === 0 ? first : second
+              const pointer = module._pw_zstd_decompressor_output(context)
+              const size = module._pw_zstd_decompressor_output_size(context)
+              expect(size).toBe(expected.length)
+              expect(module.HEAPU8.subarray(pointer, pointer + size).every((byte) => byte === expected[0])).toBe(true)
+            }
+            if (limit !== total - 1) expect(module._pw_zstd_decompressor_finish(context)).toBe(0)
+          } finally {
+            module._pw_zstd_decompressor_free(context)
+          }
+        }
+      } finally {
+        module._free(input)
+      }
+    },
+  )
+
   it("uses zstd's library-default compression level", async () => {
     expect(ZSTD_LEVEL).toBe(0)
     const source = new TextEncoder().encode("default compression level ".repeat(100))
-    expect(await compressZstd(source)).toStrictEqual(await compressZstd(source, 0))
+    expect(await compressZstdForTest(source)).toStrictEqual(await compressZstdForTest(source, 0))
   })
 
   it("retains level 4 and rejects compression levels excluded from the WASM build", async () => {
     const source = new TextEncoder().encode("bounded compression level ".repeat(100))
-    const restored = await decompressZstd(await compressZstd(source, ZSTD_MAX_LEVEL), source.byteLength)
+    const restored = await decompressZstd(await compressZstdForTest(source, ZSTD_MAX_LEVEL), source.byteLength)
     expect(restored.byteLength).toBe(source.byteLength)
     expect(restored.findIndex((byte, index) => byte !== source[index])).toBe(-1)
-    await expect(compressZstd(source, ZSTD_MAX_LEVEL + 1)).rejects.toThrow(/integer from -131072 through 4/)
+    await expect(compressZstdForTest(source, ZSTD_MAX_LEVEL + 1)).rejects.toThrow(/integer from -131072 through 4/)
     await expect(createStreamingZstdCompressor(ZSTD_MAX_LEVEL + 1)).rejects.toThrow(/integer from -131072 through 4/)
   })
 
@@ -174,12 +306,12 @@ describe("official zstd runtime", () => {
     const first = new TextEncoder().encode("first frame")
     const second = new TextEncoder().encode("second frame")
     const skippable = Uint8Array.of(0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 9, 8, 7, 6)
-    const stream = join([await compressZstd(first), skippable, await compressZstd(second)])
+    const stream = join([await compressZstdForTest(first), skippable, await compressZstdForTest(second)])
     expect(await decompressZstd(stream, first.byteLength + second.byteLength)).toStrictEqual(join([first, second]))
   })
 
   it("accepts an empty frame at a zero output limit", async () => {
-    const compressed = await compressZstd(new Uint8Array())
+    const compressed = await compressZstdForTest(new Uint8Array())
     expect(await decompressZstd(compressed, 0)).toStrictEqual(new Uint8Array())
   })
 
@@ -187,7 +319,7 @@ describe("official zstd runtime", () => {
     const module = await instantiateDecoder()
     const source = new Uint8Array(1024).fill(42)
     const [knownSizeFrame, unknownSizeFrame] = await Promise.all([
-      compressZstd(source),
+      compressZstdForTest(source),
       compressWithoutContentSize(source),
     ])
 
@@ -199,7 +331,7 @@ describe("official zstd runtime", () => {
 
   it("rejects truncated streams and output beyond the configured limit", async () => {
     const source = new TextEncoder().encode("bounded output ".repeat(100))
-    const compressed = await compressZstd(source)
+    const compressed = await compressZstdForTest(source)
 
     const truncated = await createStreamingZstdDecompressor(source.byteLength)
     try {
@@ -217,7 +349,7 @@ describe("official zstd runtime", () => {
 
   it("enforces the output limit across multiple decoder output blocks", async () => {
     const source = new Uint8Array(300_000).fill(42)
-    const compressed = await compressZstd(source)
+    const compressed = await compressZstdForTest(source)
 
     expect(await decompressZstd(compressed, source.byteLength)).toStrictEqual(source)
     await expect(decompressZstd(compressed, source.byteLength - 1)).rejects.toThrow(/configured limit/)

@@ -1,6 +1,6 @@
 import { compileWasmModule, configuredWasmVariant, createRetryableLoader, selectWasmSimd } from "../../utils/wasm.js"
 
-export { compileWasmModule, configuredWasmVariant, createRetryableLoader } from "../../utils/wasm.js"
+export { configuredWasmVariant } from "../../utils/wasm.js"
 
 /** Shared by the live sender, APNG exporter and receiver page in their
  * respective page realms. Select the SIMD implementation when available and

@@ -1,0 +1,166 @@
+diff --git a/core/src/qrcode/QRBitMatrixParser.cpp b/core/src/qrcode/QRBitMatrixParser.cpp
+--- a/core/src/qrcode/QRBitMatrixParser.cpp
++++ b/core/src/qrcode/QRBitMatrixParser.cpp
+@@ -14,7 +14,10 @@
+ #include "QRFormatInformation.h"
+ #include "QRVersion.h"
+ 
++#include <array>
++#include <cstdint>
+ #include <utility>
++#include <vector>
+ 
+ namespace ZXing::QRCode {
+ 
+@@ -305,10 +308,56 @@
+ 
+ ByteArray ReadTransferCodewords(const BitMatrix& bitMatrix, const Version& version, bool isMirrored)
+ {
+-	FormatInformation formatInfo;
+-	formatInfo.dataMask = 3;
+-	formatInfo.isMirrored = isMirrored;
+-	return ReadQRCodewords(bitMatrix, version, formatInfo);
++	// A stream normally keeps one version. Bound retained storage to one layout,
++	// with separate mirrored offsets so the hot loop needs no coordinate math.
++	struct Layout {
++		int dimension = 0;
++		std::array<std::vector<uint16_t>, 2> offsets;
++	};
++	static thread_local Layout cache;
++	constexpr unsigned MASK_BIT = 0x8000;
++	static_assert(177 * 177 < MASK_BIT);
++	const int dimension = bitMatrix.height();
++	const size_t bitCount = size_t(version.totalCodewords()) * 8;
++	if (cache.dimension != dimension) {
++		Layout next;
++		for (auto& offsets : next.offsets)
++			offsets.reserve(bitCount);
++		const auto functions = version.buildFunctionPattern();
++		bool readingUp = true;
++		for (int x = dimension - 1; x > 0; x -= 2) {
++			if (x == 6)
++				--x;
++			for (int row = 0; row < dimension; ++row) {
++				const int y = readingUp ? dimension - 1 - row : row;
++				for (int col = 0; col < 2; ++col) {
++					const int xx = x - col;
++					if (functions.get(xx, y) || next.offsets[0].size() == bitCount)
++						continue;
++					const unsigned mask = (xx + y) % 3 == 0 ? MASK_BIT : 0;
++					next.offsets[0].push_back(uint16_t(y * dimension + xx + mask));
++					next.offsets[1].push_back(uint16_t(xx * dimension + y + mask));
++				}
++			}
++			readingUp = !readingUp;
++		}
++		if (next.offsets[0].size() != bitCount)
++			return {};
++		next.dimension = dimension;
++		cache = std::move(next);
++	}
++	const auto* pixels = bitMatrix.row(0).begin();
++	const auto* offsets = cache.offsets[isMirrored].data();
++	ByteArray result(version.totalCodewords());
++	for (size_t i = 0; i < result.size(); ++i) {
++		unsigned byte = 0;
++		for (int bit = 0; bit < 8; ++bit) {
++			const unsigned entry = offsets[i * 8 + bit];
++			byte = (byte << 1) | ((pixels[entry & (MASK_BIT - 1)] != 0) ^ (entry >> 15));
++		}
++		result[i] = uint8_t(byte);
++	}
++	return result;
+ }
+ 
+ } // namespace ZXing::QRCode
+diff --git a/core/src/qrcode/QRDecoder.cpp b/core/src/qrcode/QRDecoder.cpp
+--- a/core/src/qrcode/QRDecoder.cpp
++++ b/core/src/qrcode/QRDecoder.cpp
+@@ -295,33 +295,32 @@
+ 
+ static DecoderResult DecodeTransferBitStream(ByteArray&& bytes, const Version& version)
+ {
+-	BitSource bits(bytes);
++	// The byte payload starts at bit 12 (v1-9) or 20 (v10-40). Both leave
++	// exactly four terminator bits in the last payload byte, then whole pads.
++	const size_t headerBytes = version.versionNumber() <= 9 ? 1 : 2;
++	if (bytes.size() <= headerBytes)
++		return FormatError("Truncated transfer bit stream");
++	if ((bytes[0] >> 4) != static_cast<int>(CodecMode::BYTE))
++		return FormatError("Transfer payload is not a byte segment");
++	const size_t count = headerBytes == 1
++		? ((bytes[0] & 15) << 4) | (bytes[1] >> 4)
++		: ((bytes[0] & 15) << 12) | (bytes[1] << 4) | (bytes[2] >> 4);
++	if (count > bytes.size() - headerBytes - 1)
++		return FormatError("Truncated transfer byte segment");
++	const size_t last = headerBytes + count;
++	if ((bytes[last] & 15) != 0)
++		return FormatError("Transfer payload has another segment");
++	for (size_t i = last + 1, pad = 0xEC; i < bytes.size(); ++i, pad ^= 0xEC ^ 0x11)
++		if (bytes[i] != pad)
++			return FormatError("Invalid transfer padding");
++
++	// Compact into the existing allocation; each source byte is ahead of its
++	// destination, so this also avoids allocating a second payload buffer.
++	for (size_t i = 0; i < count; ++i)
++		bytes[i] = uint8_t((bytes[headerBytes + i] << 4) | (bytes[headerBytes + i + 1] >> 4));
++	bytes.resize(count);
+ 	Content result;
+-
+-	try {
+-		if (bits.readBits(4) != static_cast<int>(CodecMode::BYTE))
+-			return FormatError("Transfer payload is not a byte segment");
+-		const int count = bits.readBits(CharacterCountBits(CodecMode::BYTE, version));
+-		if (count > bits.available() / 8)
+-			return FormatError("Truncated transfer byte segment");
+-
+-		result.reserve(count);
+-		for (int i = 0; i < count; ++i)
+-			result.push_back(bits.readBits(8));
+-
+-		const int terminatorBits = std::min(4, bits.available());
+-		if (terminatorBits && bits.readBits(terminatorBits) != 0)
+-			return FormatError("Transfer payload has another segment");
+-		const int alignmentBits = bits.available() & 7;
+-		if (alignmentBits && bits.readBits(alignmentBits) != 0)
+-			return FormatError("Invalid transfer byte alignment");
+-		for (int pad = 0xEC; bits.available() >= 8; pad ^= 0xEC ^ 0x11)
+-			if (bits.readBits(8) != pad)
+-				return FormatError("Invalid transfer padding");
+-	} catch (const std::out_of_range&) {
+-		return FormatError("Truncated transfer bit stream");
+-	}
+-
++	result.bytes = std::move(bytes);
+ 	return DecoderResult(std::move(result));
+ }
+ 
+diff --git a/core/src/Pattern.h b/core/src/Pattern.h
+--- a/core/src/Pattern.h
++++ b/core/src/Pattern.h
+@@ -439,15 +439,20 @@
+ 		auto* bitPtr = bitPtrBegin;
+ #ifdef __wasm_simd128__
+ 		// Compare adjacent bytes sixteen at a time. The bitmask contains one bit
+-		// for every black/white transition and ctz locates the first one.
++		// for every black/white transition and ctz enumerates all transitions before loading the next block.
+ 		while (bitPtrEnd - bitPtr > 16) {
+ 			auto current = wasm_v128_load(bitPtr);
+ 			auto shifted = wasm_v128_load(bitPtr + 1);
+ 			uint32_t transitions = wasm_i8x16_bitmask(wasm_i8x16_ne(current, shifted));
+-			int step = transitions ? std::countr_zero(transitions) + 1 : 16;
+-			(*intPos) += step;
+-			intPos += transitions != 0;
+-			bitPtr += step;
++			int previous = 0;
++			while (transitions) {
++				const int next = std::countr_zero(transitions) + 1;
++				(*intPos++) += next - previous;
++				previous = next;
++				transitions &= transitions - 1;
++			}
++			(*intPos) += 16 - previous;
++			bitPtr += 16;
+ 		}
+ #else
+ 		using simd_t = uint64_t;

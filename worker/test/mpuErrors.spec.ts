@@ -58,6 +58,19 @@ describe("MPU error paths", () => {
     expect(await resp.text()).toContain("missing request body")
   })
 
+  it.each(["", "0", "-1", "1abc", "1.5", "1e2", "9007199254740992"])(
+    "handleMPUResume rejects invalid partNumber %s",
+    async (partNumber) => {
+      const url = new URL(`${BASE_URL}/mpu/resume`)
+      url.searchParams.set("key", "k")
+      url.searchParams.set("uploadId", "u")
+      url.searchParams.set("partNumber", partNumber)
+      const resp = await workerFetch(ctx, new Request(url, { method: "PUT", body: "x" }))
+      expect(resp.status).toBe(400)
+      expect(await resp.text()).toContain("invalid partNumber")
+    },
+  )
+
   it("handleMPUComplete returns 400 when name does not match the upload key", async () => {
     const createResp = await workerFetch(ctx, new Request(`${BASE_URL}/mpu/create`, { method: "POST" }))
     const { key, uploadId }: MPUCreateResponse = await createResp.json()
